@@ -9,6 +9,8 @@
 //! controlled agent accepts that choice. Which side controls is decided by which offered, and the
 //! two must not agree — see [`Credentials`] and [`Agent::set_role`].
 #[cfg(test)]
+mod agent_options_test;
+#[cfg(test)]
 mod agent_test;
 
 /// Configuration for a new [`Agent`]: servers, timeouts and role.
@@ -165,6 +167,10 @@ pub struct Agent {
     // How long connectivity checks can fail before the ICE Agent
     // goes to disconnected
     pub(crate) disconnected_timeout: Duration,
+    /// Whether the disconnected timeout was set explicitly: a lite agent that did not set one
+    /// uses the longer lite default but computes its initial checking deadline from the full
+    /// default (pion's `disconnectedTimeoutExplicit`).
+    pub(crate) disconnected_timeout_explicit: bool,
     // How long connectivity checks can fail before the ICE Agent
     // goes to failed
     pub(crate) failed_timeout: Duration,
@@ -177,6 +183,9 @@ pub struct Agent {
     pub(crate) check_interval: Duration,
     pub(crate) checking_duration: Instant,
     pub(crate) last_checking_time: Instant,
+
+    /// How much a TCP candidate's type preference is lowered relative to UDP.
+    pub(crate) tcp_priority_offset: u16,
     // When set, a connectivity check has been requested and must be run on the next
     // `handle_timeout`. Checks are deferred (rather than run inline) so that adding a
     // candidate can never re-enter `contact()` and mutate agent state - e.g. transition
@@ -246,6 +255,9 @@ impl Agent {
             config.candidate_types.clone()
         };
 
+        // Deduplicate and validate the configured network types.
+        let network_types = sanitize_network_types(&config.network_types)?;
+
         if config.lite && (candidate_types.len() != 1 || candidate_types[0] != CandidateType::Host)
         {
             return Err(Error::ErrLiteUsingNonHostCandidates);
@@ -312,12 +324,16 @@ impl Agent {
             },
 
             // How long connectivity checks can fail before the ICE Agent
-            // goes to disconnected
+            // goes to disconnected. A lite agent that did not set one explicitly uses the
+            // longer RFC 7675 consent-expiry period as its default.
             disconnected_timeout: if let Some(disconnected_timeout) = config.disconnected_timeout {
                 disconnected_timeout
+            } else if config.lite {
+                DEFAULT_LITE_DISCONNECTED_TIMEOUT
             } else {
                 DEFAULT_DISCONNECTED_TIMEOUT
             },
+            disconnected_timeout_explicit: config.disconnected_timeout.is_some(),
 
             // How long connectivity checks can fail before the ICE Agent
             // goes to failed
@@ -341,6 +357,9 @@ impl Agent {
             } else {
                 config.check_interval
             },
+            tcp_priority_offset: config
+                .tcp_priority_offset
+                .unwrap_or(crate::candidate::DEFAULT_TCP_PRIORITY_OFFSET),
             last_consent_sent: now,
             checking_duration: now,
             last_checking_time: now,
@@ -363,7 +382,7 @@ impl Agent {
             pending_binding_requests: vec![],
 
             candidate_types,
-            network_types: config.network_types.clone(),
+            network_types,
             urls: config.urls.clone(),
 
             write_outs: VecDeque::new(),
@@ -386,6 +405,9 @@ impl Agent {
 
     /// Adds a new local candidate.
     pub fn add_local_candidate(&mut self, mut c: Candidate) -> Result<bool> {
+        // The agent's configured TCP priority offset governs this candidate's priority.
+        c.tcp_priority_offset = self.tcp_priority_offset;
+
         // Filter by network type if network_types is configured
         if !self.network_types.is_empty() {
             let candidate_network_type = c.network_type();
@@ -684,10 +706,13 @@ impl Agent {
             pwd = generate_pwd_with_random(self.crypto_provider.random())?;
         }
 
-        if ufrag.len() * 8 < 24 {
+        // RFC 8839 §5.4: ufrag = 4*256ice-char, password = 22*256ice-char. The lengths are
+        // checked in characters (pion's minLenUFrag/minLenPwd), not bits: a 3-character ufrag
+        // or a 21-character password is rejected even though its bit count looks sufficient.
+        if ufrag.chars().count() < 4 {
             return Err(Error::ErrLocalUfragInsufficientBits);
         }
-        if pwd.len() * 8 < 128 {
+        if pwd.chars().count() < 22 {
             return Err(Error::ErrLocalPwdInsufficientBits);
         }
 
@@ -728,6 +753,26 @@ impl Agent {
         }
 
         Ok(())
+    }
+
+    /// The deadline the initial checking phase may run for before the agent gives up and
+    /// transitions to failed (pion's `initialCheckingTimeout`).
+    ///
+    /// A zero failed timeout disables transitions to failed. A lite agent that did not set a
+    /// disconnected timeout explicitly uses the *full* agent's default in the sum, even though
+    /// its own disconnected timeout is the longer lite default.
+    pub(crate) fn initial_checking_timeout(&self) -> Duration {
+        if self.failed_timeout == Duration::ZERO {
+            return Duration::ZERO;
+        }
+
+        let disconnected_timeout = if self.lite && !self.disconnected_timeout_explicit {
+            DEFAULT_DISCONNECTED_TIMEOUT
+        } else {
+            self.disconnected_timeout
+        };
+
+        disconnected_timeout + self.failed_timeout
     }
 
     /// Generates and immediately applies an ICE restart.

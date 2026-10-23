@@ -16,6 +16,10 @@ pub struct CandidateRelayConfig {
 
     /// The server this candidate was gathered from.
     pub url: Option<String>,
+
+    /// The protocol used to reach the TURN server: `udp`, `tcp`, `tls` or `dtls`. Drives the
+    /// relay candidate's local preference (libwebrtc ordering: TLS < TCP < DTLS < UDP).
+    pub relay_protocol: String,
 }
 
 impl CandidateRelayConfig {
@@ -26,7 +30,7 @@ impl CandidateRelayConfig {
             candidate_id = generate_cand_id();
         }
 
-        let ip: IpAddr = match self.base_config.address.parse() {
+        let ip: IpAddr = match parse_candidate_ip(&self.base_config.address) {
             Ok(ip) => ip,
             Err(_) => return Err(Error::ErrAddressParseFailed),
         };
@@ -47,6 +51,7 @@ impl CandidateRelayConfig {
                 port: self.rel_port,
             }),
             url: self.url,
+            relay_local_preference: relay_protocol_preference(&self.relay_protocol),
             ..Candidate::default()
         })
     }

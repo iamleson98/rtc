@@ -30,6 +30,11 @@ pub(crate) const DEFAULT_PRFLX_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_mi
 /// Wait time before nominating a relay candidate.
 pub(crate) const DEFAULT_RELAY_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_millis(2000);
 
+/// The default time till a *lite* Agent transitions disconnected: the RFC 7675 consent-expiry
+/// period, longer than the full agent's default because a lite agent cannot recover by
+/// gathering new candidates.
+pub(crate) const DEFAULT_LITE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Max binding request before considering a pair failed.
 pub(crate) const DEFAULT_MAX_BINDING_REQUESTS: u16 = 7;
 
@@ -123,4 +128,23 @@ pub struct AgentConfig {
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
     /// DTLS.
     pub insecure_skip_verify: bool,
+
+    /// How much a TCP candidate's type preference is lowered relative to the same candidate type
+    /// over UDP. When `None`, the libwebrtc default of 27 is used.
+    pub tcp_priority_offset: Option<u16>,
+}
+
+/// Deduplicates the configured network types and rejects values that are neither UDP nor TCP
+/// (pion's `sanitizeTransportNetworkTypes`).
+pub(crate) fn sanitize_network_types(types: &[NetworkType]) -> Result<Vec<NetworkType>> {
+    let mut seen = Vec::with_capacity(types.len());
+    for network_type in types {
+        if !network_type.is_udp() && !network_type.is_tcp() {
+            return Err(Error::ErrProtoType);
+        }
+        if !seen.contains(network_type) {
+            seen.push(*network_type);
+        }
+    }
+    Ok(seen)
 }
