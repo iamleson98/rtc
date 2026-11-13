@@ -1,0 +1,105 @@
+# Long-running soak of rtc against Go pion/webrtc over loopback with netem impairment, to catch
+# drift that short tests miss (counter wraparound, slow leaks, growing queues, failed recovery).
+# Weekly and by hand: two hours. On a pull request that touches the harness: ten minutes, five-
+# minute cycles. See benchmarks/soak/README.md.
+name: soak
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Sunday
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: run length per pair, minutes
+        default: "120"
+  pull_request:
+    paths:
+      - 'benchmarks/soak/**'
+      - '.github/workflows/soak.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MINUTES: ${{ github.event_name == 'pull_request' && '10' || inputs.minutes || '120' }}
+  CYCLE_MIN: ${{ github.event_name == 'pull_request' && '5' || '20' }}
+
+jobs:
+  soak:
+    name: soak ${{ matrix.pair }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 180 # the run is bounded by MINUTES (up to 150); expressions have no arithmetic
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: [ rtc-rtc, pion-pion, rtc-pion ]
+        arch: [ x64, arm64 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: benchmarks/soak/go/go.mod
+          cache-dependency-path: benchmarks/soak/go/go.sum
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks/soak
+          key: ${{ matrix.arch }}
+      - name: Machine
+        run: |
+          uname -m; lscpu | grep -E 'Model name' | cut -c1-120
+          rustc -vV | head -3; go version
+      - name: netem
+        run: |
+          sudo modprobe sch_netem || {
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          }
+          tc -V
+      - name: Soak
+        run: scripts/ci-run.sh benchmarks/soak/run.sh "${{ matrix.pair }}" "$MINUTES" soak-out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ matrix.pair }}-${{ matrix.arch }}
+          path: |
+            soak-out/*.jsonl
+            soak-out/*.log
+            soak-out/summary.md
+            soak-out/report.html
+
+  report:
+    name: report
+    needs: soak
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: soak-*-*
+          path: soak-in
+      - name: Combined report
+        run: |
+          python3 benchmarks/soak/report.py --rules benchmarks/soak/rules.json --out soak-report \
+            $(find soak-in -name '*.jsonl' | sort)
+        id: report
+      - name: Summary
+        if: always()
+        run: |
+          [ -f soak-report/summary.md ] && cat soak-report/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report
+          path: |
+            soak-report/report.html
+            soak-report/summary.md
+            soak-in/**/*.jsonl

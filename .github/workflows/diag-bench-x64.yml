@@ -1,6 +1,6 @@
 # Diagnostic, run by hand (workflow_dispatch): the micro-benchmarks against pion on a plain x86-64
-# runner, with the CPU model, many runs, and no gating. For tuning where only a real x86-64 machine
-# gives the answer.
+# runner (or Linux arm64, with the `runner` input), with the CPU model, many runs, and no gating.
+# For tuning where only a real machine of that architecture gives the answer.
 name: diag-bench-x64
 
 on:
@@ -9,10 +9,15 @@ on:
       runs:
         description: runs per implementation
         default: "15"
+      runner:
+        description: runner image; ubuntu-24.04-arm for Linux arm64
+        type: choice
+        options: [ ubuntu-latest, ubuntu-24.04-arm ]
+        default: ubuntu-latest
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +31,7 @@ jobs:
           workspaces: benchmarks/pion-compare
       - name: Machine
         run: |
-          lscpu | grep -E 'Model name|MHz|Flags' | cut -c1-200
+          lscpu | grep -E 'Model name|MHz|Flags|Features' | cut -c1-200
           rustc -vV | head -3; go version
       - name: Compare
         run: python3 benchmarks/pion-compare/compare.py --runs "${{ inputs.runs }}" --no-gate
