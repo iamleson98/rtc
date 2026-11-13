@@ -228,6 +228,10 @@ pub struct Candidate {
     pub(crate) last_sent: Option<Instant>,
     /// When traffic was last received on this candidate, or `None` if none ever has been.
     pub(crate) last_received: Option<Instant>,
+    /// When an authenticated STUN message (a Binding request or success response) was last
+    /// received on this candidate, or `None` if none ever has been. A subset of `last_received`:
+    /// media refreshes liveness but not consent (RFC 7675 section 5.1).
+    pub(crate) last_stun_received: Option<Instant>,
 
     pub(crate) foundation_override: String,
     pub(crate) priority_override: u32,
@@ -268,6 +272,7 @@ impl Default for Candidate {
 
             last_sent: None,
             last_received: None,
+            last_stun_received: None,
 
             foundation_override: String::new(),
             priority_override: 0,
@@ -351,6 +356,13 @@ impl Candidate {
     /// construction instant, which also meant every candidate constructor needed a clock.
     pub fn last_received(&self) -> Option<Instant> {
         self.last_received
+    }
+
+    /// When an authenticated STUN message was last received on this candidate, or `None` if none
+    /// ever has been. Unlike [`Candidate::last_received`] this ignores media, so it is the clock
+    /// consent expires against (RFC 7675 section 5.1).
+    pub fn last_stun_received(&self) -> Option<Instant> {
+        self.last_stun_received
     }
 
     /// When traffic was last sent on this candidate, or `None` if none ever has been.
@@ -514,14 +526,17 @@ impl Candidate {
         }
     }
 
-    /// Records traffic on this candidate, updating its last-sent or last-received time.
+    /// Records STUN traffic on this candidate, updating its last-sent or last-received time.
     ///
-    /// Feeds consent freshness — a pair that stops seeing traffic is eventually abandoned.
+    /// Feeds liveness and consent freshness — a pair that stops seeing STUN is eventually
+    /// abandoned. Inbound media goes through [`Candidate::set_last_received`] instead, which does
+    /// not renew consent.
     pub fn seen(&mut self, now: Instant, outbound: bool) {
         if outbound {
             self.set_last_sent(now);
         } else {
             self.set_last_received(now);
+            self.last_stun_received = Some(now);
         }
     }
 
@@ -583,7 +598,8 @@ impl Candidate {
 }
 
 impl Candidate {
-    /// Records that traffic was received on this candidate at `now`.
+    /// Records that non-STUN traffic was received on this candidate at `now`. This keeps the
+    /// pair live but does not renew consent; STUN goes through [`Candidate::seen`].
     pub fn set_last_received(&mut self, now: Instant) {
         self.last_received = Some(now);
     }

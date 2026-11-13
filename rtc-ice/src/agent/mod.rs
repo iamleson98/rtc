@@ -635,6 +635,9 @@ impl Agent {
             if new.last_received.is_none() {
                 new.last_received = old.last_received;
             }
+            if new.last_stun_received.is_none() {
+                new.last_stun_received = old.last_stun_received;
+            }
             if new.last_sent.is_none() {
                 new.last_sent = old.last_sent;
             }
@@ -1152,17 +1155,25 @@ impl Agent {
     /// `now` comes from the caller so that this decision and the keepalive decision below are
     /// made against the same instant as the `contact(now)` that reached them.
     pub(crate) fn validate_selected_pair(&mut self, now: Instant) -> bool {
-        let (valid, disconnected_time) = {
+        // Two clocks, as in RFC 7675 section 5.1: any inbound traffic (media included) keeps the
+        // pair out of Disconnected, but consent only expires against authenticated STUN. A peer
+        // that stops answering consent checks must not be kept alive by media alone, and
+        // inbound media proves nothing about whether the peer still consents to receive ours.
+        let (valid, disconnected_time, consent_age) = {
             self.selected_pair.as_ref().map_or_else(
-                || (false, Duration::from_secs(0)),
+                || (false, Duration::ZERO, Duration::ZERO),
                 |&pair_index| {
                     let remote_index = self.candidate_pairs[pair_index].remote_index;
+                    let remote = &self.remote_candidates[remote_index];
 
-                    let last_received = self.remote_candidates[remote_index]
-                        .last_received()
-                        .unwrap_or(self.start_time);
-                    let disconnected_time = now.saturating_duration_since(last_received);
-                    (true, disconnected_time)
+                    let age = |seen: Option<Instant>| {
+                        now.saturating_duration_since(seen.unwrap_or(self.start_time))
+                    };
+                    (
+                        true,
+                        age(remote.last_received()),
+                        age(remote.last_stun_received()),
+                    )
                 },
             )
         };
@@ -1177,7 +1188,7 @@ impl Agent {
             let disconnected = self.disconnected_timeout != Duration::from_secs(0)
                 && disconnected_time > self.disconnected_timeout;
             let failed = total_time_to_failure != Duration::from_secs(0)
-                && disconnected_time > total_time_to_failure;
+                && consent_age > total_time_to_failure;
 
             let new_state = if failed {
                 if disconnected
@@ -1851,9 +1862,27 @@ impl Agent {
     ) -> bool {
         self.find_remote_candidate(remote_addr)
             .is_some_and(|remote_index| {
-                self.remote_candidates[remote_index].seen(now, false);
+                self.remote_candidates[remote_index].set_last_received(now);
                 true
             })
+    }
+
+    /// Records inbound non-STUN traffic from `remote_addr` as liveness of the selected pair, the
+    /// way pion's `seen(false)` does for media. Returns whether a pair is selected.
+    ///
+    /// This runs for every media packet, so it is two indexed reads and a store: no lookup, no
+    /// allocation. Only the selected remote candidate's own address counts, so a packet from
+    /// anywhere else cannot keep the pair alive. It renews liveness, not consent
+    /// (see `validate_selected_pair`).
+    pub fn record_media_on_selected_pair(&mut self, now: Instant, remote_addr: SocketAddr) -> bool {
+        let Some(pair_index) = self.selected_pair else {
+            return false;
+        };
+        let remote = &mut self.remote_candidates[self.candidate_pairs[pair_index].remote_index];
+        if remote.addr() == remote_addr {
+            remote.set_last_received(now);
+        }
+        true
     }
 
     pub(crate) fn send_stun(

@@ -173,8 +173,7 @@ impl<'a>
             .ctx
             .ice_transport
             .agent
-            .get_selected_candidate_pair()
-            .is_some()
+            .record_media_on_selected_pair(msg.now, msg.transport.peer_addr)
         {
             // only ICE connection is ready and bypass it
             debug!("bypass ice read {:?}", msg.transport.peer_addr);
