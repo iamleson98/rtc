@@ -31,7 +31,7 @@ jobs:
     name: Test (default backend)
     strategy:
       matrix:
-        os: [ 'ubuntu-latest' ] # Only Linux x64 runs in CI; macOS arm64 is tested on the developer's Mac
+        os: [ 'ubuntu-latest', 'ubuntu-24.04-arm' ] # Linux x64 and arm64 run in CI; macOS arm64 is tested on the developer's Mac
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
