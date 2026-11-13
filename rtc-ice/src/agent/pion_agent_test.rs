@@ -741,6 +741,95 @@ fn test_validate_selected_pair_transitions() {
     assert_eq!(ConnectionState::Failed, agent.state());
 }
 
+fn connected_agent(now: Instant) -> Agent {
+    let mut agent = Agent::new(now, Arc::new(AgentConfig::default()), provider()).unwrap();
+    agent.add_local_candidate(host("1.1.1.1", 1000)).unwrap();
+    agent.add_remote_candidate(host("2.2.2.2", 2000)).unwrap();
+    agent.set_selected_pair(Some(now), Some(0));
+    assert_eq!(ConnectionState::Connected, agent.state());
+    agent
+}
+
+// pion counts media as liveness (candidate_base.go seen(false)): 6 s without STUN but with
+// RTP every 20 ms must not disconnect the pair.
+#[test]
+fn test_media_on_selected_pair_keeps_it_connected() {
+    let now = Instant::now();
+    let mut agent = connected_agent(now);
+    let peer = "2.2.2.2:2000".parse().unwrap();
+
+    for tick in 1..=300u32 {
+        let t = now + Duration::from_millis(20) * tick;
+        assert!(agent.record_media_on_selected_pair(t, peer));
+        assert!(agent.validate_selected_pair(t));
+        assert_eq!(ConnectionState::Connected, agent.state(), "at {t:?}");
+    }
+    assert_eq!(Duration::from_secs(6), Duration::from_millis(20) * 300);
+}
+
+// With every kind of traffic stopped the defaults still apply: Disconnected after 5 s, Failed
+// 25 s later.
+#[test]
+fn test_silent_selected_pair_disconnects_then_fails() {
+    let now = Instant::now();
+    let mut agent = connected_agent(now);
+    let peer = "2.2.2.2:2000".parse().unwrap();
+    assert!(agent.record_media_on_selected_pair(now, peer));
+
+    let at = |secs: f32| now + Duration::from_secs_f32(secs);
+    agent.validate_selected_pair(at(4.9));
+    assert_eq!(ConnectionState::Connected, agent.state());
+    agent.validate_selected_pair(at(5.1));
+    assert_eq!(ConnectionState::Disconnected, agent.state());
+    agent.validate_selected_pair(at(29.9));
+    assert_eq!(ConnectionState::Disconnected, agent.state());
+    agent.validate_selected_pair(at(30.1));
+    assert_eq!(ConnectionState::Failed, agent.state());
+}
+
+// RFC 7675 section 5.1: only authenticated STUN renews consent, so media alone cannot keep a
+// pair out of Failed once 30 s pass without a consent response.
+#[test]
+fn test_media_does_not_renew_consent() {
+    let now = Instant::now();
+    let mut agent = connected_agent(now);
+    let peer = "2.2.2.2:2000".parse().unwrap();
+
+    let mut t = now;
+    while t < now + Duration::from_secs(31) {
+        t += Duration::from_millis(20);
+        agent.record_media_on_selected_pair(t, peer);
+        agent.validate_selected_pair(t);
+    }
+    assert_eq!(ConnectionState::Failed, agent.state());
+
+    // A fresh agent that does get a STUN message every few seconds stays connected.
+    let mut agent = connected_agent(now);
+    let mut t = now;
+    while t < now + Duration::from_secs(60) {
+        t += Duration::from_millis(20);
+        agent.record_media_on_selected_pair(t, peer);
+        if t.duration_since(now).as_millis().is_multiple_of(2000) {
+            agent.remote_candidates[0].seen(t, false);
+        }
+        agent.validate_selected_pair(t);
+    }
+    assert_eq!(ConnectionState::Connected, agent.state());
+}
+
+// Traffic from an address other than the selected remote candidate's is not its liveness.
+#[test]
+fn test_media_from_another_address_is_not_liveness() {
+    let now = Instant::now();
+    let mut agent = connected_agent(now);
+    let other = "3.3.3.3:3000".parse().unwrap();
+    let t = now + Duration::from_secs(6);
+
+    assert!(agent.record_media_on_selected_pair(t, other));
+    agent.validate_selected_pair(t);
+    assert_eq!(ConnectionState::Disconnected, agent.state());
+}
+
 // pion TestAddRemoteCandidateStoresCandidatesIndependentlyOfNetworkTypes
 #[test]
 fn test_remote_candidates_are_stored_independently_of_network_types() {
