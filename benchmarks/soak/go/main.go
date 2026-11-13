@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,14 +24,21 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const reportEvery = 5 * time.Second
+const (
+	reportEvery      = 5 * time.Second
+	patientICEFailed = 240 * time.Second // the abuse profile's longest outage is 120 s
+)
 
 type signalMsg struct {
 	SDP        webrtc.SessionDescription `json:"sdp"`
 	Candidates []webrtc.ICECandidateInit `json:"candidates"`
 }
 
-func writeFrame(c net.Conn, m signalMsg) error {
+func writeFrame(c net.Conn, m signalMsg) error { return writeJSONFrame(c, m) }
+
+func readFrame(c net.Conn) (m signalMsg, err error) { return m, readJSONFrame(c, &m) }
+
+func writeJSONFrame(c net.Conn, m any) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -40,17 +49,16 @@ func writeFrame(c net.Conn, m signalMsg) error {
 	return err
 }
 
-func readFrame(c net.Conn) (m signalMsg, err error) {
+func readJSONFrame(c net.Conn, m any) error {
 	var n [4]byte
-	if _, err = io.ReadFull(c, n[:]); err != nil {
-		return
+	if _, err := io.ReadFull(c, n[:]); err != nil {
+		return err
 	}
 	b := make([]byte, binary.BigEndian.Uint32(n[:]))
-	if _, err = io.ReadFull(c, b); err != nil {
-		return
+	if _, err := io.ReadFull(c, b); err != nil {
+		return err
 	}
-	err = json.Unmarshal(b, &m)
-	return
+	return json.Unmarshal(b, m)
 }
 
 // rendezvous: the offerer listens on addr and the answerer dials it; each sends one framed message.
@@ -79,7 +87,14 @@ func main() {
 	minutes := flag.Float64("minutes", 1, "how long to run once connected")
 	out := flag.String("out", "pion.jsonl", "JSONL file to append to")
 	id := flag.String("id", "", "peer id (default pion-<role>)")
+	profile := flag.String("profile", "call", "call, or abuse: hostile connections and traffic next to the call")
+	seed := flag.Uint64("seed", 1, "seed of the abuse profile's schedule")
+	only := flag.String("only", "", "abuse profile: only these attack classes (comma separated)")
 	flag.Parse()
+	if *profile != "call" && *profile != "abuse" {
+		fmt.Fprintln(os.Stderr, "soak-pion: --profile is call or abuse")
+		os.Exit(2)
+	}
 	if *id == "" {
 		*id = "pion-" + *role
 	}
@@ -88,37 +103,55 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := run(log, *role, *addr, *id, time.Duration(*minutes*float64(time.Minute))); err != nil {
+	if *profile == "abuse" {
+		log.event("seed", fmt.Sprintf("profile abuse seed %d", *seed))
+	}
+	ab := abuseOpts{enabled: *profile == "abuse", seed: *seed, only: *only, out: *out, signal: *addr}
+	if err := run(log, *role, *addr, *id, time.Duration(*minutes*float64(time.Minute)), ab); err != nil {
 		log.event("error", err.Error())
 		fmt.Fprintln(os.Stderr, "soak-pion:", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *logger, role, addr, id string, dur time.Duration) error {
-	me := &webrtc.MediaEngine{}
-	opus := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"}
-	vp8 := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000,
+var (
+	opusCap = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"}
+	vp8Cap  = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000,
 		RTCPFeedback: []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}}}
-	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: opus, PayloadType: 111}, webrtc.RTPCodecTypeAudio); err != nil {
-		return err
+)
+
+// newPeerConnection builds a peer connection with the soak's codecs, header extension and the
+// library's default interceptors, over loopback host candidates only.
+// A patient one lets ICE ride out a long outage (the measured call of the abuse profile, whose
+// network goes down for up to two minutes) instead of failing after 25 s.
+func newPeerConnection(patient bool) (*webrtc.PeerConnection, error) {
+	me := &webrtc.MediaEngine{}
+	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: opusCap, PayloadType: 111}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, err
 	}
-	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: vp8, PayloadType: 96}, webrtc.RTPCodecTypeVideo); err != nil {
-		return err
+	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: vp8Cap, PayloadType: 96}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, err
 	}
 	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: audioLevelURI}, webrtc.RTPCodecTypeAudio); err != nil {
-		return err
+		return nil, err
 	}
 	ir := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
-		return err
+		return nil, err
 	}
 	se := webrtc.SettingEngine{}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetIncludeLoopbackCandidate(true)
 	se.SetInterfaceFilter(func(n string) bool { return n == "lo" || n == "lo0" })
+	if patient {
+		se.SetICETimeouts(5*time.Second, patientICEFailed, 2*time.Second)
+	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
-	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+	return api.NewPeerConnection(webrtc.Configuration{})
+}
+
+func run(log *logger, role, addr, id string, dur time.Duration, ab abuseOpts) error {
+	pc, err := newPeerConnection(ab.enabled)
 	if err != nil {
 		return err
 	}
@@ -139,11 +172,11 @@ func run(log *logger, role, addr, id string, dur time.Duration) error {
 		}
 	})
 
-	audio, err := webrtc.NewTrackLocalStaticRTP(opus, "audio", "soak")
+	audio, err := webrtc.NewTrackLocalStaticRTP(opusCap, "audio", "soak")
 	if err != nil {
 		return err
 	}
-	video, err := webrtc.NewTrackLocalStaticRTP(vp8, "video", "soak")
+	video, err := webrtc.NewTrackLocalStaticRTP(vp8Cap, "video", "soak")
 	if err != nil {
 		return err
 	}
@@ -188,7 +221,8 @@ func run(log *logger, role, addr, id string, dur time.Duration) error {
 	opened := make(chan struct{})
 	dc.OnOpen(func() { close(opened) })
 
-	if err := negotiate(pc, role, addr); err != nil {
+	remotePorts, err := negotiate(pc, role, addr)
+	if err != nil {
 		return err
 	}
 	select {
@@ -201,6 +235,9 @@ func run(log *logger, role, addr, id string, dur time.Duration) error {
 	log.event("join", "connected")
 	runCtx, stop := context.WithTimeout(ctx, dur)
 	defer stop()
+	if ab.enabled {
+		defer startAbuse(runCtx, ab, role, id, remotePorts).stop()
+	}
 	go sendAudio(runCtx, log, audio, audioSender)
 	go sendVideo(runCtx, log, video, &keyframe)
 	go func() {
@@ -264,7 +301,7 @@ func run(log *logger, role, addr, id string, dur time.Duration) error {
 	}
 }
 
-func negotiate(pc *webrtc.PeerConnection, role, addr string) error {
+func negotiate(pc *webrtc.PeerConnection, role, addr string) ([]uint16, error) {
 	var cands []webrtc.ICECandidateInit
 	var mu sync.Mutex
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -276,7 +313,7 @@ func negotiate(pc *webrtc.PeerConnection, role, addr string) error {
 	})
 	conn, err := rendezvous(role, addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer conn.Close()
 	local := func(d webrtc.SessionDescription, err error) (signalMsg, error) {
@@ -306,27 +343,41 @@ func negotiate(pc *webrtc.PeerConnection, role, addr string) error {
 	if role == "offerer" {
 		m, err := local(pc.CreateOffer(nil))
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := writeFrame(conn, m); err != nil {
-			return err
+			return nil, err
 		}
 		ans, err := readFrame(conn)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return apply(ans)
+		return candidatePorts(ans.Candidates), apply(ans)
 	}
 	offer, err := readFrame(conn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := apply(offer); err != nil {
-		return err
+		return nil, err
 	}
 	m, err := local(pc.CreateAnswer(nil))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return writeFrame(conn, m)
+	return candidatePorts(offer.Candidates), writeFrame(conn, m)
+}
+
+// candidatePorts are the ports of signaled candidate lines
+// ("candidate:1 1 udp 2130706431 127.0.0.1 40000 typ host").
+func candidatePorts(cs []webrtc.ICECandidateInit) []uint16 {
+	var ports []uint16
+	for _, c := range cs {
+		if f := strings.Fields(c.Candidate); len(f) > 5 {
+			if n, err := strconv.ParseUint(f[5], 10, 16); err == nil {
+				ports = append(ports, uint16(n))
+			}
+		}
+	}
+	return ports
 }

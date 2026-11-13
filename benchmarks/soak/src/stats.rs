@@ -42,9 +42,26 @@ impl Logger {
     }
 
     pub fn emit(&mut self, kind: &str, id: &str, fields: Value) {
+        self.emit_as("rtc", kind, id, fields);
+    }
+
+    /// An `attack` window edge (README.md, kind `attack`): written as the pseudo implementation `abuse`.
+    /// `who` is the hostile connection, never a measured participant, so every measured receiver
+    /// counts as innocent in the window.
+    pub fn attack(&mut self, id: &str, name: &str, state: &str, seed: u64, detail: &str) {
+        let who = format!("{}-abuser", self.id);
+        self.emit_as(
+            "abuse",
+            "attack",
+            id,
+            json!({"name": name, "state": state, "group": "impaired", "who": [who], "seed": seed, "detail": detail}),
+        );
+    }
+
+    fn emit_as(&mut self, imp: &str, kind: &str, id: &str, fields: Value) {
         let mut m: Map<String, Value> = fields.as_object().cloned().unwrap_or_default();
         m.insert("ts".into(), json!(now_ms()));
-        m.insert("impl".into(), json!("rtc"));
+        m.insert("impl".into(), json!(imp));
         m.insert("arch".into(), json!(std::env::consts::ARCH));
         m.insert("kind".into(), json!(kind));
         m.insert("id".into(), json!(id));

@@ -1,7 +1,12 @@
 # Long-running soak of rtc against Go pion/webrtc over loopback with netem impairment, to catch
-# drift that short tests miss (counter wraparound, slow leaks, growing queues, failed recovery).
+# drift that short tests miss (counter wraparound, slow leaks, growing queues, failed recovery). The
+# report job holds rtc-rtc against pion-pion (the same run, the same machine type) and fails when
+# rtc is less stable, when a pair job failed or when a pair left no measurements.
 # Weekly and by hand: two hours. On a pull request that touches the harness: ten minutes, five-
-# minute cycles. See benchmarks/soak/README.md.
+# minute cycles. Two profiles: `call` (the call under netem phases) and `abuse` (the same call while
+# hostile connections, traffic and a hostile network are thrown at it; pairs rtc-rtc and pion-pion
+# only, with the same seed, the run id, so both libraries get the same abuse). A crash fails the
+# job. See benchmarks/soak/README.md.
 name: soak
 
 on:
@@ -31,14 +36,18 @@ env:
 
 jobs:
   soak:
-    name: soak ${{ matrix.pair }} / ${{ matrix.arch }}
+    name: soak ${{ matrix.pair }} / ${{ matrix.arch }} / ${{ matrix.profile }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    timeout-minutes: 180 # the run is bounded by MINUTES (up to 150); expressions have no arithmetic
+    timeout-minutes: 180 # the run is bounded by MINUTES (120 by default) plus the build; expressions have no arithmetic
     strategy:
       fail-fast: false
       matrix:
         pair: [ rtc-rtc, pion-pion, rtc-pion ]
         arch: [ x64, arm64 ]
+        profile: [ call, abuse ]
+        exclude:
+          - pair: rtc-pion # the mixed pair is a call comparison only
+            profile: abuse
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,17 +71,21 @@ jobs:
             sudo modprobe sch_netem
           }
           tc -V
+      - name: Report tests
+        run: python3 -m unittest discover -s benchmarks/soak -p 'test_*.py'
       - name: Soak
+        env:
+          PROFILE: ${{ matrix.profile }}
+          SEED: ${{ github.run_id }} # the same for every job of the run: one schedule of abuse for both libraries
         run: scripts/ci-run.sh benchmarks/soak/run.sh "${{ matrix.pair }}" "$MINUTES" soak-out
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: soak-${{ matrix.pair }}-${{ matrix.arch }}
+          name: soak-${{ matrix.pair }}-${{ matrix.arch }}-${{ matrix.profile }}
           path: |
             soak-out/*.jsonl
             soak-out/*.log
-            soak-out/summary.md
-            soak-out/report.html
+            soak-out/machine.txt
 
   report:
     name: report
@@ -86,20 +99,60 @@ jobs:
         with:
           pattern: soak-*-*
           path: soak-in
-      - name: Combined report
+      - name: Every pair produced its measurements
+        id: inputs
         run: |
-          python3 benchmarks/soak/report.py --rules benchmarks/soak/rules.json --out soak-report \
-            $(find soak-in -name '*.jsonl' | sort)
+          missing=0
+          for profile in call abuse; do
+            pairs="rtc-rtc pion-pion rtc-pion"
+            [ "$profile" = abuse ] && pairs="rtc-rtc pion-pion"
+            for pair in $pairs; do
+              for arch in x64 arm64; do
+                if [ -z "$(find "soak-in/soak-$pair-$arch-$profile" -name '*.jsonl' -size +0 2>/dev/null)" ]; then
+                  echo "::error::no measurements from $pair on $arch ($profile)"
+                  missing=1
+                fi
+              done
+            done
+          done
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+      - name: Combined report
         id: report
+        run: |
+          set +e
+          # One report per architecture and profile: the pairs of one are compared with each other.
+          status=0
+          for profile in call abuse; do
+            rules=rules.json
+            [ "$profile" = abuse ] && rules='rules-abuse.json'
+            for arch in x64 arm64; do
+              mapfile -t files < <(find "soak-in" -path "*-$arch-$profile/*" -name '*.jsonl' | sort)
+              python3 benchmarks/soak/report.py --rules "benchmarks/soak/$rules" --out "soak-report/$arch-$profile" \
+                "${files[@]}" || status=1
+            done
+          done
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Summary
         if: always()
         run: |
-          [ -f soak-report/summary.md ] && cat soak-report/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          for profile in call abuse; do
+            for arch in x64 arm64; do
+              [ -f "soak-report/$arch-$profile/summary.md" ] && { echo "## $arch, $profile"; cat "soak-report/$arch-$profile/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: soak-report
           path: |
-            soak-report/report.html
-            soak-report/summary.md
+            soak-report/**/report.html
+            soak-report/**/summary.md
             soak-in/**/*.jsonl
+            soak-in/**/machine.txt
+      - name: Fail when a pair failed, left nothing, or rtc is less stable than pion
+        if: always() && (needs.soak.result != 'success' || steps.inputs.outputs.missing != '0' || steps.report.outputs.status != '0')
+        run: |
+          echo "pair jobs: ${{ needs.soak.result }}; missing measurements: ${{ steps.inputs.outputs.missing }}; report status: ${{ steps.report.outputs.status }}"
+          exit 1
