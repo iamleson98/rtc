@@ -1,0 +1,332 @@
+// Command soak-pion is the pion half of the soak harness (see ../README.md): one WebRTC peer that
+// sends audio, video and data and logs what it receives as JSONL.
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
+	"github.com/pion/webrtc/v4"
+)
+
+const reportEvery = 5 * time.Second
+
+type signalMsg struct {
+	SDP        webrtc.SessionDescription `json:"sdp"`
+	Candidates []webrtc.ICECandidateInit `json:"candidates"`
+}
+
+func writeFrame(c net.Conn, m signalMsg) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], uint32(len(b)))
+	_, err = c.Write(append(n[:], b...))
+	return err
+}
+
+func readFrame(c net.Conn) (m signalMsg, err error) {
+	var n [4]byte
+	if _, err = io.ReadFull(c, n[:]); err != nil {
+		return
+	}
+	b := make([]byte, binary.BigEndian.Uint32(n[:]))
+	if _, err = io.ReadFull(c, b); err != nil {
+		return
+	}
+	err = json.Unmarshal(b, &m)
+	return
+}
+
+// rendezvous: the offerer listens on addr and the answerer dials it; each sends one framed message.
+func rendezvous(role, addr string) (net.Conn, error) {
+	if role == "offerer" {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		defer ln.Close()
+		return ln.Accept()
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil || time.Now().After(deadline) {
+			return c, err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func main() {
+	role := flag.String("role", "offerer", "offerer or answerer")
+	addr := flag.String("signal", "127.0.0.1:7100", "rendezvous address (the offerer listens)")
+	minutes := flag.Float64("minutes", 1, "how long to run once connected")
+	out := flag.String("out", "pion.jsonl", "JSONL file to append to")
+	id := flag.String("id", "", "peer id (default pion-<role>)")
+	flag.Parse()
+	if *id == "" {
+		*id = "pion-" + *role
+	}
+	log, err := newLogger(*out, *id)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := run(log, *role, *addr, *id, time.Duration(*minutes*float64(time.Minute))); err != nil {
+		log.event("error", err.Error())
+		fmt.Fprintln(os.Stderr, "soak-pion:", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *logger, role, addr, id string, dur time.Duration) error {
+	me := &webrtc.MediaEngine{}
+	opus := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"}
+	vp8 := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000,
+		RTCPFeedback: []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}}}
+	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: opus, PayloadType: 111}, webrtc.RTPCodecTypeAudio); err != nil {
+		return err
+	}
+	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: vp8, PayloadType: 96}, webrtc.RTPCodecTypeVideo); err != nil {
+		return err
+	}
+	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: audioLevelURI}, webrtc.RTPCodecTypeAudio); err != nil {
+		return err
+	}
+	ir := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
+		return err
+	}
+	se := webrtc.SettingEngine{}
+	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	se.SetIncludeLoopbackCandidate(true)
+	se.SetInterfaceFilter(func(n string) bool { return n == "lo" || n == "lo0" })
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return err
+	}
+	defer pc.Close()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	failed := make(chan struct{})
+	connected := make(chan struct{})
+	var once sync.Once
+	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) { log.event("ice_state", s.String()) })
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		switch s {
+		case webrtc.PeerConnectionStateConnected:
+			once.Do(func() { close(connected) })
+		case webrtc.PeerConnectionStateFailed:
+			close(failed)
+		}
+	})
+
+	audio, err := webrtc.NewTrackLocalStaticRTP(opus, "audio", "soak")
+	if err != nil {
+		return err
+	}
+	video, err := webrtc.NewTrackLocalStaticRTP(vp8, "video", "soak")
+	if err != nil {
+		return err
+	}
+	var keyframe atomic.Bool
+	audioSender, err := pc.AddTrack(audio)
+	if err != nil {
+		return err
+	}
+	videoSender, err := pc.AddTrack(video)
+	if err != nil {
+		return err
+	}
+	go drainRTCP(audioSender, nil)
+	go drainRTCP(videoSender, &keyframe)
+
+	stats := map[string]*recvStats{}
+	var statsMu sync.Mutex
+	pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		media := tr.Kind().String()
+		rs := newRecvStats(log, media, tr.Codec().ClockRate)
+		statsMu.Lock()
+		stats[media] = rs
+		statsMu.Unlock()
+		for {
+			p, _, err := tr.ReadRTP()
+			if err != nil {
+				return
+			}
+			if rs.onPacket(time.Now(), p.SequenceNumber, p.Timestamp, p.Marker) {
+				_ = pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(tr.SSRC())}})
+			}
+		}
+	})
+
+	dcs := &dcState{lat: make(chan float64, 4096)}
+	neg, dcID := true, uint16(1)
+	dc, err := pc.CreateDataChannel("soak", &webrtc.DataChannelInit{Negotiated: &neg, ID: &dcID})
+	if err != nil {
+		return err
+	}
+	dc.OnMessage(func(m webrtc.DataChannelMessage) { onData(dcs, m) })
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+
+	if err := negotiate(pc, role, addr); err != nil {
+		return err
+	}
+	select {
+	case <-connected:
+	case <-time.After(60 * time.Second):
+		return fmt.Errorf("not connected after 60 s")
+	case <-ctx.Done():
+		return nil
+	}
+	log.event("join", "connected")
+	runCtx, stop := context.WithTimeout(ctx, dur)
+	defer stop()
+	go sendAudio(runCtx, log, audio, audioSender)
+	go sendVideo(runCtx, log, video, &keyframe)
+	go func() {
+		select {
+		case <-opened:
+			sendData(runCtx, dc, dcs)
+		case <-runCtx.Done():
+		}
+	}()
+
+	proc := &procSampler{}
+	tick := time.NewTicker(reportEvery)
+	defer tick.Stop()
+	report := func() {
+		now := time.Now()
+		nack, pli, rtt := map[string]uint32{}, map[string]uint32{}, map[string]any{}
+		for _, s := range pc.GetStats() {
+			switch v := s.(type) {
+			case webrtc.InboundRTPStreamStats:
+				nack[v.Kind], pli[v.Kind] = v.NACKCount, v.PLICount
+			case webrtc.RemoteInboundRTPStreamStats:
+				if v.RoundTripTime > 0 {
+					rtt[v.Kind] = round1(v.RoundTripTime * 1000)
+				}
+			}
+		}
+		statsMu.Lock()
+		for media, rs := range stats {
+			r, ok := rtt[media]
+			if !ok {
+				r = nil
+			}
+			log.emit("recv", id+"-"+media, rs.snapshot(now, nack[media], pli[media], r))
+		}
+		statsMu.Unlock()
+		log.emit("proc", id, proc.sample())
+		var window []float64
+		for drained := false; !drained; {
+			select {
+			case v := <-dcs.lat:
+				window = append(window, v)
+			default:
+				drained = true
+			}
+		}
+		log.emit("dc", id, map[string]any{"sent": dcs.sent.Load(), "recv": dcs.recv.Load(),
+			"lat_ms_p50": percentile(window, 50), "lat_ms_p99": percentile(window, 99)})
+	}
+	for {
+		select {
+		case <-tick.C:
+			report()
+		case <-failed:
+			report()
+			return fmt.Errorf("peer connection failed")
+		case <-runCtx.Done():
+			report()
+			log.event("leave", "done")
+			return nil
+		}
+	}
+}
+
+func negotiate(pc *webrtc.PeerConnection, role, addr string) error {
+	var cands []webrtc.ICECandidateInit
+	var mu sync.Mutex
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			mu.Lock()
+			cands = append(cands, c.ToJSON())
+			mu.Unlock()
+		}
+	})
+	conn, err := rendezvous(role, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	local := func(d webrtc.SessionDescription, err error) (signalMsg, error) {
+		if err != nil {
+			return signalMsg{}, err
+		}
+		gathered := webrtc.GatheringCompletePromise(pc)
+		if err := pc.SetLocalDescription(d); err != nil {
+			return signalMsg{}, err
+		}
+		<-gathered
+		mu.Lock()
+		defer mu.Unlock()
+		return signalMsg{SDP: *pc.LocalDescription(), Candidates: cands}, nil
+	}
+	apply := func(m signalMsg) error {
+		if err := pc.SetRemoteDescription(m.SDP); err != nil {
+			return err
+		}
+		for _, c := range m.Candidates {
+			if err := pc.AddICECandidate(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if role == "offerer" {
+		m, err := local(pc.CreateOffer(nil))
+		if err != nil {
+			return err
+		}
+		if err := writeFrame(conn, m); err != nil {
+			return err
+		}
+		ans, err := readFrame(conn)
+		if err != nil {
+			return err
+		}
+		return apply(ans)
+	}
+	offer, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+	if err := apply(offer); err != nil {
+		return err
+	}
+	m, err := local(pc.CreateAnswer(nil))
+	if err != nil {
+		return err
+	}
+	return writeFrame(conn, m)
+}
