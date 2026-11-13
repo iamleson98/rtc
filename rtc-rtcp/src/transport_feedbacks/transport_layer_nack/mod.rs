@@ -196,9 +196,9 @@ impl Marshal for TransportLayerNack {
         buf.put_u32(self.sender_ssrc);
         buf.put_u32(self.media_ssrc);
 
-        for i in 0..self.nacks.len() {
-            buf.put_u16(self.nacks[i].packet_id);
-            buf.put_u16(self.nacks[i].lost_packets);
+        for nack in &self.nacks {
+            buf.put_u16(nack.packet_id);
+            buf.put_u16(nack.lost_packets);
         }
 
         if h.padding {
