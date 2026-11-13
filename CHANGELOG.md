@@ -102,6 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_stream_scheduler`, `with_stream_scheduler_weight`, `StreamScheduler`. A peer that does not
   offer it keeps plain DATA and FORWARD-TSN. `Association::metadata()` reports what was
   negotiated (`AssociationMetadata`, `PartialReliabilityMode`).
+- `rtc-sctp`: weighted fair queueing between streams without interleaving, a whole message at a
+  time (RFC 8260 section 3.6, which RFC 8831 section 6.4 asks of WebRTC). `StreamScheduler` is one
+  enum for both modes: `FirstComeFirstServed` (the default; with interleaving negotiated it gives
+  way to `WeightedFairQueueing`), `RoundRobin` (interleaving only) and `WeightedFairQueueing`.
+  `Stream::set_priority` sets a stream's weight in data channel priority units, and
+  `SettingEngineBuilder::with_sctp_weighted_fair_queueing` selects the scheduler for data channels.
 - `rtc-sctp`: `TransportConfig::with_max_reassembly_queue_entries` (pion
   `WithMaxReassemblyQueueEntries`): a peer that makes one stream hold more partial DATA entries or
   I-DATA messages than the cap is aborted with a protocol violation. Off by default.
@@ -764,8 +770,28 @@ see `docs/crypto-provider-migration.md` for before/after examples.
 
 ### Fixed
 
+- A message that reaches a peer in the same read sweep as the COOKIE-ACK (or COOKIE-ECHO) that
+  completes its SCTP handshake is no longer dropped. The data now waits for
+  `SCTPHandshakeComplete`, on which negotiated data channels open; it used to reach the data
+  channel handler first and be discarded with `ErrDataChannelNotExisted`, after SCTP had already
+  acknowledged it, so the first message the peer sent on a negotiated channel could be lost.
+- ICE: a controlling agent now answers a Binding request that carries USE-CANDIDATE without
+  ICE-CONTROLLING, and ignores the USE-CANDIDATE, instead of dropping it with
+  `ErrUnexpectedStunrequestMessage`. Peers that always act as controlling can now complete ICE
+  ([#299](https://github.com/webrtc-rs/rtc/issues/299)).
+- ICE: the controlling agent now sends a triggered check (RFC 8445 §7.3.1.4) when a Binding
+  request arrives on a pair it had marked Failed, so a late-opening direct path is no longer
+  lost to the relay ([#282](https://github.com/webrtc-rs/rtc/issues/282)).
+- Incoming RTCP reaches `get_stats()` again. Receiver reports, NACK, PLI and FIR now update the
+  outbound stream's remote-inbound and feedback counts, and sender reports update the inbound
+  stream. The read-side stats hook was lost when the interceptor started consuming RTCP
+  ([#310](https://github.com/webrtc-rs/rtc/issues/310)).
+
 - Ignore unrelated post-handshake DTLS records without consuming the final-flight
   retry budget or modifying the completed handshake cache.
+
+- Preserve the DTLS retransmission deadline when a repeated or incomplete peer flight
+  arrives while waiting for the next flight.
 
 - `rtc-crypto`'s AES-CTR keystream now uses a batched implementation instead of one
   `encrypt_block` call per 16-byte block, which defeated AES-NI / ARMv8 instruction pipelining.

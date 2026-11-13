@@ -437,6 +437,8 @@ pub struct SettingEngine {
     /// `SettingEngine.SetSCTPCwndCAStep`; the effective step is `max(MTU, n)`.
     /// `None` keeps the one-MTU default.
     pub(crate) sctp_cwnd_ca_step: Option<u32>,
+    /// SCTP streams share the bytes sent by weight (RFC 8260 section 3.6), off by default.
+    pub(crate) sctp_weighted_fair_queueing: bool,
     pub(crate) ignore_rid_pause_for_recv: bool,
     pub(crate) write_ssrc_attributes_for_simulcast: bool,
 }
@@ -1554,9 +1556,9 @@ impl SettingEngineBuilder {
     }
 
     /// Overrides the SCTP MTU: the size budget, in bytes, for each outbound DATA packet
-    /// (common header plus bundled DATA chunks) this endpoint emits. Control packets
-    /// (INIT, INIT ACK, SACK, RECONFIG, FORWARD TSN, shutdown) marshal without consulting
-    /// this value.
+    /// (common header plus bundled DATA chunks) this endpoint emits. A SACK keeps within it
+    /// too, carrying the gap blocks and duplicate TSNs that fit. Other control packets
+    /// (INIT, INIT ACK, RECONFIG, FORWARD TSN, shutdown) marshal without consulting this value.
     ///
     /// Each SCTP packet becomes one DTLS record carried in one UDP datagram, so the wire
     /// size is roughly this value + ~37 bytes of DTLS record overhead + IP/UDP headers
@@ -1641,6 +1643,13 @@ impl SettingEngineBuilder {
     /// [RFC 9653]: https://datatracker.ietf.org/doc/html/rfc9653
     pub fn with_sctp_enable_zero_checksum(mut self, enable: bool) -> Self {
         self.0.sctp_enable_zero_checksum = enable;
+        self
+    }
+
+    /// Has SCTP send from its data channels by weighted fair queueing (RFC 8260 section 3.6,
+    /// RFC 8831 section 6.4), each channel's share of the bytes in proportion to its weight.
+    pub fn with_sctp_weighted_fair_queueing(mut self, enabled: bool) -> Self {
+        self.0.sctp_weighted_fair_queueing = enabled;
         self
     }
 

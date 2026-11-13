@@ -119,9 +119,12 @@ fn test_psk_client_verify_connection_fails() {
         client_error.to_string().contains("verify failed"),
         "client error carries the callback's error: {client_error}"
     );
+    // The server has completed its handshake by the time the alert arrives, and the record rides
+    // epoch 1 unencrypted, so it fails to decrypt like a forged one. Such a record is discarded
+    // without an answer or an error (RFC 6347 section 4.1.2.7), where pion's server fails on it.
     assert!(
-        out.server_error.is_some(),
-        "the server fails too, on the alert"
+        out.server_error.is_none(),
+        "the server does not fail on the unreadable alert"
     );
     // The client alerts after its ChangeCipherSpec, so the record rides epoch 1.
     assert_eq!(

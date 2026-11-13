@@ -59,19 +59,31 @@ pub fn max_payload_size_for_mtu(mtu: u32) -> u32 {
 }
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 262144;
 
-/// How the sender shares the wire between streams once user message interleaving ([RFC 8260])
-/// is negotiated. Without it, a message must be sent in full before the next one starts.
+/// How an association shares the wire between streams.
+///
+/// Without user message interleaving ([RFC 8260]) a message is sent in full before the next one
+/// starts, so a scheduler only picks which stream's message goes next. Once interleaving is
+/// negotiated, fragments of different messages may share the wire and the scheduler picks the
+/// stream of the next fragment.
 ///
 /// [RFC 8260]: https://www.rfc-editor.org/rfc/rfc8260.html
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StreamScheduler {
-    /// One chunk from each backlogged stream in turn.
-    RoundRobin,
-    /// Weighted fair queueing: backlogged streams share the wire in proportion to their weights
-    /// (see [`TransportConfig::with_stream_scheduler_weight`]); every stream weighs 1 unless
-    /// set otherwise. This is the default, as in pion.
+    /// One queue in the order messages were written, unordered messages first. This is the
+    /// default when interleaving is not negotiated. Interleaving has no first-come first-served
+    /// form: an association that negotiates it with this scheduler configured uses
+    /// [`WeightedFairQueueing`](Self::WeightedFairQueueing), as pion does.
     #[default]
+    FirstComeFirstServed,
+    /// One fragment from each backlogged stream in turn. It applies once interleaving is
+    /// negotiated; without it messages go out in the order they were written.
+    RoundRobin,
+    /// Backlogged streams share the bytes sent in proportion to their weights: whole messages
+    /// at a time without interleaving (RFC 8260 section 3.6, which RFC 8831 section 6.4 asks of
+    /// WebRTC), fragment by fragment with it. Without interleaving the weights are
+    /// `Stream::set_priority`'s; with it, every stream weighs 1 unless
+    /// [`TransportConfig::with_stream_scheduler_weight`] sets otherwise.
     WeightedFairQueueing,
 }
 
@@ -285,8 +297,7 @@ impl TransportConfig {
         self
     }
 
-    /// Selects how interleaved streams share the wire; see [`StreamScheduler`]. Has no effect
-    /// unless interleaving is negotiated.
+    /// Selects how streams share the wire; see [`StreamScheduler`].
     pub fn with_stream_scheduler(mut self, value: StreamScheduler) -> Self {
         self.stream_scheduler = value;
         self
