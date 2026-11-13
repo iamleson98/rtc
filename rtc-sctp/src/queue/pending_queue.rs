@@ -628,10 +628,11 @@ impl PendingQueue {
             return None;
         }
         let stream = self.next_wfq_stream()?;
+        // Saturating, as on the other paths: a counter out of step must not stall the queue.
         let n_bytes = self
             .n_bytes
-            .checked_sub(self.next_wfq_message()?.peek()?.user_data.len())?;
-        let queue_len = self.queue_len.checked_sub(1)?;
+            .saturating_sub(self.next_wfq_message()?.peek()?.user_data.len());
+        let queue_len = self.queue_len.saturating_sub(1);
         let starting = !self.selected;
         let wfq = self.wfq.as_mut()?;
         let (c, tag) = wfq.update(stream, |s, _| {

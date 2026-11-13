@@ -538,13 +538,15 @@ impl Association {
             // weighted fair queueing, as in pion.
             stream_scheduler: match config.stream_scheduler() {
                 StreamScheduler::RoundRobin => SchedulerKind::RoundRobin,
-                _ => SchedulerKind::WeightedFairQueueing {
-                    weights: config
-                        .stream_scheduler_weights()
-                        .iter()
-                        .map(|(&si, &w)| (si, w))
-                        .collect(),
-                },
+                StreamScheduler::FirstComeFirstServed | StreamScheduler::WeightedFairQueueing => {
+                    SchedulerKind::WeightedFairQueueing {
+                        weights: config
+                            .stream_scheduler_weights()
+                            .iter()
+                            .map(|(&si, &w)| (si, w))
+                            .collect(),
+                    }
+                }
             },
             max_reassembly_queue_entries: config.max_reassembly_queue_entries(),
 
