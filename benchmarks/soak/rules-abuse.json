@@ -1,0 +1,15 @@
+{
+  "compare": [
+    {"subject": "rtc", "baseline": "pion", "subject_run": "rtc-rtc", "baseline_run": "pion-pion"}
+  ],
+  "require_groups": ["impaired"],
+  "ratio": 1.25,
+  "recover_window_s": 240,
+  "slack": {"stalls": 15, "stall_max": 10, "recover_s": 120, "ice_disc": 3, "freezes": 1000000},
+  "warmup_min": 15,
+  "window_min": 20,
+  "min_clean_window_min": 5,
+  "rss_slope_mb_per_h_max": 30,
+  "rss_slope_min_span_min": 30,
+  "clean_zero": []
+}

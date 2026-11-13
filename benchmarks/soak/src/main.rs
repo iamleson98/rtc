@@ -2,6 +2,7 @@
 //! and data and logs what it receives as JSONL. It drives the sans-IO API with its own UDP loop
 //! over loopback. Mirrors ../go/ in behaviour and flags.
 
+mod abuse;
 mod stats;
 
 use bytes::{Bytes, BytesMut};
@@ -13,6 +14,7 @@ use rtc::peer_connection::configuration::interceptor_registry::register_default_
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine,
 };
+use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use rtc::peer_connection::sdp::RTCSessionDescription;
@@ -32,12 +34,13 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::{StatsSelector, report::RTCStatsReportEntry};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stats::{Logger, ProcSampler, RecvStats, now_us, percentile};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -53,6 +56,7 @@ const REPORT_EVERY: Duration = Duration::from_secs(5);
 const AUDIO_EVERY: Duration = Duration::from_millis(20);
 const VIDEO_EVERY: Duration = Duration::from_nanos(33_333_333);
 const DATA_EVERY: Duration = Duration::from_millis(100);
+const PATIENT_ICE_FAILED: Duration = Duration::from_secs(240); // the abuse profile's longest outage is 120 s
 const DC_STREAM_ID: u16 = 1; // the id both peers agree on out-of-band
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -69,6 +73,9 @@ struct Args {
     minutes: f64,
     out: String,
     id: String,
+    profile: String,
+    seed: u64,
+    only: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -78,6 +85,9 @@ fn parse_args() -> Args {
         minutes: 1.0,
         out: "rtc.jsonl".into(),
         id: String::new(),
+        profile: "call".into(),
+        seed: 1,
+        only: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -88,10 +98,13 @@ fn parse_args() -> Args {
             "minutes" => a.minutes = v.parse().unwrap_or_else(|_| usage()),
             "out" => a.out = v,
             "id" => a.id = v,
+            "profile" => a.profile = v,
+            "only" => a.only = v.split(',').map(str::to_owned).collect(),
+            "seed" => a.seed = v.parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
-    if a.role != "offerer" && a.role != "answerer" {
+    if a.role != "offerer" && a.role != "answerer" || a.profile != "call" && a.profile != "abuse" {
         usage();
     }
     if a.id.is_empty() {
@@ -102,18 +115,18 @@ fn parse_args() -> Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: soak-rtc [--role offerer|answerer] [--signal HOST:PORT] [--minutes N] [--out FILE.jsonl] [--id NAME]"
+        "usage: soak-rtc [--role offerer|answerer] [--signal HOST:PORT] [--minutes N] [--out FILE.jsonl] [--id NAME] [--profile call|abuse] [--seed N] [--only CLASS,...]"
     );
     std::process::exit(2);
 }
 
-fn write_frame(c: &mut TcpStream, m: &SignalMsg) -> std::io::Result<()> {
+fn write_frame<T: Serialize>(c: &mut TcpStream, m: &T) -> std::io::Result<()> {
     let b = serde_json::to_vec(m)?;
     c.write_all(&(b.len() as u32).to_be_bytes())?;
     c.write_all(&b)
 }
 
-fn read_frame(c: &mut TcpStream) -> std::io::Result<SignalMsg> {
+fn read_frame<T: DeserializeOwned>(c: &mut TcpStream) -> std::io::Result<T> {
     let mut n = [0u8; 4];
     c.read_exact(&mut n)?;
     let mut b = vec![0u8; u32::from_be_bytes(n) as usize];
@@ -190,6 +203,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if a.profile == "abuse" {
+        log.event("seed", &format!("profile abuse seed {}", a.seed));
+        // A panic on any thread (the hostile sessions run on their own) is a crash, not a warning.
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default(info);
+            std::process::exit(101);
+        }));
+    }
     if let Err(e) = run(&mut log, &a) {
         log.event("error", &e.to_string());
         eprintln!("soak-rtc: {e}");
@@ -210,11 +232,18 @@ fn codec(mime: &str, rate: u32, channels: u16, fmtp: &str, pt: u8) -> RTCRtpCode
     }
 }
 
-fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = ctrlc_stop();
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
-    let local_addr = socket.local_addr()?;
+/// One peer connection with the soak's tracks (Opus audio, VP8 video) and the negotiated data
+/// channel. `alt_video_ssrc` gives the video track a second SSRC to switch to (the abuse sessions);
+/// `patient` lets ICE ride out a long outage (the measured call of the abuse profile, whose network
+/// goes down for up to two minutes) instead of failing after 25 s.
+struct Peer {
+    pc: rtc::peer_connection::RTCPeerConnection,
+    audio: RTCRtpSenderId,
+    video: RTCRtpSenderId,
+    dc: rtc::data_channel::RTCDataChannelId,
+}
 
+fn build_peer(alt_video_ssrc: bool, patient: bool) -> Result<Peer, Box<dyn std::error::Error>> {
     let audio_codec = codec(MIME_TYPE_OPUS, 48_000, 2, "minptime=10;useinbandfec=1", 111);
     let video_codec = codec(MIME_TYPE_VP8, 90_000, 0, "", 96);
     let mut me = MediaEngine::default();
@@ -228,34 +257,48 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut me)?;
-    let mut pc = RTCPeerConnectionBuilder::new()
+    let mut builder = RTCPeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(me)
-        .with_interceptor_registry(registry)
-        .build(Instant::now())?;
+        .with_interceptor_registry(registry);
+    if patient {
+        builder = builder.with_setting_engine(
+            SettingEngineBuilder::new()
+                .with_ice_timeouts(None, Some(PATIENT_ICE_FAILED), None)
+                .build(),
+        );
+    }
+    let mut pc = builder.build(Instant::now())?;
 
-    let mut sender_ids = HashMap::new();
+    let mut ids = Vec::new();
     for (kind, codec) in [
         (RtpCodecKind::Audio, &audio_codec),
         (RtpCodecKind::Video, &video_codec),
     ] {
+        let ssrcs = if alt_video_ssrc && kind == RtpCodecKind::Video {
+            2
+        } else {
+            1
+        };
         let track = MediaStreamTrack::new(
             "soak".to_owned(),
             format!("soak-{kind}"),
             format!("soak-{kind}"),
             kind,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters {
-                    ssrc: Some(rand_ssrc()),
+            (0..ssrcs)
+                .map(|i| RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(rand_ssrc().wrapping_add(i * 2)),
+                        ..Default::default()
+                    },
+                    codec: codec.rtp_codec.clone(),
                     ..Default::default()
-                },
-                codec: codec.rtp_codec.clone(),
-                ..Default::default()
-            }],
+                })
+                .collect(),
         );
-        sender_ids.insert(kind, pc.add_track(track)?);
+        ids.push(pc.add_track(track)?);
     }
-    let dc_id = pc
+    let dc = pc
         .create_data_channel(
             "soak",
             Some(rtc::data_channel::RTCDataChannelInit {
@@ -264,13 +307,22 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }),
         )?
         .id();
+    Ok(Peer {
+        pc,
+        audio: ids[0],
+        video: ids[1],
+        dc,
+    })
+}
 
-    let host = RTCIceCandidate::from(
+/// The host candidate for a UDP socket bound to `addr`, as signaled.
+fn host_candidate(addr: SocketAddr) -> Result<RTCIceCandidateInit, Box<dyn std::error::Error>> {
+    Ok(RTCIceCandidate::from(
         &CandidateHostConfig {
             base_config: CandidateConfig {
                 network: "udp".to_owned(),
-                address: local_addr.ip().to_string(),
-                port: local_addr.port(),
+                address: addr.ip().to_string(),
+                port: addr.port(),
                 component: 1,
                 ..Default::default()
             },
@@ -278,9 +330,30 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         .new_candidate_host()?,
     )
-    .to_json()?;
+    .to_json()?)
+}
+
+/// The port of a signaled candidate line ("candidate:1 1 udp 2130706431 127.0.0.1 40000 typ host").
+fn candidate_port(c: &RTCIceCandidateInit) -> Option<u16> {
+    c.candidate.split_whitespace().nth(5)?.parse().ok()
+}
+
+fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = ctrlc_stop();
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let local_addr = socket.local_addr()?;
+
+    let Peer {
+        mut pc,
+        audio,
+        video,
+        dc: dc_id,
+    } = build_peer(false, a.profile == "abuse")?;
+    let sender_ids = HashMap::from([(RtpCodecKind::Audio, audio), (RtpCodecKind::Video, video)]);
+    let host = host_candidate(local_addr)?;
 
     let mut conn = rendezvous(&a.role, &a.signal)?;
+    let mut media_ports = Vec::new();
     let remote = if a.role == "offerer" {
         let offer = pc.create_offer(None)?;
         pc.set_local_description(Instant::now(), offer.clone())?;
@@ -292,13 +365,15 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 candidates: vec![host.clone()],
             },
         )?;
-        let answer = read_frame(&mut conn)?;
+        let answer: SignalMsg = read_frame(&mut conn)?;
         pc.set_remote_description(Instant::now(), answer.sdp)?;
+        media_ports.extend(answer.candidates.iter().filter_map(candidate_port));
         answer.candidates
     } else {
-        let offer = read_frame(&mut conn)?;
+        let offer: SignalMsg = read_frame(&mut conn)?;
         pc.set_remote_description(Instant::now(), offer.sdp)?;
         pc.add_local_candidate(host.clone())?;
+        media_ports.extend(offer.candidates.iter().filter_map(candidate_port));
         for c in &offer.candidates {
             pc.add_remote_candidate(c.clone())?;
         }
@@ -348,6 +423,8 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let (mut t_video, mut t_data) = (t_audio, t_audio);
     let mut t_report = t_audio + REPORT_EVERY;
     let mut end = None::<Instant>;
+    let mut abusers = None;
+    let mut rejected = 0u64; // packets the library refused to read (abuse profile)
 
     loop {
         let now = Instant::now();
@@ -367,6 +444,13 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             audio = Some(out_params(&mut pc, sender_ids[&RtpCodecKind::Audio])?);
             video = Some(out_params(&mut pc, sender_ids[&RtpCodecKind::Video])?);
             end = Some(now + dur);
+            if a.profile == "abuse" {
+                abusers = Some(abuse::start(abuse::Cfg::new(
+                    a,
+                    now + dur,
+                    media_ports.clone(),
+                )));
+            }
             (t_audio, t_video, t_data, t_report) = (now, now, now, now + REPORT_EVERY);
         }
         if let (Some(au), Some(vi)) = (&audio, &video) {
@@ -492,7 +576,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 .max(Duration::from_micros(500)),
         ))?;
         if let Ok((n, peer_addr)) = socket.recv_from(&mut buf) {
-            pc.handle_read(TaggedBytesMut {
+            let read = pc.handle_read(TaggedBytesMut {
                 now: Instant::now(),
                 transport: TransportContext {
                     local_addr,
@@ -501,8 +585,24 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     transport_protocol: TransportProtocol::UDP,
                 },
                 message: BytesMut::from(&buf[..n]),
-            })?;
+            });
+            // Hostile datagrams are refused with an error; only the call profile treats that as fatal.
+            if let Err(e) = read {
+                if a.profile != "abuse" {
+                    return Err(e.into());
+                }
+                rejected += 1;
+            }
         }
+    }
+    if let Some(h) = abusers {
+        h.stop();
+    }
+    if rejected > 0 {
+        log.event(
+            "junk-rejected",
+            &format!("{rejected} datagrams refused by handle_read"),
+        );
     }
     if state.connected {
         report(log, &id, &mut pc, &mut state, &mut proc, Instant::now());
