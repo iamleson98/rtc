@@ -3577,3 +3577,67 @@ fn test_controlling_rechecks_failed_pair_on_inbound_binding_request() -> Result<
     a.close()?;
     Ok(())
 }
+
+/// The Binding request that re-checks a Failed pair is STUN, so it renews both liveness clocks
+/// of the remote candidate: the one media also feeds and the consent clock only STUN feeds.
+#[test]
+fn test_binding_request_on_failed_pair_renews_both_liveness_clocks() -> Result<()> {
+    use crate::attributes::control::AttrControlled;
+
+    let start = Instant::now();
+    let config = AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    };
+    let mut a = Agent::new(start, Arc::new(config), test_crypto_provider())?;
+
+    let host = |address: &str, port: u16| -> Result<Candidate> {
+        CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: address.to_owned(),
+                port,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()
+    };
+    a.add_local_candidate(host("192.168.0.2", 7777)?)?;
+    a.add_remote_candidate(host("172.17.0.3", 9999)?)?;
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remote_ufrag".to_string(),
+        pwd: "remote_pwd".to_string(),
+    });
+    a.candidate_pairs[0].state = CandidatePairState::Failed;
+    a.candidate_pairs[0].binding_request_count = a.max_binding_requests + 1;
+    assert!(a.remote_candidates[0].last_received().is_none());
+    assert!(a.remote_candidates[0].last_stun_received().is_none());
+
+    let username = a.ufrag_pwd.local_credentials.ufrag.clone() + ":remote_ufrag";
+    let local_pwd = a.ufrag_pwd.local_credentials.pwd.clone();
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlled(1)),
+        Box::new(PriorityAttr(1000)),
+        Box::new(MessageIntegrity::new_short_term_integrity_with_provider(
+            local_pwd,
+            test_crypto_provider().crypto(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    let now = start + Duration::from_secs(1);
+    a.handle_inbound(now, &mut msg, 0, SocketAddr::from_str("172.17.0.3:9999")?)?;
+
+    assert_eq!(a.candidate_pairs[0].state, CandidatePairState::InProgress);
+    assert_eq!(a.remote_candidates[0].last_received(), Some(now));
+    assert_eq!(a.remote_candidates[0].last_stun_received(), Some(now));
+
+    a.close()?;
+    Ok(())
+}

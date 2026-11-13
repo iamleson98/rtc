@@ -1783,6 +1783,7 @@ fn full_buffer_association() -> Association {
             .with_max_receive_buffer_size(FULL_BUFFER_RECV_BUFFER)
             .with_max_message_size(FULL_BUFFER_MAX_MESSAGE),
     );
+    a.set_state(AssociationState::Established);
     assert!(
         a.create_stream(0, true, PayloadProtocolIdentifier::Binary)
             .is_some()

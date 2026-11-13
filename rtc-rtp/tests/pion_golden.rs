@@ -181,6 +181,11 @@ fn matches_pion_rtp() {
             // ([AV1 spec] §4.10.5); pion reads it to the end and accepts the garbage.
             (Ok(Outcome::Err(_)), None)
                 if kind == "AV1Depacketizer" && has_overlong_leb128(&input) => {}
+            // Documented strictness: a STAP-A whose last aggregation unit is cut inside its
+            // two-byte size is truncated like any other cut unit, and is rejected; pion stops
+            // quietly at the stray byte and accepts the units before it.
+            (Ok(Outcome::Err(_)), None)
+                if kind == "H264Packet" && stapa_ends_inside_a_size(&input) => {}
             (Ok(Outcome::Err(e)), None) => {
                 diverged.push((tag, format!("rust rejects ({e}), pion accepts"), shown))
             }
@@ -324,6 +329,23 @@ fn av1_semantic(v: &serde_json::Value, mtu: usize, input: &[u8]) -> Option<Strin
         }
     }
     None
+}
+
+/// Whether `packet` is a STAP-A whose aggregation units are intact up to a final byte too short
+/// to hold a size.
+fn stapa_ends_inside_a_size(packet: &[u8]) -> bool {
+    if packet.first().is_none_or(|b| b & 0x1f != 24) {
+        return false;
+    }
+    let mut offset = 1;
+    while offset < packet.len() {
+        if packet.len() - offset < 2 {
+            return true;
+        }
+        let size = usize::from(u16::from_be_bytes([packet[offset], packet[offset + 1]]));
+        offset += 2 + size;
+    }
+    false
 }
 
 fn has_overlong_leb128(input: &[u8]) -> bool {
