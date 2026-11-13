@@ -84,7 +84,9 @@ GATES = {
     "rtcp unmarshal SR+SDES+REMB": gap(max_ratio=2.0, max_allocs=9),
     "vp8 payload 30KB mtu1200": win(max_allocs=32),
     "h264 payload 30KB mtu1200": win(max_allocs=32),
-    "dtls handshake ecdsa-p256 gcm": win(max_allocs=785),
+    # 787 since upstream's fix that authenticates a repeated Finished after the handshake (cd3f08a2)
+    # keeps the peer's Finished to compare with: two allocations once per connection.
+    "dtls handshake ecdsa-p256 gcm": win(max_allocs=787),
     "dtls app data 1200B": win(max_allocs=17),
     "ice connect, one host pair": win(max_allocs=320),
     "twcc record": win(max_allocs=0),

@@ -48,9 +48,12 @@ jobs:
           SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '300' }}
         run: |
           set -eu
+          # cargo-fuzz builds for the triple it was itself built for unless told otherwise, and the
+          # prebuilt binary is a musl one, which the address sanitizer refuses; use the runner's own.
+          host=$(rustc -vV | sed -n 's/^host: //p')
           for target in $(cargo fuzz list); do
             echo "::group::$target"
-            cargo fuzz run "$target" -- -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=20
+            cargo fuzz run --target "$host" "$target" -- -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=20
             echo "::endgroup::"
           done
       - name: Upload crashes
