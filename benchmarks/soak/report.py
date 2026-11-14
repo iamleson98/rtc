@@ -16,7 +16,7 @@ import json
 import math
 import os
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 
 DEFAULTS = {
@@ -49,10 +49,13 @@ DEFAULTS = {
     "cpu_sat_pct": 190,
 }
 # (key, title, decimals, kind, default slack): `rate` metrics are held to ratio and slack, `count`
-# metrics to the baseline plus slack. Lower is better for every one.
+# metrics to the baseline plus slack. Lower is better for every one but `higher` (the subject must
+# reach the baseline divided by the ratio, less the slack).
 METRICS = [
     ("freeze_rate", "Freezes / min (video)", 2, "rate", 0.5),
     ("freeze_ms", "Freeze ms / min (video)", 0, "rate", 300),
+    ("outage_freeze_ms", "Freeze ms per outage (video)", 0, "count", 1000),
+    ("video_fps", "Video frames / s (mean, higher is better)", 1, "higher", 1.0),
     ("audio_gap", "Audio gap %", 2, "rate", 0.5),
     ("loss", "Residual loss %", 2, "rate", 0.5),
     ("dup", "Duplicate packets %", 2, "rate", 0.5),
@@ -95,7 +98,8 @@ RECOVER_SETTLE_S = 15  # the start of `recover` is the outage's own aftermath, n
 COUNTERS = ("frames", "freezes", "freeze_ms", "packets", "lost", "nack", "pli", "audio_gap_ms", "bytes",
             "duplicates")
 PALETTE = ["#2563eb", "#dc2626", "#059669", "#d97706"]
-ATTACK_KEYS = ("freezes", "freeze_rate", "stalls", "stall_max", "closes", "sig_closes", "ice_disc", "recover_s",
+ATTACK_KEYS = ("freezes", "freeze_rate", "freeze_ms", "stalls", "stall_max", "closes", "sig_closes", "ice_disc",
+               "recover_s",
                "never")
 ATTACK_FILL = "#a855f7"
 EARLY_STOP_S = 60  # a baseline whose samples end this much before the subject's stopped early
@@ -118,6 +122,7 @@ class Run:
         self.t0 = self.t1 = 0.0
         self.timeline = {}  # group -> ([t], [(t, name)])
         self.attacks = []  # {id, name, start, end, group, who, seed, arch, detail}: the attack windows
+        self._attack_index = None
 
     def finish(self):
         if not self.rows:
@@ -151,6 +156,15 @@ class Run:
         for g, ph in per.items():
             ph.sort()
             self.timeline[g] = ([p[0] for p in ph], ph)
+
+    def attack_index(self):
+        """The attack windows sorted by start, their starts, and the longest one's length: what
+        finding the windows that overlap a span needs."""
+        if self._attack_index is None:
+            by_start = sorted(self.attacks, key=lambda w: w["start"])
+            self._attack_index = ([w["start"] for w in by_start], by_start,
+                                  max((w["end"] - w["start"] for w in by_start), default=0.0))
+        return self._attack_index
 
     def phase_at(self, group, t):
         """(phase name, its start) for a sample of `group` at t: a group without a timeline is never impaired."""
@@ -299,6 +313,7 @@ def clipped(ents, t_end):
         if run is None:
             run = runs[id(e.run)] = copy.copy(e.run)
             run.attacks = [dict(w, end=min(w["end"], t_end)) for w in e.run.attacks if w["start"] < t_end]
+            run._attack_index = None
             run.t1 = min(run.t1, run.t0 + t_end)
         c = Ent(e.impl, e.arch, run)
         c.events = [ev for ev in e.events if ev["t"] <= t_end]
@@ -312,6 +327,13 @@ def clipped(ents, t_end):
                 c.series[key] = n
         out.append(c)
     return out
+
+
+def server_span(ents):
+    """Seconds into the run to the last sample of the SFU process (the last row of any client when
+    the side has no process samples): how long the server was there to be measured."""
+    last = [s.s[-1]["t"] for e in ents for s in e.proc() if s.s]
+    return max(last) if last else max(e.t1 for e in ents)
 
 
 def mean(xs):
@@ -336,6 +358,31 @@ def per_track_rate(sers, field, scale, pred, media):
         if dt > 0:
             rates.append(sum(i[field] for i in ivs) * scale / dt)
     return mean(rates)
+
+
+def outage_spans(run, group):
+    """(start, end) of what an outage of `group` costs: from its start to one sample interval after
+    its recovery began, where its freeze is booked whichever way the sampling clock falls."""
+    ph = run.phases(group)
+    return [(t, end + SAMPLE_S) for (t, name), (end, _) in zip(ph, ph[1:]) if name == "outage"]
+
+
+def in_span(i, spans):
+    return any(i["t"] > a and i["t"] - i["dt"] < b for a, b in spans)
+
+
+def outage_freezes(sers, group, keep=lambda i: True):
+    """Freeze ms each video track counted per outage of `group`: one value per (track, outage); a
+    track with no interval in the outage's span adds none."""
+    out = []
+    for s in sers:
+        if s.media != "video":
+            continue
+        for span in outage_spans(s.run, group):
+            ivs = [i for i in s.ivs if keep(i) and in_span(i, [span])]
+            if ivs:
+                out.append(sum(i["freeze_ms"] for i in ivs))
+    return out
 
 
 def stalls(s):
@@ -384,7 +431,13 @@ def recoveries(ent, group, rules, gone):
     """Seconds from each outage's end until frames grow again (inf = never), over the tracks that
     are expected to flow: the participant was in the call at the outage and stayed through
     `recover_window_s` after it. A track that ends because the session was closed is not one of
-    them: it is counted as a close."""
+    them: it is counted as a close.
+
+    Frames are only seen at samples, so the sample that shows them growing would put the answer on
+    the sampling clock. The frames resumed inside that sample's interval, and the freeze it closes
+    lasted from the outage's start (frames stopped there) until they did: the freeze ms the track
+    counted from the outage's start to that sample place the moment inside the interval. A track
+    that counted no freeze keeps the sample's time."""
     out = []
     window = rules["recover_window_s"]
     ph = ent.run.phases(group)
@@ -397,10 +450,13 @@ def recoveries(ent, group, rules, gone):
                 continue
             if any(t < d <= end + window for d in gone.get((group, s.who), [])):
                 continue
-            got = next((r["t"] - end for prev, r in zip(s.s, s.s[1:])
+            hit = next(((prev, r) for prev, r in zip(s.s, s.s[1:])
                         if r["t"] > end and prev["t"] >= t and (r.get("frames") or 0) > (prev.get("frames") or 0)), None)
-            if got is not None:
-                out.append(got)
+            if hit is not None:
+                prev, r = hit
+                froze = sum(i["freeze_ms"] for i in s.ivs if t < i["t"] <= r["t"]) / 1000.0
+                resumed = t + froze if froze > 0 else r["t"]
+                out.append(max(0.0, min(r["t"], max(prev["t"], resumed)) - end))
             elif s.s[-1]["t"] - end >= window:
                 out.append(math.inf)
     return out
@@ -497,10 +553,12 @@ def scope_metrics(ents, group, phase, rules, drop=None):
     if not sers:
         return None
     pred = (lambda i: True) if phase is None else (lambda i: i["phase"] == phase)
+    keep = lambda i: True
     if drop is not None:
         dropped = {id(i) for s in sers for i in s.ivs if drop(s.run, i["t"] - i["dt"], i["t"])}
+        keep = lambda i: id(i) not in dropped
         base = pred
-        pred = lambda i: base(i) and id(i) not in dropped
+        pred = lambda i: base(i) and keep(i)
     ivs = [i for s in sers for i in s.ivs if pred(i)]
     packets = sum(i["packets"] for i in ivs)
     dup = sum(i["duplicates"] for i in ivs)
@@ -509,11 +567,25 @@ def scope_metrics(ents, group, phase, rules, drop=None):
     m = {
         "freeze_rate": per_track_rate(sers, "freezes", 60, pred, "video"),
         "freeze_ms": per_track_rate(sers, "freeze_ms", 60, pred, "video"),
+        "outage_freeze_ms": None,
+        "video_fps": per_track_rate(sers, "frames", 1, pred, "video"),
         "audio_gap": per_track_rate(sers, "audio_gap_ms", 0.1, pred, "audio"),
         "loss": 100.0 * lost / (unique + lost) if unique + lost > 0 else None,
         "dup": 100.0 * dup / packets if packets else None,
         "freezes": sum(i["freezes"] for i in ivs) if ivs else None,
     }
+    if phase == "outage":
+        # An outage is a few samples long, so a rate per minute would be decided by where the sampling
+        # clock falls: score the freeze per episode instead.
+        m["freeze_rate"] = m["freeze_ms"] = m["video_fps"] = None
+        m["outage_freeze_ms"] = mean(outage_freezes(sers, group, keep))
+    if phase == "recover":
+        # The tail of the outage's own freeze is booked in the first interval after it.
+        spans = {id(s): outage_spans(s.run, group) for s in sers}
+        after = lambda s: (lambda i: pred(i) and not in_span(i, spans[id(s)]))
+        for key, field, scale in (("freeze_rate", "freezes", 60), ("freeze_ms", "freeze_ms", 60)):
+            rates = [r for s in sers if (r := per_track_rate([s], field, scale, after(s), "video")) is not None]
+            m[key] = mean(rates)
     rates = rx_rates(sers, pred)
     m["rx_mbps"], m["rx_max"] = mean(rates), max(rates, default=None)
     st = []
@@ -602,7 +674,8 @@ def window_metrics(ent, win, rules, clean_only=False):
     """What the innocent receivers of one attack window saw between its start and `recover_window_s`
     after its end, cut at the start of the receiver group's next outage (an outage's recovery is judged
     by `recoveries`, not charged to the attack). Innocent: every participant of the clean group, and
-    those of the other groups that the window does not name (`clean_only`: the clean group alone)."""
+    those of the other groups that the window does not name (`clean_only`: the clean group alone),
+    each only for the time no other window that names it overlaps."""
     rw = rules["recover_window_s"]
     a, b = win["start"], win["end"]
     z = b + rw
@@ -615,19 +688,36 @@ def window_metrics(ent, win, rules, clean_only=False):
         nxt = [t for t, name in ent.run.phases(group) if name == "outage" and t > a]
         return min([z] + nxt)
 
-    m = {"freezes": 0, "vid_dt": 0.0, "stalls": [], "closes": 0, "sig_closes": 0, "ice_disc": 0, "rec": [],
-         "fz": [], "vdt": [], "ev": [], "never_at": []}
+    starts, by_start, longest = ent.run.attack_index()
+
+    def shared(group, who, t0, t1):
+        """Whether another attack window that names the receiver overlaps [t0, t1]: what it saw then
+        is that window's doing. The clean group is innocent whatever else runs. Only the windows
+        that start in (t0 - longest, t1) can overlap, so a 2-hour run with hundreds of windows
+        looks at a few per interval."""
+        if group == "clean":
+            return False
+        lo, hi = bisect_left(starts, t0 - longest), bisect_left(starts, t1)
+        return any(w is not win and w["arch"] == ent.arch and t0 < w["end"] and attacked(w, group, who)
+                   for w in by_start[lo:hi])
+
+    m = {"freezes": 0, "n_iv": 0, "vid_dt": 0.0, "stalls": [], "closes": 0, "sig_closes": 0, "ice_disc": 0, "rec": [],
+         "fz": [], "fzms": [], "vdt": [], "ev": [], "never_at": []}
     for s in ent.series.values():
         if s.kind != "recv" or not innocent(s.group, s.who):
             continue
         zs = cut(s.group)
-        ivs = [i for i in s.ivs if i["t"] > a and i["t"] - i["dt"] < zs]
+        ivs = [i for i in s.ivs if i["t"] > a and i["t"] - i["dt"] < zs
+               and not shared(s.group, s.who, i["t"] - i["dt"], i["t"])]
+        m["n_iv"] += len(ivs)
         m["freezes"] += sum(i["freezes"] for i in ivs)
         m["fz"] += [((s.id, i["t"]), i["freezes"]) for i in ivs if i["freezes"]]
         if s.media == "video":
             m["vid_dt"] += sum(i["dt"] for i in ivs)
+            m["fzms"] += [((s.id, i["t"]), i["freeze_ms"]) for i in ivs]
             m["vdt"] += [((s.id, i["t"]), i["dt"]) for i in ivs]
-        m["stalls"] += [(s.id, st, d) for st, d in stalls(s) if a <= st <= zs]
+        m["stalls"] += [(s.id, st, d) for st, d in stalls(s)
+                      if a <= st <= zs and not shared(s.group, s.who, st, st + d)]
         if s.media != "video" or s.s[-1]["t"] < b or zs <= b:
             continue
         before = [i for i in s.ivs if i["t"] <= a]
@@ -648,7 +738,7 @@ def window_metrics(ent, win, rules, clean_only=False):
         kind = classify(ev)
         group = str(ev.get("group") or "impaired")
         if kind in ("closes", "sig_closes", "ice_disc") and ev.get("id") != "sfu" and a <= ev["t"] <= cut(group) \
-                and innocent(group, str(ev.get("id"))):
+                and innocent(group, str(ev.get("id"))) and not shared(group, str(ev.get("id")), ev["t"], ev["t"]):
             m[kind] += 1
             m["ev"].append((kind, ev.get("id"), ev["t"], ev.get("detail")))
     return m
@@ -674,12 +764,15 @@ def attack_metrics(ents, pick_name, rules, clean_only=False):
 
     fz = sum(once("fz").values())
     dt = sum(once("vdt").values())
+    fzms = sum(once("fzms").values())
     st = list({(w["name"], sid, t): d for (_, w), p in zip(wins, per) for sid, t, d in p["stalls"]}.values())
     never = len({(w["name"], x) for (_, w), p in zip(wins, per) for x in p["never_at"]})
     p90 = [quantile(p["rec"], 0.9) for p in per if p["rec"]]
-    return {"freezes": fz,
+    used = any(p["n_iv"] for p in per)  # a class whose receivers were all under another attack has no verdict
+    return {"freezes": fz if used else None,
             "freeze_rate": fz * 60.0 / dt if dt > 0 else None,
-            "stalls": len(st), "stall_max": max(st, default=0.0),
+            "freeze_ms": fzms * 60.0 / dt if dt > 0 else None,
+            "stalls": len(st) if used else None, "stall_max": max(st, default=0.0) if used else None,
             "closes": events("closes"), "sig_closes": events("sig_closes"), "ice_disc": events("ice_disc"),
             "recover_s": max(p90) if p90 else None,
             "never": never if p90 else None}
@@ -710,11 +803,23 @@ def judge(key, s, b, rules, kind=None):
     if s is None or b is None:
         return "n/a", None
     slack = rules["slack"].get(key, SLACK.get(key, 0))
-    if (kind or KIND.get(key)) == "count":
+    kind = kind or KIND.get(key)
+    if kind == "higher":
+        lim = b / rules["ratios"].get(key, rules["ratio"]) - slack
+        return ("ok" if s >= lim else "BREACH"), lim
+    if kind == "count":
         lim = b + slack
     else:
         lim = b * rules["ratios"].get(key, rules["ratio"]) + slack
     return ("ok" if s <= lim else "BREACH"), lim
+
+
+def freezes_only_if_frozen(key, verdict, s_m, b_m):
+    """More freezes of less frozen time is a stream that plays, not one that breaks: freezes per
+    minute breach only when the freeze ms per minute is worse too."""
+    if key == "freeze_rate" and verdict == "BREACH" and not (s_m["freeze_ms"] or 0) > (b_m["freeze_ms"] or 0):
+        return "ok"
+    return verdict
 
 
 def compare(ents, rules):
@@ -740,11 +845,14 @@ def compare(ents, rules):
                 missing = "baseline" if not b_ents else "subject"
                 add(gated, where, "no %s data on %s" % (missing, arch), "both sides need data", False)
                 continue
-            # A baseline that stopped early (killed, crashed) is compared over the time it ran: the
-            # subject's later minutes would otherwise be held against nothing. The subject's absolute
-            # checks below (clean group, process errors, drift) still cover its whole run.
+            # A baseline whose server stopped early (killed, crashed) is compared over the time it ran:
+            # its clients keep logging without a server, and the subject's later minutes would be held
+            # against nothing. The subject's absolute checks below (clean group, process errors, drift)
+            # still cover its whole run.
             full_ents = s_ents
-            s_span, b_span = max(e.t1 for e in s_ents), max(e.t1 for e in b_ents)
+            s_span, b_span = server_span(s_ents), server_span(b_ents)
+            if b_span < max(e.t1 for e in b_ents):
+                b_ents = clipped(b_ents, b_span)
             if b_span < s_span - EARLY_STOP_S:
                 add(False, where + ": the baseline stopped early", "after %.1f of %.1f min" % (
                     b_span / 60.0, s_span / 60.0), "compared over its %.1f min" % (b_span / 60.0), None)
@@ -772,6 +880,7 @@ def compare(ents, rules):
                         if s_v is None and b_v is None:
                             continue
                         verdict, lim = judge(key, s_v, b_v, rules) if kind else ("", None)
+                        verdict = freezes_only_if_frozen(key, verdict, sm, bm)
                         rows.append({"arch": arch, "pair": name, "scope": g, "phase": ph or "all", "key": key,
                                      "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                      "gated": gated, "where": where})
@@ -804,6 +913,7 @@ def compare(ents, rules):
                         continue
                     kind = "count" if key == "freezes" else KIND.get(key)
                     verdict, lim = judge(key, s_v, b_v, rules, kind)
+                    verdict = freezes_only_if_frozen(key, verdict, sm, bm)
                     rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": cls, "key": key,
                                  "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                  "gated": gated, "where": where})

@@ -27,17 +27,18 @@ def event(impl, t, who, what, detail="", group="impaired", **more):
 
 
 def track(impl, rid, group, end, flowing=lambda t: True, start=0, media="video", bytes_per_s=0, freezes=lambda t: 0,
-          arch="x86_64"):
-    """recv rows every 5 s from start to end; counters grow while `flowing(t)`."""
+          arch="x86_64", frames_of=lambda t: 150, freeze_ms=lambda t: 0):
+    """recv rows every 5 s from start to end; counters grow while `flowing(t)` (`frames_of(t)` a step);
+    `freezes` and `freeze_ms` give the cumulative counters."""
     rows, frames, packets, nbytes = [], 0, 0, 0
     t = start
     while t <= end:
         if flowing(t) and t > start:
-            frames += 150
+            frames += frames_of(t)
             packets += 400
             nbytes += int(bytes_per_s * STEP)
         rows.append({"ts": ts(t), "impl": impl, "arch": arch, "kind": "recv", "id": rid, "media": media,
-                     "group": group, "frames": frames, "freezes": freezes(t), "freeze_ms": 0, "packets": packets,
+                     "group": group, "frames": frames, "freezes": freezes(t), "freeze_ms": freeze_ms(t), "packets": packets,
                      "lost": 0, "nack": 0, "pli": 0, "jitter_ms": 1.0, "rtt_ms": None, "audio_gap_ms": 0,
                      "bytes": nbytes, "duplicates": 0, "stalled": False})
         t += STEP
@@ -130,6 +131,85 @@ class PhaseAssignment(Fixture):
         # 300 + 100 kB/s on s17 = 3.2 Mbit/s in the bw phase; the baseline has one track (2.4).
         line = next(l for l in md.splitlines() if l.startswith("| impaired | bw | Receive Mbit/s per participant (mean)"))
         self.assertIn("| 3.20 |", line)
+
+
+def lone_track(impl, start, **kw):
+    """A lesson-like side whose only impaired receiver is the given track."""
+    rows = list(TIMELINE) + proc(impl, END)
+    rows += track(impl, "c01/video:teacher", "clean", END, bytes_per_s=200_000)
+    return rows + track(impl, "s17/video:teacher", "impaired", END, start=start, bytes_per_s=300_000, **kw)
+
+
+def lerp(t, t0, t1, total):
+    """A counter that grows evenly from 0 at t0 to `total` at t1."""
+    return total * min(max(t - t0, 0.0), t1 - t0) / (t1 - t0)
+
+
+class OutageEpisode(Fixture):
+    def side(self, impl, start):
+        # A 4.9 s freeze from the outage's start; an open freeze counts at once, so it is booked
+        # across the samples that see it.
+        return lone_track(impl, start, flowing=lambda t: not (120 <= t < 125),
+                          freeze_ms=lambda t: int(lerp(t, 120, 124.9, 4900)))
+
+    def test_the_freeze_per_outage_does_not_depend_on_the_sampling_clock(self):
+        code, md, ents, _ = run_report(self.side("rtcd-rs", 3.9), self.side("rtcd-go", 4.9))
+        got = {e.impl: report.scope_metrics([e], "impaired", "outage", dict(report.DEFAULTS))["outage_freeze_ms"]
+               for e in ents}
+        self.assertAlmostEqual(got["rtcd-rs"], 4900, delta=49)
+        self.assertAlmostEqual(got["rtcd-go"], 4900, delta=49)
+        self.assertEqual(code, 0, md)
+
+
+class FrozenStream(Fixture):
+    def side(self, impl, fps, freezes_per_step, ms_per_step):
+        """In the bw phase (60 to 120 s) the track plays `fps` frames a second and freezes
+        `freezes_per_step` times and `ms_per_step` ms in every sample."""
+        return lone_track(impl, 0, frames_of=lambda t: int(fps * 5) if 60 < t <= 120 else 150,
+                          freezes=lambda t: int(lerp(t, 60, 120, 12 * freezes_per_step)),
+                          freeze_ms=lambda t: int(lerp(t, 60, 120, 12 * ms_per_step)))
+
+    def test_a_dead_baseline_does_not_make_a_live_stuttering_subject_breach(self):
+        # The baseline froze once for 96 % of the phase at 1 fps; the subject plays 6 fps in many short freezes.
+        code, md, _, _ = run_report(self.side("rtcd-rs", 6, 1, 1000), self.side("rtcd-go", 1, 0.084, 4800))
+        self.assertEqual(code, 0, md)
+
+    def test_a_subject_that_plays_less_and_freezes_longer_breaches(self):
+        code, md, _, _ = run_report(self.side("rtcd-rs", 1, 0.084, 4800), self.side("rtcd-go", 6, 1, 1000))
+        self.assertEqual(code, 1, md)
+        self.assertIn("Video frames / s", md)
+
+
+    def test_the_outage_phase_has_no_frame_rate(self):
+        # Too few intervals for a rate; the outage is scored per episode.
+        slow = lone_track("rtcd-rs", 0, frames_of=lambda t: 5 if 120 < t <= 125 else 150)
+        code, md, _, _ = run_report(slow, lone_track("rtcd-go", 0))
+        self.assertEqual(code, 0, md)
+        self.assertNotIn("| impaired | outage | Video frames", md)
+        self.assertIn("| impaired | bw | Video frames", md)
+
+
+class AttackFrozenTime(Fixture):
+    RULES = dict(RULES, slack={"freezes": 1000})
+
+    def side(self, impl, freezes, ms):
+        """An innocent impaired receiver that freezes `freezes` times, `ms` ms in all, in a window (100 to 110 s)."""
+        rows = list(TIMELINE) + proc(impl, END) + window(100, 110, "a1", "reorder", ["s17"])
+        rows += track(impl, "c01/video:teacher", "clean", END, bytes_per_s=200_000)
+        rows += track(impl, "s17/video:teacher", "impaired", END, bytes_per_s=300_000)
+        return rows + track(impl, "s18/video:teacher", "impaired", END, bytes_per_s=300_000,
+                            freezes=lambda t: int(lerp(t, 100, 110, freezes)),
+                            freeze_ms=lambda t: int(lerp(t, 100, 110, ms)))
+
+    def test_many_short_freezes_are_not_a_breach_when_the_frozen_time_is_less(self):
+        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 400), self.side("rtcd-go", 1, 4000), self.RULES)
+        self.assertEqual(code, 0, md)
+        self.assertIn("| reorder | Freeze ms / min (video) |", md)
+
+    def test_more_frozen_time_breaches(self):
+        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 4000), self.side("rtcd-go", 1, 400), self.RULES)
+        self.assertEqual(code, 1, md)
+        self.assertIn("attack / reorder / Freeze ms / min (video)", md)
 
 
 class Recovery(Fixture):
@@ -330,6 +410,15 @@ class Attacks(Fixture):
         none = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS), clean_only=True)
         self.assertEqual(none["freezes"], 0)
 
+    def test_a_receiver_is_innocent_only_while_no_other_window_names_it(self):
+        def ents(freezes):
+            rows = lone_track("rtcd-rs", 0, freezes=freezes)
+            rows += window(20, 100, "a1", "rtcp-garbage", ["s18"]) + window(30, 40, "a2", "bw-flap", ["s17"])
+            return self.ents(rows)
+        count = lambda e: report.attack_metrics(e, lambda n: n == "rtcp-garbage", dict(report.DEFAULTS))["freezes"]
+        self.assertEqual(count(ents(lambda t: 1 if t >= 35 else 0)), 0)  # during bw-flap, which names s17
+        self.assertEqual(count(ents(lambda t: (1 if t >= 35 else 0) + (1 if t >= 70 else 0))), 1)  # outside it
+
     def test_a_clean_freeze_fails_in_pli_flood_but_not_in_load_hold(self):
         freeze = {"clean_freezes": lambda t: 1 if t > 100 else 0}
         for name, status in (("pli-flood", 1), ("load-hold", 0)):
@@ -409,6 +498,16 @@ class Attacks(Fixture):
         with open(rules, "w") as f:
             json.dump(RULES, f)
         self.assertEqual(report.main(["--rules", rules, "--out", os.path.join(d, "out"), p]), 1)
+
+    def test_classes_after_the_baseline_server_stopped_are_not_compared(self):
+        flood = window(100, 110, "a1", "pli-flood") + window(220, 230, "a2", "reorder")
+        s = side("rtcd-rs", extra=flood)
+        b = [r for r in side("rtcd-go", extra=[dict(r, impl="rtcd-go") for r in flood])
+             if not (r["kind"] == "proc" and r["ts"] > ts(200))]
+        _, md, _, _ = run_report(s, b)
+        self.assertIn("| pli-flood | Freezes (count) | 0 | 0 | ok |", md)
+        self.assertNotIn("| reorder | Freezes", md)
+        self.assertIn("attack reorder | only the subject has it | both sides need it | n/a", md)
 
     def test_sfu_slopes_and_saturation(self):
         grow = [dict(r, threads=10 + (r["ts"] - T0) // 1000 // STEP, cpu_pct=200.0) for r in proc("rtcd-rs", END)]

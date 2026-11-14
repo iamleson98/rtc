@@ -262,16 +262,13 @@ pub fn set_multicast_interface<S: std::os::windows::io::AsSocket>(
 /// A send that fails this way may still succeed through another interface, so the caller can
 /// retry with `IP_MULTICAST_IF` set to each of [`multicast_interfaces`].
 pub fn is_route_error(err: &io::Error) -> bool {
-    if matches!(
+    matches!(
         err.kind(),
         io::ErrorKind::HostUnreachable
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::NetworkDown
             | io::ErrorKind::AddrNotAvailable
-    ) {
-        return true;
-    }
-    false
+    )
 }
 
 #[cfg(test)]
