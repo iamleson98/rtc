@@ -15,6 +15,8 @@ mod agent_test;
 #[cfg(test)]
 mod pion_agent_test;
 #[cfg(test)]
+mod rebind_test;
+#[cfg(test)]
 mod selection_test;
 
 /// Configuration for a new [`Agent`]: servers, timeouts and role.
