@@ -775,9 +775,15 @@ impl Candidate {
     }
 
     /// The wire form of the extension attributes: `key value key value ...`.
+    ///
+    /// Spaces in a row among the extensions of a parsed line make extensions without a name
+    /// (kept, as pion keeps them). Ones that would come first are left out: the attributes would
+    /// begin with a space, and the line would not parse. They come first where a `tcptype`
+    /// without a value, which is not stored, stood before them.
     pub fn marshal_extensions(&self) -> String {
         self.extensions()
             .iter()
+            .skip_while(|ext| ext.key.is_empty())
             .map(|ext| format!("{} {}", ext.key, ext.value))
             .collect::<Vec<_>>()
             .join(" ")
