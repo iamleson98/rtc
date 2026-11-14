@@ -295,7 +295,9 @@ load `load-hold`. A server-side failure is an `event` with `what` `error` and id
 
 For every `compare` pair and architecture, the subject and the baseline side by side, per group
 (`clean`, `impaired`) and phase (`all` and each netem phase), for: freezes per minute, freeze ms per
-minute, audio gap %, residual loss % (after retransmission, from unique packets), duplicate %, stall
+minute (in the `outage` phase, the freeze ms per outage instead: the freeze booked from the outage's
+start to one sample after its recovery began, so the sampling clock cannot decide it; the `recover` phase
+leaves that span out), the video frames per second (higher is better; not in the `outage` phase, which has too few intervals for a rate), audio gap %, residual loss % (after retransmission, from unique packets), duplicate %, stall
 count and longest stall, recovery after an outage (median, p90, tracks that never recovered), SFU-closed
 sessions, signaling closes, lost seats, rejoins and their total downtime, ICE disconnects and failures,
 and the Mbit/s each participant received (all its tracks together; in the bw phase this is what shows
@@ -306,8 +308,9 @@ the breaches. `report.html` charts subject against baseline over the run, with t
 With `attack` rows, per architecture and per attack class (scope `attack`, the class in the phase
 column) the metrics of the innocent receivers: every receiver of the `clean` group, and those of
 other participants the window does not name (`who`; a window with `group` names that whole group),
-over the intervals from the window's start to `recover_window_s` after its end: freezes (count) and
-freeze rate, stalls and longest stall, SFU closes, signaling closes, ICE disconnects, `recover_s` (per
+over the intervals from the window's start to `recover_window_s` after its end, leaving out the time another window that names the
+receiver overlaps (a class left with nothing to score reports n/a): freezes (count),
+freeze rate and frozen ms per minute of video (over the same intervals, counted once per class), stalls and longest stall, SFU closes, signaling closes, ICE disconnects, `recover_s` (per
 window the p90 over the innocent video tracks that were flowing at the start, seconds from the end of
 the window until they flow again, 0 when never interrupted, `never` if not within `recover_window_s`;
 the worst window of the class) and `never` (those tracks). `summary.md` has a table per architecture of
@@ -321,6 +324,9 @@ Recovery is measured over the tracks that are expected to flow: the participant 
 the outage and stayed through `recover_window_s` after it. A track that ends because the SFU closed
 the session, or the participant left, is not one of them: it is a close, counted as one, with the
 participant's downtime until it rejoins (or until the run ends).
+The recovery time is placed inside the sample interval that first shows frames by the freeze ms the
+track counted since the outage began, so it does not round to the sampling clock (a track with no
+freeze ms keeps the sample's time).
 
 ## Rules (`rules.json`)
 
@@ -333,6 +339,11 @@ without failing on it. For each architecture the subject is held to the baseline
 * counts (stalls, closes, ICE disconnects, rejoins ...): subject <= baseline + slack (0). An ICE
   disconnect that starts in an outage, or within one sample interval after it, is the outage's and is
   not counted; an ICE failure always is.
+* frames per second (higher is better): subject >= baseline / `ratio` - slack (1). Freezes per minute
+  breach only when the subject's freeze ms per minute is also above the baseline's: a stream that stays
+  frozen has few freezes, one that plays and stutters has many.
+  The attack classes follow the same rule: their freezes per minute breach only with their freeze ms per
+  minute, which is gated like the scope's.
 
 Data that is missing fails loudly: no baseline (or no subject) data for an architecture, a group the
 subject must have (`require_groups`) without receivers, a side with SFU process samples where the other
