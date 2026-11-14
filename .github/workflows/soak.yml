@@ -39,6 +39,8 @@ jobs:
     name: soak ${{ matrix.pair }} / ${{ matrix.arch }} / ${{ matrix.profile }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 180 # the run is bounded by MINUTES (120 by default) plus the build; expressions have no arithmetic
+    # pion failing is the baseline's finding, not rtc's: the report compares rtc over the minutes pion ran.
+    continue-on-error: ${{ matrix.pair == 'pion-pion' }}
     strategy:
       fail-fast: false
       matrix:

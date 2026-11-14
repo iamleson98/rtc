@@ -237,6 +237,44 @@ class CleanGroup(Fixture):
         self.assertIn("SFU process errors", md)
 
 
+class EarlyStop(Fixture):
+    """A baseline killed part way (OOM, crash) is compared over the minutes it ran."""
+
+    @staticmethod
+    def stopped(t_end):
+        gone = event("rtcd-go", t_end, "sfu", "error", "the SFU process is gone")
+        gone.pop("group")
+        return [r for r in side("rtcd-go") if r["ts"] <= ts(t_end)] + [gone]
+
+    def test_what_the_subject_did_after_the_baseline_stopped_is_not_compared(self):
+        late = [event("rtcd-rs", 200, "s17", "error", "the SFU closed the session")]
+        status, md, _, _ = run_report(side("rtcd-rs", extra=late), self.stopped(100))
+        self.assertEqual(status, 0, md)
+        self.assertIn("the baseline stopped early", md)
+
+    def test_what_the_subject_did_while_the_baseline_ran_is_still_compared(self):
+        early = [event("rtcd-rs", 70, "s17", "error", "the SFU closed the session")]
+        status, md, _, _ = run_report(side("rtcd-rs", extra=early), self.stopped(100))
+        self.assertEqual(status, 1)
+        self.assertIn("SFU-closed sessions", md.split("## Breaches")[1].split("## ")[0])
+
+    def test_the_subjects_absolute_rules_cover_its_whole_run(self):
+        late = {"clean_freezes": lambda t: 1 if t > 200 else 0}
+        status, md, _, _ = run_report(side("rtcd-rs", **late), self.stopped(100))
+        self.assertEqual(status, 1)
+        self.assertIn("clean group, subject Freezes (count) must be zero", md)
+
+
+class CleanZeroPerPair(Fixture):
+    def test_a_pair_may_leave_freezes_to_the_comparison(self):
+        both = {"clean_freezes": lambda t: 1 if t > 100 else 0}
+        rules = dict(RULES, compare=[{"subject": "rtcd-rs", "baseline": "rtcd-go",
+                                      "clean_zero": ["stalls", "closes", "ice_disc"]}])
+        status, md, _, _ = run_report(side("rtcd-rs", **both), side("rtcd-go", **both), rules)
+        self.assertEqual(status, 0, md)
+        self.assertNotIn("Freezes (count) must be zero", md)
+
+
 class Attacks(Fixture):
     def ents(self, rows, impl="rtcd-rs"):
         _, _, ents, _ = run_report(rows, side("rtcd-go"))
@@ -287,6 +325,40 @@ class Attacks(Fixture):
         e = self.ents(side("rtcd-rs", extra=win, **stuck))[0]
         m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
         self.assertEqual((m["recover_s"], m["never"]), (float("inf"), 1))
+
+    def late_outage_rows(self, wins, stalled=()):
+        """An impaired receiver of a run with the outage at 250 s; `stalled` samples are flagged."""
+        rows = [phase(0, "clean"), phase(250, "outage"), phase(400, "recover")] + proc("rtcd-rs", 500)
+        rows += track("rtcd-rs", "s17/video:teacher", "impaired", 500, bytes_per_s=300_000,
+                      flowing=lambda t: not 250 <= t < 400)
+        for r in rows:
+            if r["kind"] == "recv" and r["ts"] in {ts(t) for t in stalled}:
+                r["stalled"] = True
+        return rows + wins
+
+    def test_an_attack_ending_before_an_outage_is_not_charged_with_it(self):
+        win = window(20, 50, "a1", "pli-flood", ["s99"])
+        e = self.ents(self.late_outage_rows(win))[0]
+        m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        self.assertEqual((m["never"], m["recover_s"]), (0, 0.0))
+
+    def test_overlapping_windows_of_one_class_count_a_stall_once(self):
+        wins = window(20, 50, "a1", "pli-flood", ["s99"]) + window(25, 55, "a2", "pli-flood", ["s99"])
+        e = self.ents(self.late_outage_rows(wins, stalled=(30, 35)))[0]
+        m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        self.assertEqual(m["stalls"], 1)
+
+    def test_an_event_in_two_overlapping_windows_of_one_class_counts_once(self):
+        wins = window(20, 50, "a1", "pli-flood", ["s99"]) + window(25, 55, "a2", "pli-flood", ["s99"])
+        ev = [event("rtcd-rs", 30, "s17", "error", "the SFU closed the session")]
+        e = self.ents(self.late_outage_rows(wins) + ev)[0]
+        m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        self.assertEqual(m["closes"], 1)
+        other = window(25, 55, "a2", "reorder", ["s99"])
+        e = self.ents(self.late_outage_rows(window(20, 50, "a1", "pli-flood", ["s99"]) + other) + ev)[0]
+        total = sum(report.attack_metrics([e], lambda n, c=c: n == c, dict(report.DEFAULTS))["closes"]
+                    for c in ("pli-flood", "reorder"))
+        self.assertEqual(total, 2)  # once per class
 
     def test_slow_recovery_breaches_equal_runs_pass(self):
         win = window(100, 110, "a1", "pli-flood", ["s17"])

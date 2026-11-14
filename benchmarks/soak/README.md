@@ -217,9 +217,7 @@ SEED=7 PROFILE=abuse ONLY=glare,dc-oversize benchmarks/soak/run.sh pion-pion 3 o
 Crashes: a peer that exits non-zero (a panic on any thread of the Rust peer exits 101; a Go panic exits 2),
 or whose log has a `panic:`, `fatal error:` or `panicked` line, fails `run.sh`, and `run.sh` writes it as
 an `error` `event` of id `sfu`, which the report counts as a process error and gates at zero. The
-measured call has no tolerance for a failed connection either: a peer whose call fails exits 1. The
-Rust peer does not treat a datagram that `handle_read` refuses as fatal in this profile; it counts them
-(`event` `junk-rejected`). What the report gates is the same as for the call profile, with `rules-abuse.json`:
+measured call has no tolerance for a failed connection either: a peer whose call fails exits 1. What the report gates is the same as for the call profile, with `rules-abuse.json`:
 process errors, closes, freezes, stalls and the leak slopes of the subject against pion, and per attack
 class what the measured receivers saw in the windows (`clean_zero` is empty: there is no unimpaired
 group). Nothing leaves the machine: the peers use loopback, the hostile sockets send to 127.0.0.1 only.
@@ -262,8 +260,8 @@ message arrived). The peers send `{"n":<count>,"ts":<unix microseconds>}` at 10 
 negotiated channel, id 1, label `soak`.
 
 `event`: `what` is `ice_state`, `wrap`, `join`, `leave`, `rejoin`, `error`, and in the abuse profile `seed`,
-`churn` (cumulative `made=N connected=N failed=N` of the extra connections), `attack-unsupported` and
-`junk-rejected`, with a `detail` string
+`churn` (cumulative `made=N connected=N failed=N` of the extra connections) and `attack-unsupported`,
+with a `detail` string
 and, from the lesson harness, the `group` of the participant (default `impaired`). `wrap` lines read
 `send|recv audio|video seq|ts wrap`. The report counts these `error` details: `the SFU closed the
 session`, `the signaling connection closed`, and the rest as lost seats (`the media path stayed
@@ -336,8 +334,11 @@ without failing on it. For each architecture the subject is held to the baseline
 Data that is missing fails loudly: no baseline (or no subject) data for an architecture, a group the
 subject must have (`require_groups`) without receivers, a side with SFU process samples where the other
 has none. Absolute rules: in the `clean` group (a path that is never impaired) the metrics in
-`clean_zero` (default zero stalls, freezes, SFU closes, ICE disconnects) must be zero, for the baseline
-too (reported only); the SFU process must not have errors. The self-drift of the subject: first clean
+`clean_zero` (default zero stalls, freezes, SFU closes, ICE disconnects; a `compare` entry may set its
+own list) must be zero, for the baseline too (reported only); the SFU process must not have errors. A
+baseline whose samples end more than a minute before the subject's (killed for memory, crashed) is
+compared over the minutes it ran, and the report says so; the subject's absolute rules still cover its
+whole run. The self-drift of the subject: first clean
 window against last (`freeze_rate_*`, `audio_gap_*`, judged only with `min_clean_window_min` of clean
 time in each window), and `rss_slope_mb_per_h_max` (only on runs with `rss_slope_min_span_min`
 minutes after `warmup_min`). During attacks the clean group is judged the same way (it is innocent in every window), with one
@@ -355,6 +356,7 @@ The same rules with the pairs the abuse profile runs (`rtc-rtc` against `pion-pi
 reorders, duplicates, delays and drops, and an attack window overlaps whatever netem scene is running:
 `stalls` +15, `stall_max` +10 s, `recover_s` +120 s, `ice_disc` +3, and `freezes` effectively not gated
 as a count in the attack classes (the freeze rate is). `recover_window_s` is 240 s (the ICE patience): a
-measured video track that has not come back that long after a window ended is `never`. Everything else is as strict as the call profile:
+measured video track that has not come back that long after a window ended is `never`. A window is scored only up to the start of the next outage of the receiver's group (an outage's recovery is
+judged on its own), and a stall that overlapping windows of one class (offerer and answerer) share counts once. Everything else is as strict as the call profile:
 process errors (a crash) must be zero, `never` recovered, closes and ICE failures at the baseline.
 The slack values are a first guess to be tuned from the first long runs.

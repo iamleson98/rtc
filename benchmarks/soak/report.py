@@ -10,6 +10,7 @@ Exit code: 0 all gates held, 1 a gated rule was broken, 2 unusable input.
 Python 3 standard library only.
 """
 import argparse
+import copy
 import html
 import json
 import math
@@ -97,6 +98,7 @@ PALETTE = ["#2563eb", "#dc2626", "#059669", "#d97706"]
 ATTACK_KEYS = ("freezes", "freeze_rate", "stalls", "stall_max", "closes", "sig_closes", "ice_disc", "recover_s",
                "never")
 ATTACK_FILL = "#a855f7"
+EARLY_STOP_S = 60  # a baseline whose samples end this much before the subject's stopped early
 WINDOW_LIST_MAX = 200  # the per-window table lists every window up to this many, then only those with an impact
 PHASE_FILL = {"loss": "#facc15", "burst": "#fb923c", "bw": "#60a5fa", "outage": "#ef4444"}
 CLOSES = ("the SFU closed the session",)
@@ -276,6 +278,30 @@ def build_entities(runs):
 
 
 # ---------------------------------------------------------------- measures
+
+def clipped(ents, t_end):
+    """The same entities with everything after `t_end` (seconds into their run) left out: what the
+    subject did while a baseline that stopped early was still running."""
+    out, runs = [], {}
+    for e in ents:
+        run = runs.get(id(e.run))
+        if run is None:
+            run = runs[id(e.run)] = copy.copy(e.run)
+            run.attacks = [dict(w, end=min(w["end"], t_end)) for w in e.run.attacks if w["start"] < t_end]
+            run.t1 = min(run.t1, run.t0 + t_end)
+        c = Ent(e.impl, e.arch, run)
+        c.events = [ev for ev in e.events if ev["t"] <= t_end]
+        c.t1 = min(e.t1, t_end)
+        for key, s in e.series.items():
+            n = Series(c, s.kind, s.id)
+            n.media, n.group = s.media, s.group
+            n.s = [r for r in s.s if r["t"] <= t_end]
+            if n.s:
+                n.build()
+                c.series[key] = n
+        out.append(c)
+    return out
+
 
 def mean(xs):
     xs = [x for x in xs if x is not None]
@@ -554,8 +580,9 @@ def attacked(win, group, who):
 
 def window_metrics(ent, win, rules, clean_only=False):
     """What the innocent receivers of one attack window saw between its start and `recover_window_s`
-    after its end. Innocent: every participant of the clean group, and those of the other groups that
-    the window does not name (`clean_only`: the clean group alone)."""
+    after its end, cut at the start of the receiver group's next outage (an outage's recovery is judged
+    by `recoveries`, not charged to the attack). Innocent: every participant of the clean group, and
+    those of the other groups that the window does not name (`clean_only`: the clean group alone)."""
     rw = rules["recover_window_s"]
     a, b = win["start"], win["end"]
     z = b + rw
@@ -563,21 +590,30 @@ def window_metrics(ent, win, rules, clean_only=False):
     def innocent(group, who):
         return group == "clean" or (not clean_only and not attacked(win, group, who))
 
-    m = {"freezes": 0, "vid_dt": 0.0, "stalls": [], "closes": 0, "sig_closes": 0, "ice_disc": 0, "rec": []}
+    def cut(group):
+        """End of the scored span for a receiver group: `z`, or the start of its next outage."""
+        nxt = [t for t, name in ent.run.phases(group) if name == "outage" and t > a]
+        return min([z] + nxt)
+
+    m = {"freezes": 0, "vid_dt": 0.0, "stalls": [], "closes": 0, "sig_closes": 0, "ice_disc": 0, "rec": [],
+         "fz": [], "vdt": [], "ev": [], "never_at": []}
     for s in ent.series.values():
         if s.kind != "recv" or not innocent(s.group, s.who):
             continue
-        ivs = [i for i in s.ivs if i["t"] > a and i["t"] - i["dt"] < z]
+        zs = cut(s.group)
+        ivs = [i for i in s.ivs if i["t"] > a and i["t"] - i["dt"] < zs]
         m["freezes"] += sum(i["freezes"] for i in ivs)
+        m["fz"] += [((s.id, i["t"]), i["freezes"]) for i in ivs if i["freezes"]]
         if s.media == "video":
             m["vid_dt"] += sum(i["dt"] for i in ivs)
-        m["stalls"] += [d for st, d in stalls(s) if a <= st <= z]
-        if s.media != "video" or s.s[-1]["t"] < b:
+            m["vdt"] += [((s.id, i["t"]), i["dt"]) for i in ivs]
+        m["stalls"] += [(s.id, st, d) for st, d in stalls(s) if a <= st <= zs]
+        if s.media != "video" or s.s[-1]["t"] < b or zs <= b:
             continue
         before = [i for i in s.ivs if i["t"] <= a]
         if not before or before[-1]["frames"] <= 0:
             continue  # not flowing when the attack began
-        inside = [i for i in ivs if i["t"] <= z]
+        inside = [i for i in ivs if i["t"] <= zs]
         bad = [i for i in inside if i["frames"] <= 0]
         if not bad:
             m["rec"].append(0.0)
@@ -585,13 +621,16 @@ def window_metrics(ent, win, rules, clean_only=False):
         nxt = next((i for i in inside if i["t"] > bad[-1]["t"]), None)
         if nxt is not None:
             m["rec"].append(max(0.0, nxt["t"] - b))
-        elif s.s[-1]["t"] >= z:
+        elif zs == z and s.s[-1]["t"] >= z:
             m["rec"].append(math.inf)
+            m["never_at"].append((s.id, bad[-1]["t"]))
     for ev in ent.events:
         kind = classify(ev)
-        if kind in ("closes", "sig_closes", "ice_disc") and ev.get("id") != "sfu" and a <= ev["t"] <= z \
-                and innocent(str(ev.get("group") or "impaired"), str(ev.get("id"))):
+        group = str(ev.get("group") or "impaired")
+        if kind in ("closes", "sig_closes", "ice_disc") and ev.get("id") != "sfu" and a <= ev["t"] <= cut(group) \
+                and innocent(group, str(ev.get("id"))):
             m[kind] += 1
+            m["ev"].append((kind, ev.get("id"), ev["t"], ev.get("detail")))
     return m
 
 
@@ -605,16 +644,25 @@ def attack_metrics(ents, pick_name, rules, clean_only=False):
     if not wins:
         return None
     per = [window_metrics(e, w, rules, clean_only) for e, w in wins]
-    dt = sum(p["vid_dt"] for p in per)
-    st = [d for p in per for d in p["stalls"]]
+    # Windows of one class overlap (offerer and answerer, or back to back), and a stall, freeze, close
+    # or lost track that falls in several of them is one thing that happened: count it once per class.
+    def once(field):
+        return {(w["name"], k): v for (_, w), p in zip(wins, per) for k, v in p[field]}
+
+    def events(kind):
+        return len({(w["name"], x) for (_, w), p in zip(wins, per) for x in p["ev"] if x[0] == kind})
+
+    fz = sum(once("fz").values())
+    dt = sum(once("vdt").values())
+    st = list({(w["name"], sid, t): d for (_, w), p in zip(wins, per) for sid, t, d in p["stalls"]}.values())
+    never = len({(w["name"], x) for (_, w), p in zip(wins, per) for x in p["never_at"]})
     p90 = [quantile(p["rec"], 0.9) for p in per if p["rec"]]
-    return {"freezes": sum(p["freezes"] for p in per),
-            "freeze_rate": sum(p["freezes"] for p in per) * 60.0 / dt if dt > 0 else None,
+    return {"freezes": fz,
+            "freeze_rate": fz * 60.0 / dt if dt > 0 else None,
             "stalls": len(st), "stall_max": max(st, default=0.0),
-            "closes": sum(p["closes"] for p in per), "sig_closes": sum(p["sig_closes"] for p in per),
-            "ice_disc": sum(p["ice_disc"] for p in per),
+            "closes": events("closes"), "sig_closes": events("sig_closes"), "ice_disc": events("ice_disc"),
             "recover_s": max(p90) if p90 else None,
-            "never": sum(1 for p in per for x in p["rec"] if math.isinf(x)) if p90 else None}
+            "never": never if p90 else None}
 
 
 def attack_classes(ents):
@@ -672,6 +720,15 @@ def compare(ents, rules):
                 missing = "baseline" if not b_ents else "subject"
                 add(gated, where, "no %s data on %s" % (missing, arch), "both sides need data", False)
                 continue
+            # A baseline that stopped early (killed, crashed) is compared over the time it ran: the
+            # subject's later minutes would otherwise be held against nothing. The subject's absolute
+            # checks below (clean group, process errors, drift) still cover its whole run.
+            full_ents = s_ents
+            s_span, b_span = max(e.t1 for e in s_ents), max(e.t1 for e in b_ents)
+            if b_span < s_span - EARLY_STOP_S:
+                add(False, where + ": the baseline stopped early", "after %.1f of %.1f min" % (
+                    b_span / 60.0, s_span / 60.0), "compared over its %.1f min" % (b_span / 60.0), None)
+                s_ents = clipped(s_ents, b_span)
             groups = sorted({s.group for e in s_ents + b_ents for s in e.series.values() if s.kind == "recv"},
                             key=lambda g: (g != "clean", g))
             for g in rules["require_groups"] if spec.get("require", True) else []:
@@ -733,20 +790,20 @@ def compare(ents, rules):
             # The clean group is never impaired: whatever it shows is the server's, except while an
             # attack that loads the whole server (`global_load`) runs.
             drop = global_drop(rules)
-            for side, side_ents, g_ in (("subject", s_ents, gated), ("baseline", b_ents, False)):
+            for side, side_ents, g_ in (("subject", full_ents, gated), ("baseline", b_ents, False)):
                 cm = scope_metrics(side_ents, "clean", None, rules, drop)
                 if cm is None:
                     continue
-                for key in rules["clean_zero"]:
+                for key in spec.get("clean_zero", rules["clean_zero"]):
                     v = cm.get(key)
                     if v is not None:
                         add(g_, "%s: clean group, %s %s must be zero" % (where, side, TITLE[key]), fmt(v, 0), "0", v == 0)
-            for side, side_ents, g_ in (("subject", s_ents, gated), ("baseline", b_ents, False)):
+            for side, side_ents, g_ in (("subject", full_ents, gated), ("baseline", b_ents, False)):
                 sm = sfu_metrics(side_ents, rules)
                 if sm is not None:
                     add(g_, "%s: %s SFU process errors (gone, crashed) must be zero" % (where, side),
                         fmt(sm["sfu_errors"], 0), "0", sm["sfu_errors"] == 0)
-            drift_checks(s_ents, rules, where, gated, add)
+            drift_checks(full_ents, rules, where, gated, add)
     return rows, checks
 
 
