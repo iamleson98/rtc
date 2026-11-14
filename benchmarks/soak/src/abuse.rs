@@ -1211,9 +1211,11 @@ fn junk_worker(cfg: Arc<Cfg>) {
     let mut rng = cfg.rng(2);
     let mut n = 0u64;
     while cfg.live() {
-        nap(ms(rng.range(5000, 15_000)), cfg.end);
-        let class = classes[rng.next() as usize % classes.len()];
-        let until = (Instant::now() + ms(rng.range(8000, 20_000))).min(cfg.end);
+        let w = junk_window(&mut rng, classes.len());
+        nap(ms(w.pause), cfg.end);
+        let class = classes[w.class];
+        let until = (Instant::now() + ms(w.dur)).min(cfg.end);
+        let mut rng = Rng::new(w.sub); // the packets never touch the schedule
         if !cfg.live() {
             break;
         }
@@ -1247,6 +1249,25 @@ fn junk_worker(cfg: Arc<Cfg>) {
             thread::sleep(ms(10));
         }
         log.attack(&id, class, "end", cfg.seed, "");
+    }
+}
+
+/// One junk window as the schedule draws it: the pause before it, the class (an index), how long
+/// it lasts, and the seed of its packets. The packets come from their own generator, so the
+/// number sent (wall-clock dependent) never shifts a later window.
+struct JunkWindow {
+    pause: u64,
+    class: usize,
+    dur: u64,
+    sub: u64,
+}
+
+fn junk_window(rng: &mut Rng, classes: usize) -> JunkWindow {
+    JunkWindow {
+        pause: rng.range(5000, 15_000),
+        class: rng.next() as usize % classes,
+        dur: rng.range(8000, 20_000),
+        sub: rng.next(),
     }
 }
 
@@ -1294,4 +1315,31 @@ fn dtls_junk(rng: &mut Rng) -> Vec<u8> {
     v.extend((hs.len() as u16).to_be_bytes());
     v.extend(hs);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schedule(seed: u64, packets: usize) -> Vec<(u64, usize, u64)> {
+        let mut rng = Rng::new(seed);
+        (0..20)
+            .map(|_| {
+                let w = junk_window(&mut rng, 3);
+                let mut pk = Rng::new(w.sub);
+                for _ in 0..packets {
+                    dtls_junk(&mut pk);
+                    stun_request(&mut pk);
+                }
+                (w.pause, w.class, w.dur)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn junk_schedule_ignores_packet_count() {
+        assert_eq!(schedule(7, 0), schedule(7, 5));
+        assert_eq!(schedule(7, 5), schedule(7, 300));
+        assert_ne!(schedule(7, 0), schedule(8, 0));
+    }
 }

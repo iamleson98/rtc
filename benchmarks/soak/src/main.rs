@@ -424,7 +424,6 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut t_report = t_audio + REPORT_EVERY;
     let mut end = None::<Instant>;
     let mut abusers = None;
-    let mut rejected = 0u64; // packets the library refused to read (abuse profile)
 
     loop {
         let now = Instant::now();
@@ -576,7 +575,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 .max(Duration::from_micros(500)),
         ))?;
         if let Ok((n, peer_addr)) = socket.recv_from(&mut buf) {
-            let read = pc.handle_read(TaggedBytesMut {
+            pc.handle_read(TaggedBytesMut {
                 now: Instant::now(),
                 transport: TransportContext {
                     local_addr,
@@ -585,24 +584,11 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     transport_protocol: TransportProtocol::UDP,
                 },
                 message: BytesMut::from(&buf[..n]),
-            });
-            // Hostile datagrams are refused with an error; only the call profile treats that as fatal.
-            if let Err(e) = read {
-                if a.profile != "abuse" {
-                    return Err(e.into());
-                }
-                rejected += 1;
-            }
+            })?;
         }
     }
     if let Some(h) = abusers {
         h.stop();
-    }
-    if rejected > 0 {
-        log.event(
-            "junk-rejected",
-            &format!("{rejected} datagrams refused by handle_read"),
-        );
     }
     if state.connected {
         report(log, &id, &mut pc, &mut state, &mut proc, Instant::now());
