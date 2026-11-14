@@ -75,11 +75,7 @@ impl Fmtp for H264Fmtp {
                 None => return false,
             };
 
-            if !profile_level_id_matches(hplid, cplid) {
-                return false;
-            }
-
-            true
+            profile_level_id_matches(hplid, cplid)
         } else {
             false
         }
