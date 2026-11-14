@@ -40,7 +40,7 @@ impl Context {
 
         let dst = self.cipher.decrypt_rtcp(encrypted, index, ssrc)?;
 
-        if let Some(replay_detector) = &mut self.get_srtcp_ssrc_state(ssrc).replay_detector {
+        if let Some(replay_detector) = &mut self.remote_srtcp_ssrc_state(ssrc).replay_detector {
             // A new SSRC's detector has not been asked about this packet yet.
             replay_detector.check(index as u64);
             replay_detector.accept();

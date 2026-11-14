@@ -83,7 +83,7 @@ impl Context {
 
         decrypt(self.cipher.as_mut(), roc)?;
 
-        let state = self.get_srtp_ssrc_state(ssrc);
+        let state = self.remote_srtp_ssrc_state(ssrc);
         if let Some(replay_detector) = &mut state.replay_detector {
             // A new SSRC's detector has not been asked about this packet yet (roc 0 here, as
             // the guess above for a stream with no history).

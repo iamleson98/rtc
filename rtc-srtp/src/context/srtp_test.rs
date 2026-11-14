@@ -856,3 +856,42 @@ fn test_srtp_failed_auth_does_not_grow_ssrc_map() -> Result<()> {
 
     Ok(())
 }
+
+/// A peer holding the keys can send a new SSRC in every packet: the receiver keeps state for at
+/// most `MAX_REMOTE_SSRCS` of them, and a stream still sending keeps its state and replay window.
+#[test]
+fn test_authenticated_random_ssrcs_keep_the_state_bounded() {
+    for profile in [
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        ProtectionProfile::AeadAes128Gcm,
+    ] {
+        let mut sender = media_context(profile);
+        let mut receiver = media_context(profile);
+        let live = 0xABCD;
+        let mut last = Vec::new();
+        for i in 0..20_000u32 {
+            let protected = sender
+                .encrypt_rtp(&rtp_packet(0x1000_0000 + i, 1, 20))
+                .unwrap();
+            receiver.decrypt_rtp(&protected).unwrap();
+            if i % 100 == 0 {
+                let seq = (i / 100) as u16;
+                last = sender
+                    .encrypt_rtp(&rtp_packet(live, seq, 20))
+                    .unwrap()
+                    .to_vec();
+                receiver.decrypt_rtp(&last).unwrap();
+            }
+        }
+        assert!(
+            receiver.srtp_ssrc_states.len() <= MAX_REMOTE_SSRCS,
+            "{profile:?}: {} SSRC states",
+            receiver.srtp_ssrc_states.len()
+        );
+        assert!(receiver.srtp_ssrc_states.contains_key(&live));
+        assert!(
+            receiver.decrypt_rtp(&last).is_err(),
+            "{profile:?}: the live stream's replay window was lost"
+        );
+    }
+}

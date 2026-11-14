@@ -31,6 +31,11 @@ pub mod srtcp;
 pub mod srtp;
 
 const MAX_ROC: u32 = u32::MAX;
+/// The most SSRCs a context decrypting what a peer sends keeps state for. A peer chooses its
+/// SSRCs, and one holding the keys can send a new one in every packet: past this many, the state
+/// of the SSRC whose last packet is the oldest is dropped to make room. A real peer sends a few
+/// dozen streams at most, and only ever pushes out its own.
+pub(crate) const MAX_REMOTE_SSRCS: usize = 256;
 const SEQ_NUM_MEDIAN: u16 = 1 << 15;
 const SEQ_NUM_MAX: u16 = u16::MAX;
 
@@ -38,6 +43,8 @@ const SEQ_NUM_MAX: u16 = u16::MAX;
 #[derive(Default)]
 pub(crate) struct SrtpSsrcState {
     ssrc: u32,
+    /// When a packet for this SSRC last authenticated, in the context's count of them.
+    last_used: u64,
     index: u64,
     rollover_has_processed: bool,
     replay_detector: Option<Box<dyn ReplayDetector>>,
@@ -48,6 +55,8 @@ pub(crate) struct SrtpSsrcState {
 pub(crate) struct SrtcpSsrcState {
     srtcp_index: usize,
     ssrc: u32,
+    /// When a packet for this SSRC last authenticated, in the context's count of them.
+    last_used: u64,
     replay_detector: Option<Box<dyn ReplayDetector>>,
 }
 
@@ -109,6 +118,9 @@ pub struct Context {
 
     new_srtp_replay_detector: ContextOption,
     new_srtcp_replay_detector: ContextOption,
+
+    /// Packets decrypted so far: the clock of the SSRC states' `last_used`.
+    decrypted: u64,
 
     cryptex_mode: cryptex::CryptexMode,
 }
@@ -178,6 +190,7 @@ impl Context {
             srtcp_ssrc_states: SsrcMap::default(),
             new_srtp_replay_detector: srtp_ctx_opt,
             new_srtcp_replay_detector: srtcp_ctx_opt,
+            decrypted: 0,
             cryptex_mode: cryptex::CryptexMode::Disabled,
         })
     }
@@ -222,6 +235,27 @@ impl Context {
             })
     }
 
+    /// The state of an SSRC a packet just authenticated for, on the decrypting side: created if
+    /// new, within [`MAX_REMOTE_SSRCS`].
+    fn remote_srtp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtpSsrcState {
+        self.decrypted += 1;
+        make_room(&mut self.srtp_ssrc_states, ssrc, |s| s.last_used);
+        let now = self.decrypted;
+        let state = self.get_srtp_ssrc_state(ssrc);
+        state.last_used = now;
+        state
+    }
+
+    /// [`Self::remote_srtp_ssrc_state`] for SRTCP.
+    fn remote_srtcp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtcpSsrcState {
+        self.decrypted += 1;
+        make_room(&mut self.srtcp_ssrc_states, ssrc, |s| s.last_used);
+        let now = self.decrypted;
+        let state = self.get_srtcp_ssrc_state(ssrc);
+        state.last_used = now;
+        state
+    }
+
     /// roc returns SRTP rollover counter value of specified SSRC.
     fn get_roc(&self, ssrc: u32) -> Option<u32> {
         self.srtp_ssrc_states
@@ -259,7 +293,23 @@ impl Context {
             srtcp_ssrc_states: SsrcMap::default(),
             new_srtp_replay_detector: srtp_no_replay_protection(),
             new_srtcp_replay_detector: srtcp_no_replay_protection(),
+            decrypted: 0,
             cryptex_mode: cryptex::CryptexMode::Disabled,
         }
+    }
+}
+
+/// Drops the state of the SSRC used longest ago when `ssrc` is new and the map holds
+/// [`MAX_REMOTE_SSRCS`]: only then, so the scan is paid for new SSRCs past the cap alone.
+fn make_room<T>(states: &mut SsrcMap<T>, ssrc: u32, last_used: impl Fn(&T) -> u64) {
+    if states.len() < MAX_REMOTE_SSRCS || states.contains_key(&ssrc) {
+        return;
+    }
+    if let Some(oldest) = states
+        .iter()
+        .min_by_key(|(_, s)| last_used(s))
+        .map(|(&k, _)| k)
+    {
+        states.remove(&oldest);
     }
 }

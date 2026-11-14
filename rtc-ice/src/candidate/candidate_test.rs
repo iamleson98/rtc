@@ -1734,3 +1734,18 @@ fn test_priority_with_an_extreme_component_does_not_overflow() {
     let at_1 = unmarshal_candidate("1052353102 1 udp 0 192.0.2.2 1 typ host").unwrap();
     assert_eq!(at_1.priority() - at_256.priority(), 255);
 }
+
+/// Found by the `candidate_unmarshal` fuzz target: a `tcptype` without a value, followed by
+/// spaces in a row, left nameless extensions first, and the marshalled line did not parse.
+#[test]
+fn test_a_candidate_with_nameless_extensions_first_marshals_to_a_line_that_parses() {
+    for line in [
+        "    W\u{0}\u{0}.invalid  typ host tcptype      typ tpp tyyt?pz   ",
+        "1 1 udp 2130706431 10.0.0.1 9 typ host tcptype   generation 0",
+    ] {
+        let c = unmarshal_candidate(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        let again = unmarshal_candidate(&c.marshal()).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        assert_eq!(c.marshal(), again.marshal(), "{line:?}");
+        assert_eq!(c.priority(), again.priority(), "{line:?}");
+    }
+}
