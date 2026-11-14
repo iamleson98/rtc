@@ -555,6 +555,19 @@ impl Agent {
     }
 }
 
+/// USE-CANDIDATE when the check nominates its pair, nothing otherwise: lets the check be built
+/// from a fixed array, with no allocation per check.
+struct UseCandidateWhen(bool);
+
+impl Setter for UseCandidateWhen {
+    fn add_to(&self, m: &mut Message) -> Result<()> {
+        if self.0 {
+            UseCandidateAttr.add_to(m)?;
+        }
+        Ok(())
+    }
+}
+
 impl ControllingSelector for Agent {
     fn start(&mut self, now: Instant) {
         self.nominated_pair = None;
@@ -617,35 +630,28 @@ impl ControllingSelector for Agent {
             let username = remote_credentials.ufrag.clone()
                 + ":"
                 + self.ufrag_pwd.local_credentials.ufrag.as_str();
-            let mut setters: Vec<Box<dyn Setter>> = vec![
-                Box::new(BINDING_REQUEST),
-                Box::new(TransactionId::new()),
-                Box::new(Username::new(ATTR_USERNAME, username)),
-            ];
             // A lite peer never checks back, so what it learns about the path it learns from
             // these: nominating on every check of the selected pair lets it follow the address
             // this side is heard from when a NAT remaps it (RFC 8445 §8.1.1; libwebrtc does the
             // same toward a lite peer).
-            if self.remote_lite
+            let nominate = self.remote_lite
                 && self.get_selected_pair().is_some_and(|selected| {
                     Some(selected) == self.find_pair(local_index, remote_index)
-                })
-            {
-                setters.push(Box::<UseCandidateAttr>::default());
-            }
-            setters.push(Box::new(AttrControlling(self.tie_breaker)));
-            setters.push(Box::new(PriorityAttr(
-                self.local_candidates[local_index].prflx_priority(),
-            )));
-            setters.push(Box::new(
-                MessageIntegrity::new_short_term_integrity_with_provider(
+                });
+            let mut msg = Message::new();
+            let result = msg.build_with(&[
+                &BINDING_REQUEST,
+                &TransactionId::new(),
+                &Username::new(ATTR_USERNAME, username),
+                &UseCandidateWhen(nominate),
+                &AttrControlling(self.tie_breaker),
+                &PriorityAttr(self.local_candidates[local_index].prflx_priority()),
+                &MessageIntegrity::new_short_term_integrity_with_provider(
                     remote_credentials.pwd.clone(),
                     self.crypto_provider.crypto(),
                 ),
-            ));
-            setters.push(Box::new(FINGERPRINT));
-            let mut msg = Message::new();
-            let result = msg.build(&setters);
+                &FINGERPRINT,
+            ]);
             (msg, result)
         };
 
