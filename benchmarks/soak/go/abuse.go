@@ -923,6 +923,8 @@ func junkWorker(cfg *abuseCfg) {
 		cfg.nap(ms(r.span(5000, 15000)))
 		class := classes[r.next()%uint64(len(classes))]
 		until := time.Now().Add(ms(r.span(8000, 20000)))
+		// the packets come from their own generator, so how many are sent never shifts a later window
+		pk := &rng{r.next()}
 		if !cfg.live() {
 			break
 		}
@@ -944,14 +946,14 @@ func junkWorker(cfg *abuseCfg) {
 				var pkt []byte
 				switch class {
 				case "stun-flood":
-					pkt = stunRequest(r)
+					pkt = stunRequest(pk)
 				case "dtls-junk":
-					pkt = dtlsJunk(r)
+					pkt = dtlsJunk(pk)
 				default:
-					pkt = r.bytes(int(r.span(1, 1400)))
+					pkt = pk.bytes(int(pk.span(1, 1400)))
 				}
-				c := socks[r.next()%uint64(len(socks))]
-				port := cfg.mediaPorts[r.next()%uint64(len(cfg.mediaPorts))]
+				c := socks[pk.next()%uint64(len(socks))]
+				port := cfg.mediaPorts[pk.next()%uint64(len(cfg.mediaPorts))]
 				_, _ = c.WriteToUDP(pkt, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)})
 			}
 			cfg.nap(10 * time.Millisecond)
