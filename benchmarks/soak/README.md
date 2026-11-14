@@ -329,7 +329,9 @@ without failing on it. For each architecture the subject is held to the baseline
 
 * rates (freezes, loss, gaps, recovery times, CPU, RSS, downtime ...): subject <= baseline x `ratio`
   (1.25) + a slack in the metric's unit (`slack` overrides it per metric key, `ratios` the ratio);
-* counts (stalls, closes, ICE disconnects, rejoins ...): subject <= baseline + slack (0).
+* counts (stalls, closes, ICE disconnects, rejoins ...): subject <= baseline + slack (0). An ICE
+  disconnect that starts in an outage, or within one sample interval after it, is the outage's and is
+  not counted; an ICE failure always is.
 
 Data that is missing fails loudly: no baseline (or no subject) data for an architecture, a group the
 subject must have (`require_groups`) without receivers, a side with SFU process samples where the other

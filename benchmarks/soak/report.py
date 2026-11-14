@@ -427,6 +427,13 @@ def classify(e):
     return None
 
 
+def outage_disconnect(run, group, t):
+    """An ICE disconnect at t that the outage caused: the path was cut, any agent loses it. One that
+    starts within a sample interval after the outage counts too (the clocks of two shapers differ by
+    that much); an ICE failure is never excused."""
+    return run.phase_at(group, t)[0] == "outage" or run.phase_at(group, t - SAMPLE_S)[0] == "outage"
+
+
 def downtimes(ent):
     """[(t, group, seconds)]: every rejoin's downtime, and for every seat lost and never taken back
     the time from the loss to the end of the run."""
@@ -520,6 +527,8 @@ def scope_metrics(ents, group, phase, rules, drop=None):
             kind = classify(ev)
             if kind and ev.get("id") != "sfu" and str(ev.get("group") or "impaired") == group:
                 if drop is not None and drop(e.run, ev["t"], ev["t"]):
+                    continue
+                if kind == "ice_disc" and outage_disconnect(e.run, group, ev["t"]):
                     continue
                 if phase is None or e.run.phase_at(group, ev["t"])[0] == phase:
                     counts[kind] += 1

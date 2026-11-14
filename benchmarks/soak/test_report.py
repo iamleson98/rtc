@@ -237,6 +237,21 @@ class CleanGroup(Fixture):
         self.assertIn("SFU process errors", md)
 
 
+class OutageDisconnects(Fixture):
+    def test_an_ice_disconnect_the_outage_caused_is_not_counted(self):
+        blip = [event("rtcd-rs", 124, "s17", "ice_state", "ice:disconnected"),
+                event("rtcd-rs", 124.1, "s17", "ice_state", "ice:connected")]
+        status, md, _, _ = run_report(side("rtcd-rs", extra=blip), side("rtcd-go"))
+        self.assertEqual(status, 0, md)
+
+    def test_an_ice_disconnect_outside_the_outage_counts(self):
+        blip = [event("rtcd-rs", 90, "s17", "ice_state", "ice:disconnected"),
+                event("rtcd-rs", 91, "s17", "ice_state", "ice:connected")]
+        status, md, _, _ = run_report(side("rtcd-rs", extra=blip), side("rtcd-go"))
+        self.assertEqual(status, 1)
+        self.assertIn("ICE disconnects", md.split("## Breaches")[1].split("## ")[0])
+
+
 class EarlyStop(Fixture):
     """A baseline killed part way (OOM, crash) is compared over the minutes it ran."""
 
