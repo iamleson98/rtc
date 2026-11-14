@@ -248,12 +248,23 @@ def load(paths):
     return runs
 
 
+def lesson_end(run):
+    """When the first participant of a run stopped (`leave` with detail `stop`): from then on its
+    receivers measure the end of the lesson, not the server, so their samples stop there."""
+    stops = [o["t"] for o in run.rows if o["kind"] == "event" and o.get("what") == "leave"
+             and o.get("detail") == "stop"]
+    return min(stops, default=math.inf)
+
+
 def build_entities(runs):
     ents = {}
     for r in runs:
+        end = lesson_end(r)
         for o in r.rows:
             k = o["kind"]
             if k not in ("recv", "proc", "dc", "event") or not o.get("impl"):
+                continue
+            if k == "recv" and o["t"] > end:
                 continue
             key = (str(o["impl"]), str(o.get("arch", "unknown")), r.stem)
             e = ents.get(key)
