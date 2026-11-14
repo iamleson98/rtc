@@ -727,3 +727,45 @@ fn test_srtcp_failed_auth_does_not_grow_ssrc_map() -> Result<()> {
 
     Ok(())
 }
+
+/// As for SRTP (`test_authenticated_random_ssrcs_keep_the_state_bounded` there): RTCP from a
+/// peer holding the keys with a new sender SSRC in every packet keeps the state bounded, and the
+/// SSRC still sending keeps its replay window.
+#[test]
+fn test_authenticated_random_rtcp_ssrcs_keep_the_state_bounded() -> Result<()> {
+    let pli = |sender: u32| {
+        let mut pkt = vec![0x81, 0xce, 0x00, 0x02];
+        pkt.extend_from_slice(&sender.to_be_bytes());
+        pkt.extend_from_slice(&0xdeadbeefu32.to_be_bytes());
+        pkt
+    };
+    for profile in [
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        ProtectionProfile::AeadAes128Gcm,
+    ] {
+        let mut encrypt_context = build_test_context(profile)?;
+        let mut decrypt_context = build_test_context(profile)?;
+        decrypt_context.new_srtcp_replay_detector = srtcp_replay_protection(64);
+        let live = 0xABCD;
+        let mut last = Vec::new();
+        for i in 0..20_000u32 {
+            let encrypted = encrypt_context.encrypt_rtcp(&pli(0x1000_0000 + i))?;
+            decrypt_context.decrypt_rtcp(&encrypted)?;
+            if i % 100 == 0 {
+                last = encrypt_context.encrypt_rtcp(&pli(live))?.to_vec();
+                decrypt_context.decrypt_rtcp(&last)?;
+            }
+        }
+        assert!(
+            decrypt_context.srtcp_ssrc_states.len() <= MAX_REMOTE_SSRCS,
+            "{profile:?}: {} SSRC states",
+            decrypt_context.srtcp_ssrc_states.len()
+        );
+        assert!(decrypt_context.srtcp_ssrc_states.contains_key(&live));
+        assert!(
+            decrypt_context.decrypt_rtcp(&last).is_err(),
+            "{profile:?}: the live SSRC's replay window was lost"
+        );
+    }
+    Ok(())
+}
