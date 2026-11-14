@@ -237,6 +237,19 @@ class CleanGroup(Fixture):
         self.assertIn("SFU process errors", md)
 
 
+class LessonEnd(Fixture):
+    def test_receivers_stop_measuring_when_the_first_participant_stops(self):
+        # The teacher stops at 200 s; the student's receiver sees nothing after that until its own
+        # stop, which is the end of the lesson, not a stall of the server.
+        rows = [r for r in side("rtcd-rs") if not (r["kind"] == "recv" and r["id"] == "s17/video:teacher")]
+        tail = track("rtcd-rs", "s17/video:teacher", "impaired", END, flowing=lambda t: not (120 <= t < 125) and t < 200)
+        rows += [dict(r, stalled=r["ts"] > ts(205)) for r in tail]
+        rows += [event("rtcd-rs", 200, "c01", "leave", "stop", group="clean"),
+                 event("rtcd-rs", 240, "s17", "leave", "stop")]
+        status, md, _, _ = run_report(rows, side("rtcd-go"))
+        self.assertEqual(status, 0, md)
+
+
 class OutageDisconnects(Fixture):
     def test_an_ice_disconnect_the_outage_caused_is_not_counted(self):
         blip = [event("rtcd-rs", 124, "s17", "ice_state", "ice:disconnected"),

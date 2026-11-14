@@ -259,7 +259,8 @@ One JSON object per line. Every line has:
 message arrived). The peers send `{"n":<count>,"ts":<unix microseconds>}` at 10 messages/s on a
 negotiated channel, id 1, label `soak`.
 
-`event`: `what` is `ice_state`, `wrap`, `join`, `leave`, `rejoin`, `error`, and in the abuse profile `seed`,
+`event`: `what` is `ice_state`, `wrap`, `join`, `leave` (`stop` when the participant was stopped at the
+end; a run's `recv` samples end at its first one, since what follows is the lesson ending), `rejoin`, `error`, and in the abuse profile `seed`,
 `churn` (cumulative `made=N connected=N failed=N` of the extra connections) and `attack-unsupported`,
 with a `detail` string
 and, from the lesson harness, the `group` of the participant (default `impaired`). `wrap` lines read
