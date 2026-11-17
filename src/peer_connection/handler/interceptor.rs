@@ -389,30 +389,22 @@ impl<'a> InterceptorHandler<'a> {
         // only the primary here would also leave the pair unbalanced — `stop` unbinds all three, so
         // the repair flows would be unbound having never been bound.
         if let Some((ssrc_rtx, payload_type_rtx)) = rtx {
-            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+            RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                 self.interceptor,
                 true,
                 ssrc_rtx,
-                None,
-                None,
                 payload_type_rtx,
-                None,
-                None,
                 &codec,
                 &parameters.rtp_parameters.header_extensions,
             );
         }
 
         if let Some((ssrc_fec, payload_type_fec)) = fec {
-            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+            RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                 self.interceptor,
                 true,
                 ssrc_fec,
-                None,
-                None,
                 payload_type_fec,
-                None,
-                None,
                 &codec,
                 &parameters.rtp_parameters.header_extensions,
             );
@@ -749,30 +741,22 @@ impl<'a> InterceptorHandler<'a> {
         // matters most — every layer has its own retransmission flow, and NACK-driven repair is
         // what keeps the upper layers usable.
         if let Some((ssrc_rtx, payload_type_rtx)) = rtx {
-            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+            RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                 self.interceptor,
                 true,
                 ssrc_rtx,
-                None,
-                None,
                 payload_type_rtx,
-                None,
-                None,
                 &codec.rtp_codec,
                 &parameters.rtp_parameters.header_extensions,
             );
         }
 
         if let Some((ssrc_fec, payload_type_fec)) = fec {
-            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+            RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                 self.interceptor,
                 true,
                 ssrc_fec,
-                None,
-                None,
                 payload_type_fec,
-                None,
-                None,
                 &codec.rtp_codec,
                 &parameters.rtp_parameters.header_extensions,
             );

@@ -186,6 +186,10 @@ pub struct NackGeneratorInterceptor {
     /// Receive logs per remote stream SSRC
     receive_logs: HashMap<u32, ReceiveLog>,
 
+    /// For each tracked stream's RTX SSRC, the stream it repairs. A repair arrives on the RTX
+    /// SSRC but fills a hole in the primary's sequence-number space.
+    rtx_to_primary: HashMap<u32, u32>,
+
     /// When and how often each still-missing (SSRC, sequence number) was last asked for
     nack_states: HashMap<u32, HashMap<u16, NackState>>,
 
@@ -224,9 +228,22 @@ impl NackGeneratorInterceptor {
             next_timeout: None,
             sender_ssrc: rand::random(),
             receive_logs: HashMap::new(),
+            rtx_to_primary: HashMap::new(),
             nack_states: HashMap::new(),
             write_queue: VecDeque::new(),
         }
+    }
+
+    /// The tracked stream and sequence number an RTP packet counts as an arrival of, if any.
+    ///
+    /// An RTX packet carrying no original sequence number (padding only, under two payload
+    /// bytes) repairs nothing and counts as nothing.
+    fn tracked_arrival(&self, rtp: &rtp::Packet) -> Option<(u32, u16)> {
+        if let Some(&primary) = self.rtx_to_primary.get(&rtp.header.ssrc) {
+            let osn = rtp.payload.get(..2)?;
+            return Some((primary, u16::from_be_bytes([osn[0], osn[1]])));
+        }
+        Some((rtp.header.ssrc, rtp.header.sequence_number))
     }
 
     /// Generate NACKs for all streams with missing packets.
@@ -307,11 +324,15 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackGeneratorInterceptor {
             self.measured_rtt = Some(*rtt);
         }
 
-        // Track incoming RTP packets
+        // Track incoming RTP packets. The chain sees RTX packets still wrapped, so one on a known
+        // RTX SSRC is credited to the stream it repairs under its original sequence number
+        // (RFC 4588 section 4: the first two payload bytes, big-endian). Otherwise a packet
+        // repaired over RTX would stay "missing" and keep being asked for.
         if let Packet::Rtp(ref rtp_packet) = msg.message.packet
-            && let Some(receive_log) = self.receive_logs.get_mut(&rtp_packet.header.ssrc)
+            && let Some((ssrc, sequence_number)) = self.tracked_arrival(rtp_packet)
+            && let Some(receive_log) = self.receive_logs.get_mut(&ssrc)
         {
-            receive_log.add(rtp_packet.header.sequence_number);
+            receive_log.add(sequence_number);
 
             // Arm the NACK timer from the first tracked packet's instant. `None` means nothing is
             // scheduled, so the interceptor asks for no wake-up until a stream is actually flowing.
@@ -372,12 +393,18 @@ impl Interceptor for NackGeneratorInterceptor {
             && let Some(receive_log) = ReceiveLog::new(self.size)
         {
             self.receive_logs.insert(info.ssrc, receive_log);
+            if let Some(ssrc_rtx) = info.ssrc_rtx {
+                self.rtx_to_primary.insert(ssrc_rtx, info.ssrc);
+            }
         }
     }
 
     fn unbind_remote_stream(&mut self, info: &StreamInfo) {
         self.receive_logs.remove(&info.ssrc);
         self.nack_states.remove(&info.ssrc);
+        if let Some(ssrc_rtx) = info.ssrc_rtx {
+            self.rtx_to_primary.remove(&ssrc_rtx);
+        }
     }
 
     fn bind_local_stream(&mut self, _info: &StreamInfo) {}
