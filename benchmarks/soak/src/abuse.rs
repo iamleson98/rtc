@@ -14,7 +14,8 @@
 
 use crate::stats::Logger;
 use crate::{
-    AUDIO_LEVEL_URI, Args, Filler, Peer, STOP, build_peer, host_candidate, read_frame, write_frame,
+    AUDIO_LEVEL_URI, Args, Filler, Inbox, Peer, STOP, build_peer, host_candidate, read_frame,
+    write_frame,
 };
 use bytes::{Bytes, BytesMut};
 use rtc::media_stream::MediaStreamTrack;
@@ -277,6 +278,7 @@ struct Pace {
 struct Sess {
     pc: RTCPeerConnection,
     sock: UdpSocket,
+    inbox: Inbox,
     local: SocketAddr,
     host: RTCIceCandidateInit,
     tcp: TcpStream,
@@ -322,6 +324,7 @@ impl Sess {
         tcp.set_nodelay(true)?;
         let sock = UdpSocket::bind("127.0.0.1:0")?;
         let local = sock.local_addr()?;
+        let inbox = Inbox::new(&sock)?;
         let host = host_candidate(local)?;
         let Peer {
             pc,
@@ -342,6 +345,7 @@ impl Sess {
         Ok(Sess {
             pc,
             sock,
+            inbox,
             local,
             host,
             tcp,
@@ -899,7 +903,7 @@ impl Sess {
     }
 
     /// Everything the pc has to say, then wait for a datagram (at most `wait`).
-    fn pump(&mut self, now: Instant, wait: Duration, buf: &mut [u8]) {
+    fn pump(&mut self, now: Instant, wait: Duration) {
         while let Some(e) = self.pc.poll_event() {
             self.on_event(e);
         }
@@ -922,30 +926,26 @@ impl Sess {
             }
             deadline = deadline.min(t);
         }
-        let _ = self.sock.set_read_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(500)),
-        ));
-        if let Ok((n, peer_addr)) = self.sock.recv_from(buf) {
-            let _ = self.pc.handle_read(TaggedBytesMut {
-                now: Instant::now(),
-                transport: TransportContext {
-                    local_addr: self.local,
-                    peer_addr,
-                    ecn: None,
-                    transport_protocol: TransportProtocol::UDP,
-                },
-                message: BytesMut::from(&buf[..n]),
+        let (pc, local) = (&mut self.pc, self.local);
+        self.inbox
+            .take(deadline.saturating_duration_since(Instant::now()), |d| {
+                let _ = pc.handle_read(TaggedBytesMut {
+                    now: d.at,
+                    transport: TransportContext {
+                        local_addr: local,
+                        peer_addr: d.from,
+                        ecn: None,
+                        transport_protocol: TransportProtocol::UDP,
+                    },
+                    message: d.bytes,
+                });
             });
-        }
     }
 
     /// Runs the connection in `mode` until `until`, the end of the run, or (with `until_connected`)
     /// the moment it is connected. A connection that fails or is closed by the other side is dead.
     fn run(&mut self, until: Instant, mode: Mode, until_connected: bool) {
         self.mode = mode;
-        let mut buf = vec![0u8; 2048];
         loop {
             let now = Instant::now();
             if self.dead || stopped() || now >= until || (until_connected && self.connected) {
@@ -954,7 +954,7 @@ impl Sess {
             self.drain_msgs(now);
             self.media(now);
             self.hostile(now);
-            self.pump(now, ms(5), &mut buf);
+            self.pump(now, ms(5));
         }
     }
 

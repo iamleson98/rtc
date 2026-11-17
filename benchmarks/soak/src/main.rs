@@ -41,7 +41,10 @@ use stats::{Logger, ProcSampler, RecvStats, now_us, percentile};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
@@ -60,6 +63,72 @@ const PATIENT_ICE_FAILED: Duration = Duration::from_secs(240); // the abuse prof
 const DC_STREAM_ID: u16 = 1; // the id both peers agree on out-of-band
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Datagrams the reader thread has taken off the socket and the loop has not handled yet.
+const INBOX_DEPTH: usize = 8192;
+/// How many queued datagrams one turn of a loop handles before it looks at its timers again.
+const INBOX_BATCH: usize = 256;
+
+/// A datagram as it came off the socket, stamped when it was read.
+pub(crate) struct Datagram {
+    pub(crate) at: Instant,
+    pub(crate) from: SocketAddr,
+    pub(crate) bytes: BytesMut,
+}
+
+/// The receiving side of a UDP socket, read on a thread of its own (as pion reads its sockets),
+/// so a burst that arrives while the loop is sending or handling timers waits in this queue
+/// instead of overflowing the socket's kernel buffer. Dropping the inbox stops the thread.
+pub(crate) struct Inbox {
+    rx: Receiver<Datagram>,
+    open: Arc<AtomicBool>,
+}
+
+impl Inbox {
+    pub(crate) fn new(socket: &UdpSocket) -> std::io::Result<Inbox> {
+        let sock = socket.try_clone()?;
+        // the thread looks at `open` this often when nothing arrives
+        sock.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let open = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = sync_channel(INBOX_DEPTH);
+        let alive = open.clone();
+        thread::spawn(move || read_socket(&sock, &tx, &alive));
+        Ok(Inbox { rx, open })
+    }
+
+    /// Waits up to `wait` for the first datagram, then hands over at most `INBOX_BATCH` in all.
+    pub(crate) fn take(&self, wait: Duration, mut handle: impl FnMut(Datagram)) {
+        match self.rx.recv_timeout(wait) {
+            Ok(d) => handle(d),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
+        }
+        for d in self.rx.try_iter().take(INBOX_BATCH - 1) {
+            handle(d);
+        }
+    }
+}
+
+impl Drop for Inbox {
+    fn drop(&mut self) {
+        self.open.store(false, Ordering::Relaxed);
+    }
+}
+
+fn read_socket(sock: &UdpSocket, tx: &SyncSender<Datagram>, open: &AtomicBool) {
+    let mut buf = vec![0u8; 2048];
+    while open.load(Ordering::Relaxed) {
+        if let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let d = Datagram {
+                at: Instant::now(),
+                from,
+                bytes: BytesMut::from(&buf[..n]),
+            };
+            if tx.send(d).is_err() {
+                return;
+            }
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct SignalMsg {
@@ -418,7 +487,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut fill = Filler(0x9e37_79b9_7f4a_7c15);
     let mut vp8 = Vp8Payloader::default();
     vp8.enable_picture_id = true;
-    let mut buf = vec![0u8; 2048];
+    let inbox = Inbox::new(&socket)?;
     let mut t_audio = Instant::now();
     let (mut t_video, mut t_data) = (t_audio, t_audio);
     let mut t_report = t_audio + REPORT_EVERY;
@@ -569,23 +638,22 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             deadline = deadline.min(t);
         }
-        socket.set_read_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(500)),
-        ))?;
-        if let Ok((n, peer_addr)) = socket.recv_from(&mut buf) {
-            pc.handle_read(TaggedBytesMut {
-                now: Instant::now(),
-                transport: TransportContext {
-                    local_addr,
-                    peer_addr,
-                    ecn: None,
-                    transport_protocol: TransportProtocol::UDP,
-                },
-                message: BytesMut::from(&buf[..n]),
-            })?;
-        }
+        let mut handled = Ok(());
+        inbox.take(deadline.saturating_duration_since(Instant::now()), |d| {
+            if handled.is_ok() {
+                handled = pc.handle_read(TaggedBytesMut {
+                    now: d.at,
+                    transport: TransportContext {
+                        local_addr,
+                        peer_addr: d.from,
+                        ecn: None,
+                        transport_protocol: TransportProtocol::UDP,
+                    },
+                    message: d.bytes,
+                });
+            }
+        });
+        handled?;
     }
     if let Some(h) = abusers {
         h.stop();

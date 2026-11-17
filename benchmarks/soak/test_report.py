@@ -74,7 +74,7 @@ def side(impl, **kw):
     rows += track(impl, "c01/video:teacher", "clean", END, bytes_per_s=kw.get("clean_bps", 200_000),
                   freezes=kw.get("clean_freezes", lambda t: 0), flowing=kw.get("clean_flow", lambda t: True))
     rows += track(impl, "s17/video:teacher", "impaired", END, bytes_per_s=300_000,
-                  flowing=lambda t: not (120 <= t < 125))
+                  flowing=lambda t: not (120 <= t < 125), **kw.get("impaired", {}))
     rows += kw.get("extra", [])
     return rows
 
@@ -379,6 +379,22 @@ class EarlyStop(Fixture):
         status, md, _, _ = run_report(side("rtcd-rs", extra=early), self.stopped(100))
         self.assertEqual(status, 1)
         self.assertIn("SFU-closed sessions", md.split("## Breaches")[1].split("## ")[0])
+
+    # a freeze of a second every 5 s through the bw phase (cumulative counters)
+    BW_FREEZES = {"impaired": {"freezes": lambda t: min(max(t - 60, 0), 60) // STEP,
+                               "freeze_ms": lambda t: min(max(t - 60, 0), 60) // STEP * 1000}}
+
+    def test_a_phase_seen_too_few_times_before_the_baseline_stopped_is_not_judged(self):
+        _, md, _, _ = run_report(side("rtcd-rs", **self.BW_FREEZES), self.stopped(150))
+        row = [l for l in md.splitlines() if l.startswith("| impaired | bw | Freezes / min (video) |")]
+        self.assertTrue(row and row[0].endswith("| too few to judge |"), row)
+        self.assertNotIn("impaired / bw / Freezes", md.split("## Breaches")[1].split("## ")[0])
+
+    def test_the_same_phase_is_judged_when_the_baseline_ran_to_the_end(self):
+        status, md, _, _ = run_report(side("rtcd-rs", **self.BW_FREEZES), side("rtcd-go"))
+        self.assertEqual(status, 1, md)
+        self.assertIn("impaired / bw / Freezes / min (video)", md)
+        self.assertNotIn("too few to judge", md)
 
     def test_the_subjects_absolute_rules_cover_its_whole_run(self):
         late = {"clean_freezes": lambda t: 1 if t > 200 else 0}
