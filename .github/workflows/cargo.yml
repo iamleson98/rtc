@@ -38,6 +38,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo test --verbose
+      - name: Simulated-time soak (release)
+        run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo test --release --test sim_soak --verbose
 
   crypto_backend_baseline:
     name: Crypto baseline (${{ matrix.backend }})
