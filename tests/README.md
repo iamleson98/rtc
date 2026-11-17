@@ -741,3 +741,38 @@ Run these with:
 ```bash
 cargo test --package rtc-interceptor --test rtcp_report_integration
 ```
+
+---
+
+## Simulated-time soak (`sim_soak.rs`)
+
+Two peers hold a call (audio at 20 ms, video at 30 fps with keyframes of 15 to 25 packets, and a
+reliable data channel, all both ways) over an in-memory network with virtual time, so 20 minutes
+of call run in seconds. The network is `common/netsim.rs` on top of `common/sim.rs`: per
+direction a one-way delay, jitter, reordering, random and Gilbert-Elliott burst loss, a bandwidth
+cap with a drop-tail queue, and outages. A seed draws the path and a schedule of phases like
+`benchmarks/soak/netem.sh` (clean, loss, burst, bandwidth cap, outages of 5 s and now and then
+30, 60 or 120 s, each followed by a clean recovery), and the sizes and timings of what is sent.
+
+Checked throughout, every failure message starting with `seed=<n>`: no panic; the call connects
+and never reports Failed; after each outage audio is back within 3 s, a decodable keyframe within
+5 s (the receiver asks with a PLI), data within 10 s; every RTP packet is the one that was sent,
+none is delivered twice (video retransmissions excepted) or more than 1000 packets late, and the
+sequence number and timestamp wrap are crossed; the data channel delivers every message once,
+in order; the number of statistics entries, events and datagrams on the wire stays bounded; and
+20 s after the weather clears nothing sent on the data channel is missing. `rtc` hands RTP to the
+application in arrival order, so reordering is visible and the receiver here puts frames
+together itself.
+
+```bash
+cargo test --release --test sim_soak                              # 8 seeds x 20 virtual minutes
+SIM_SOAK_SEEDS=500 SIM_SOAK_MINUTES=120 cargo test --release --test sim_soak
+SIM_SOAK_SEED=25 SIM_SOAK_MINUTES=20 cargo test --release --test sim_soak -- --nocapture   # replay one seed
+```
+
+`SIM_SOAK_SEED_START` sets the first seed of a range (default 1). A debug build defaults to 2
+seeds x 5 minutes. Replaying a seed gives the same weather and the same sending pattern, but
+the library draws its own randomness (certificates, ICE credentials, initial sequence values)
+from the operating system, so a marginal failure may need a few replays. The pull request
+workflow runs the defaults in release mode; the nightly workflow runs 500 seeds x 120 minutes in
+ten shards and lists the failing seeds in each shard's summary.

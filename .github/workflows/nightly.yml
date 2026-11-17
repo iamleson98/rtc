@@ -151,3 +151,47 @@ jobs:
         with:
           name: pion-compare-${{ matrix.os }}-${{ matrix.backend }}
           path: pion-compare.json
+
+  # The simulated-time soak (tests/sim_soak.rs): two peers hold a call through generated network
+  # weather, 120 virtual minutes per seed, 500 seeds split over ten shards. Each night takes the
+  # next 500 seeds (from the run number), so the weather explored grows night after night. A
+  # failing seed is named in the summary and replays with SIM_SOAK_SEED=<n> SIM_SOAK_MINUTES=120.
+  sim-soak:
+    name: sim soak / shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the seeds
+        env:
+          SIM_SOAK_SEEDS: '50'
+          SIM_SOAK_MINUTES: '120'
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          export SIM_SOAK_SEED_START=$(( (GITHUB_RUN_NUMBER % 100000) * 500 + SHARD * 50 + 1 ))
+          status=0
+          cargo test --release --test sim_soak -- --nocapture 2>&1 | tee sim-soak.log || status=$?
+          {
+            echo "### sim soak shard $SHARD: seeds $SIM_SOAK_SEED_START to $((SIM_SOAK_SEED_START + 49))"
+            if [ "$status" -ne 0 ]; then
+              echo 'Failing seeds (replay with `SIM_SOAK_SEED=<n> SIM_SOAK_MINUTES=120 cargo test --release --test sim_soak`):'
+              echo '```'
+              grep -E '^seed=[0-9]+ ' sim-soak.log | sort -u
+              echo '```'
+            else
+              echo 'All seeds passed.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sim-soak-failures-shard-${{ matrix.shard }}
+          path: sim-soak.log

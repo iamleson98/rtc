@@ -41,6 +41,47 @@ impl Side {
     }
 }
 
+/// A small deterministic generator (xorshift64*), so a seed replays the same network.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        // SplitMix64 spreads nearby seeds apart, and the state must never be zero.
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        Rng((z ^ (z >> 31)) | 1)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in `[0, 1)`.
+    pub fn chance(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Uniform in `[low, high]`.
+    pub fn range(&mut self, low: u64, high: u64) -> u64 {
+        low + self.next_u64() % (high - low + 1)
+    }
+}
+
+/// Two-state burst loss (Gilbert-Elliott): the link moves between a good state that loses
+/// nothing and a bad state that loses `loss_bad` of the datagrams, so losses come in runs.
+#[derive(Clone, Copy)]
+pub struct GilbertElliott {
+    /// Chance per datagram of going from good to bad.
+    pub to_bad: f64,
+    /// Chance per datagram of going from bad to good; `1 / to_good` is the mean burst length.
+    pub to_good: f64,
+    pub loss_bad: f64,
+}
+
 /// A one-way bottleneck: datagrams queue behind each other, each taking `size / rate` to leave,
 /// and arrive `delay` after they left. A datagram that would wait longer than `max_queue` in the
 /// queue is dropped (tail drop), and `loss` drops a fraction at random first.
@@ -48,10 +89,21 @@ pub struct Link {
     pub bits_per_second: u64,
     pub delay: Duration,
     pub max_queue: Duration,
-    /// Fraction of datagrams lost before they reach the queue, from a fixed-seed generator.
+    /// Fraction of datagrams lost before they reach the queue, from the link's own generator.
     pub loss: f64,
+    /// Bursty loss on top of `loss`.
+    pub burst: Option<GilbertElliott>,
+    /// Each datagram arrives up to this much later than `delay`, drawn uniformly; datagrams
+    /// that draw different values overtake each other, which is how jitter reorders.
+    pub jitter: Duration,
+    /// Fraction of datagrams held back by `reorder_hold` on top of the jitter.
+    pub reorder: f64,
+    pub reorder_hold: Duration,
+    /// While set the path is dead: every datagram handed to the link is lost.
+    pub outage: bool,
+    in_bad_state: bool,
     free_at: Option<Instant>,
-    rng: u64,
+    rng: Rng,
 }
 
 impl Link {
@@ -61,22 +113,47 @@ impl Link {
             delay,
             max_queue,
             loss: 0.0,
+            burst: None,
+            jitter: Duration::ZERO,
+            reorder: 0.0,
+            reorder_hold: Duration::ZERO,
+            outage: false,
+            in_bad_state: false,
             free_at: None,
-            rng: 0x9E37_79B9_7F4A_7C15,
+            rng: Rng::new(0),
         }
     }
 
-    fn chance(&mut self) -> f64 {
-        // xorshift64*: deterministic, and good enough to decide a coin flip.
-        self.rng ^= self.rng >> 12;
-        self.rng ^= self.rng << 25;
-        self.rng ^= self.rng >> 27;
-        (self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    /// The same link with its generator seeded, so the losses and delays it draws replay.
+    pub fn seeded(mut self, seed: u64) -> Link {
+        self.rng = Rng::new(seed);
+        self
+    }
+
+    fn lost_to_burst(&mut self) -> bool {
+        let Some(ge) = self.burst else {
+            return false;
+        };
+        let flip = if self.in_bad_state {
+            ge.to_good
+        } else {
+            ge.to_bad
+        };
+        if self.rng.chance() < flip {
+            self.in_bad_state = !self.in_bad_state;
+        }
+        self.in_bad_state && self.rng.chance() < ge.loss_bad
     }
 
     /// When a datagram of `len` bytes handed over at `now` arrives, or `None` if it is dropped.
     fn carry(&mut self, now: Instant, len: usize) -> Option<Instant> {
-        if self.loss > 0.0 && self.chance() < self.loss {
+        if self.outage {
+            return None;
+        }
+        if self.loss > 0.0 && self.rng.chance() < self.loss {
+            return None;
+        }
+        if self.lost_to_burst() {
             return None;
         }
         let start = self.free_at.map_or(now, |t| t.max(now));
@@ -85,7 +162,14 @@ impl Link {
         }
         let serialise = Duration::from_secs_f64(len as f64 * 8.0 / self.bits_per_second as f64);
         self.free_at = Some(start + serialise);
-        Some(start + serialise + self.delay)
+        let mut arrival = start + serialise + self.delay;
+        if !self.jitter.is_zero() {
+            arrival += self.jitter.mul_f64(self.rng.chance());
+        }
+        if self.reorder > 0.0 && self.rng.chance() < self.reorder {
+            arrival += self.reorder_hold;
+        }
+        Some(arrival)
     }
 }
 
@@ -273,10 +357,11 @@ impl Sim {
             let mut moved = false;
             let now = self.now;
             if self.in_flight.iter().any(|f| f.arrival <= now) {
-                let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.in_flight)
+                let (mut due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.in_flight)
                     .into_iter()
                     .partition(|f| f.arrival <= now);
                 self.in_flight = later;
+                due.sort_by_key(|f| f.arrival);
                 for f in due {
                     moved = true;
                     self.deliver(f.from_a, &f.datagram);
@@ -467,6 +552,11 @@ impl Side {
 }
 
 impl Sim {
+    /// How many datagrams are on the wire right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
     pub fn side(&mut self, a: bool) -> &mut Side {
         if a { &mut self.a } else { &mut self.b }
     }
