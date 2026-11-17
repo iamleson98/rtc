@@ -930,7 +930,7 @@ impl InterceptorHandler<'_> {
                     // Track outbound RTP stats if the stream accumulator exists
                     let ssrc = rtp_packet.header.ssrc;
                     let payload_bytes = rtp_packet.payload.len();
-                    self.stats.on_rtx_packet_sent_if_rtx(ssrc, payload_bytes);
+                    let sent_as_rtx = self.stats.on_rtx_packet_sent_if_rtx(ssrc, payload_bytes);
 
                     if let Some(stream) = self.stats.outbound_rtp_streams.get_mut(&ssrc) {
                         stream.on_rtp_sent(
@@ -938,6 +938,11 @@ impl InterceptorHandler<'_> {
                             payload_bytes,
                             packet.now,
                         );
+                        // A retransmission sent on the primary SSRC (no RTX negotiated) is still a
+                        // retransmission; only the RTX SSRC case was counted above.
+                        if !sent_as_rtx && packet.message.has(&Attribute::Retransmission) {
+                            stream.on_rtx_sent(payload_bytes);
+                        }
                     }
                 }
                 _ => {}
@@ -1272,6 +1277,60 @@ mod boundary_tests {
             0.0, stats.outbound_rtp_streams[&7].target_bitrate,
             "only the estimate writes this field"
         );
+    }
+
+    /// A retransmission with no RTX stream negotiated goes out on the primary SSRC; it is counted
+    /// as a retransmission all the same, and an original is not.
+    #[test]
+    fn a_retransmission_on_the_primary_ssrc_is_counted() {
+        let mut ctx = connected();
+        let mut chain = FakeChain::default();
+        let mut stats = RTCStatsAccumulator::default();
+        stats.outbound_rtp_streams.insert(
+            7,
+            OutboundRtpStreamAccumulator {
+                ssrc: 7,
+                ..Default::default()
+            },
+        );
+        let rtp = |sequence_number: u16| rtp::Packet {
+            header: rtp::header::Header {
+                version: 2,
+                ssrc: 7,
+                sequence_number,
+                ..Default::default()
+            },
+            payload: vec![0u8; 100].into(),
+        };
+        let send = |packet: rtp::Packet| TaggedPacket {
+            now: Instant::now(),
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtp(packet)),
+        };
+        chain.writes.push_back(send(rtp(1)));
+        chain.writes.push_back(TaggedPacket {
+            message: AttributedPacket::new(Packet::Rtp(rtp(1))).with(Attribute::Retransmission),
+            ..send(rtp(1))
+        });
+
+        let mut transceivers = vec![];
+        let media_engine = MediaEngine::default();
+        let mut handler = InterceptorHandler::new(
+            &mut ctx,
+            &mut transceivers,
+            &media_engine,
+            &mut chain,
+            &mut stats,
+        );
+        while handler.poll_write().is_some() {}
+
+        let outbound = &stats.outbound_rtp_streams[&7];
+        assert_eq!(2, outbound.packets_sent);
+        assert_eq!(
+            1, outbound.retransmitted_packets_sent,
+            "only the tagged copy is a retransmission"
+        );
+        assert_eq!(100, outbound.retransmitted_bytes_sent);
     }
 
     /// Feedback from the peer about a stream we send is counted, though the chain answers it.

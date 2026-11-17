@@ -72,7 +72,10 @@ the run, warmup to a sixth); a 3-minute smoke run therefore compares 45 s with 4
 
 ## The peers
 
-`soak-pion` (`go/`) and `soak-rtc` (`src/`) take the same flags and behave the same:
+`soak-pion` (`go/`) and `soak-rtc` (`src/`) take the same flags and behave the same. Both read every UDP
+socket on a thread of its own, as pion does inside the library: the rtc peer's loop takes what that
+thread queued (`Inbox`), so a burst that arrives while the loop sends or runs its timers waits in the
+queue instead of overflowing the socket's kernel buffer (`UDP buffer errors of the host`).
 
 ```
 --role offerer|answerer   --signal HOST:PORT   --minutes N   --out FILE.jsonl   --id NAME
@@ -391,7 +394,9 @@ has none. Absolute rules: in the `clean` group (a path that is never impaired) t
 own list) must be zero, for the baseline too (reported only); the SFU process must not have errors. A
 baseline whose samples end more than a minute before the subject's (killed for memory, crashed) is
 compared over the minutes it ran, and the report says so; the subject's absolute rules still cover its
-whole run. The self-drift of the subject: first clean
+whole run. Over those minutes a phase that started fewer than three times on either side is shown as
+`too few to judge` and not gated: one or two outages say more about where they fell than about the
+server. The self-drift of the subject: first clean
 window against last (`freeze_rate_*`, `audio_gap_*`, judged only with `min_clean_window_min` of clean
 time in each window), and `rss_slope_mb_per_h_max` (only on runs with `rss_slope_min_span_min`
 minutes after `warmup_min`). During attacks the clean group is judged the same way (it is innocent in every window), with one

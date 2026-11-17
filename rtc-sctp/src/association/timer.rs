@@ -34,8 +34,12 @@ impl Default for TimerConfig {
             max_t1_init_retrans: MAX_INIT_RETRANS,
             max_t1_cookie_retrans: MAX_INIT_RETRANS,
             max_t2_shutdown_retrans: NO_MAX_RETRANS,
-            max_t3_rtx_retrans: PATH_MAX_RETRANS,
-            max_reconfig_retrans: PATH_MAX_RETRANS,
+            // DATA and stream resets are retransmitted for as long as the association lives, as
+            // pion does: a failed T3-rtx stops its timer, so a limit here would leave DATA
+            // unsent for good after an outage of about a minute while the connection (ICE)
+            // rides it out, with nothing reported to the application.
+            max_t3_rtx_retrans: NO_MAX_RETRANS,
+            max_reconfig_retrans: NO_MAX_RETRANS,
             max_ack_retrans: PATH_MAX_RETRANS,
         }
     }
@@ -322,6 +326,22 @@ mod tests {
         rto.set_rto(DEFAULT_RTO_MAX - 1, false);
         rto.backoff();
         assert_eq!(DEFAULT_RTO_MAX, rto.get_rto());
+    }
+
+    #[test]
+    fn data_and_stream_resets_are_retransmitted_without_a_limit() {
+        let mut timers = TimerTable::new(TimerConfig::default(), 0);
+        for timer in [Timer::T3RTX, Timer::Reconfig] {
+            let mut now = Instant::now();
+            // Two hours of retransmissions at the longest RTO.
+            for _ in 0..120 {
+                timers.start(timer, now, DEFAULT_RTO_MAX);
+                now += Duration::from_millis(DEFAULT_RTO_MAX);
+                let (expired, failed, _) = timers.is_expired(timer, now);
+                assert!(expired && !failed, "{timer:?} gave up");
+                timers.set(timer, None);
+            }
+        }
     }
 
     #[test]

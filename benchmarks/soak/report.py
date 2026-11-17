@@ -103,6 +103,9 @@ ATTACK_KEYS = ("freezes", "freeze_rate", "freeze_ms", "stalls", "stall_max", "cl
                "never")
 ATTACK_FILL = "#a855f7"
 EARLY_STOP_S = 60  # a baseline whose samples end this much before the subject's stopped early
+# Over the minutes a baseline that stopped early ran, a phase seen fewer times than this is shown
+# but not judged: one or two outages say more about where they fell than about the server.
+MIN_PHASE_SAMPLES = 3
 WINDOW_LIST_MAX = 200  # the per-window table lists every window up to this many, then only those with an impact
 PHASE_FILL = {"loss": "#facc15", "burst": "#fb923c", "bw": "#60a5fa", "outage": "#ef4444"}
 CLOSES = ("the SFU closed the session",)
@@ -826,6 +829,11 @@ def judge(key, s, b, rules, kind=None):
     return ("ok" if s <= lim else "BREACH"), lim
 
 
+def phase_count(ents, group, name, t_end):
+    """How many times the phase `name` of `group` started before `t_end` (the fewest of the runs)."""
+    return min((sum(1 for t, n in e.run.phases(group) if n == name and t < t_end) for e in ents), default=0)
+
+
 def freezes_only_if_frozen(key, verdict, s_m, b_m):
     """More freezes of less frozen time is a stream that plays, not one that breaks: freezes per
     minute breach only when the freeze ms per minute is worse too."""
@@ -865,10 +873,12 @@ def compare(ents, rules):
             s_span, b_span = server_span(s_ents), server_span(b_ents)
             if b_span < max(e.t1 for e in b_ents):
                 b_ents = clipped(b_ents, b_span)
+            short = None  # the compared span when the baseline stopped early
             if b_span < s_span - EARLY_STOP_S:
                 add(False, where + ": the baseline stopped early", "after %.1f of %.1f min" % (
                     b_span / 60.0, s_span / 60.0), "compared over its %.1f min" % (b_span / 60.0), None)
                 s_ents = clipped(s_ents, b_span)
+                short = b_span
             groups = sorted({s.group for e in s_ents + b_ents for s in e.series.values() if s.kind == "recv"},
                             key=lambda g: (g != "clean", g))
             for g in rules["require_groups"] if spec.get("require", True) else []:
@@ -887,12 +897,16 @@ def compare(ents, rules):
                         continue
                     if sm is None:
                         continue
+                    few = (short is not None and ph is not None
+                           and min(phase_count(s_ents, g, ph, short), phase_count(b_ents, g, ph, short)) < MIN_PHASE_SAMPLES)
                     for key, _, nd, kind, _ in METRICS:
                         s_v, b_v = sm.get(key), bm.get(key)
                         if s_v is None and b_v is None:
                             continue
                         verdict, lim = judge(key, s_v, b_v, rules) if kind else ("", None)
                         verdict = freezes_only_if_frozen(key, verdict, sm, bm)
+                        if few and verdict == "BREACH":
+                            verdict = "too few to judge"
                         rows.append({"arch": arch, "pair": name, "scope": g, "phase": ph or "all", "key": key,
                                      "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                      "gated": gated, "where": where})
