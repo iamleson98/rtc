@@ -47,12 +47,15 @@ let chain = Registry::new()
 | Configurable size             | ✅    | ✅   | 64-32768, power of 2                              |
 | Configurable interval         | ✅    | ✅   | Duration between NACK cycles                      |
 | skip_last_n                   | ✅    | ✅   | Skip recent packets                               |
-| max_nacks_per_packet          | ✅    | ✅   | Limit retransmission requests                     |
+| max_nacks_per_packet          | ✅    | ✅   | Limit retransmission requests; default 10 here (pion: 0, unlimited) |
+| Re-request pacing (`rtt`)     | ➖    | ✅   | A packet is asked for again only after one round trip; 100 ms until measured |
 | Stream filter                 | ✅    | ✅   | Via `stream_supports_nack()`                      |
 | Custom logger                 | ✅    | ➖   | Skipped                                           |
 | Custom ticker                 | ✅    | ➖   | Sans-I/O uses `handle_timeout()`                  |
 | **Responder**                 |      |     |                                                   |
 | Configurable size             | ✅    | ✅   | 1-32768, power of 2                               |
+| Measured RTT                  | ✅    | ✅   | From receiver reports answering our sender reports; pion keeps a running mean, here an EWMA (new sample 1/8) |
+| Skip a repeat within one RTT  | ✅    | ✅   | Pion waits `rtt + 5 ms`; here `rtt`, 100 ms until measured |
 | Stream filter                 | ✅    | ✅   | Via `stream_supports_nack()`                      |
 | Packet factory (copy/no-copy) | ✅    | ➖   | Always clone packets                              |
 | RFC4588 RTX support           | ✅    | ✅   | Retransmit on separate SSRC with modified payload |
@@ -174,13 +177,18 @@ This section compares this sans-I/O implementation with the async-based webrtc c
 | **Data Structure**   | `Vec<u64>` bitmap                                 | `Vec<u64>` bitmap                              |
 | **Bit Indexing**     | `(seq % size) / 64`, `(seq % size) % 64`          | Same approach                                  |
 | **Skip Last N**      | ✅ Supported                                       | ✅ Supported                                    |
-| **Max NACKs/Packet** | ❌ Not implemented                                 | ✅ `max_nacks_per_packet` option                |
+| **Max NACKs/Packet** | ❌ Not implemented                                 | ✅ `max_nacks_per_packet`, default 10           |
+| **Re-request pacing**| ❌ Every interval                                  | ✅ Once per round trip (`rtt`, then measured)   |
 | **Interval**         | Default 100ms (async timer)                       | Default 100ms (poll_timeout)                   |
 | **NACK Generation**  | Background `tokio::spawn` loop                    | `handle_timeout()` triggers `generate_nacks()` |
 
-**Key Difference**: This sans-I/O implementation adds `max_nacks_per_packet` to limit
-retransmission attempts per missing sequence number. This prevents infinite NACK loops
-for permanently lost packets.
+**Key Difference**: This sans-I/O implementation limits retransmission requests the way
+libwebrtc does. A missing sequence number is asked for again only once a round trip has
+passed since it was last asked for (100 ms until the responder measures one from RTCP
+reports, passed on as `Attribute::RoundTripTime`), and is given up on after
+`max_nacks_per_packet` requests (default 10, libwebrtc's `kMaxNackRetries`; 0 is unlimited).
+Without this a lossy path with a long round trip is asked for the same packet on every
+tick, and the sender repeats it each time before the first copy can arrive.
 
 ### NACK Responder Comparison
 
@@ -231,6 +239,8 @@ matching the async version's behavior.
 | NACK Generator basic           |      ✅       |      ✅       |
 | Generator skip_last_n          |      ✅       |      ✅       |
 | Generator max_nacks_per_packet |      ❌       |      ✅       |
+| Generator RTT-paced re-requests|      ❌       |      ✅       |
+| Responder measured RTT         |      ❌       |      ✅       |
 | NACK Responder basic           |      ✅       |      ✅       |
 | Responder RTX (RFC 4588)       |      ❌       |      ✅       |
 | Stream filtering               |      ✅       |      ✅       |
