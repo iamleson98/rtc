@@ -300,7 +300,7 @@ For every `compare` pair and architecture, the subject and the baseline side by 
 (`clean`, `impaired`) and phase (`all` and each netem phase), for: freezes per minute, freeze ms per
 minute (in the `outage` phase, the freeze ms per outage instead: the freeze booked from the outage's
 start to one sample after its recovery began, so the sampling clock cannot decide it; the `recover` phase
-leaves that span out), the video frames per second (higher is better; not in the `outage` phase, which has too few intervals for a rate), audio gap %, residual loss % (after retransmission, from unique packets), duplicate %, stall
+leaves that span out), the video frames per second (higher is better; not in the `outage` phase, which has too few intervals for a rate), audio gap %, residual loss % (after retransmission, from unique packets; both are only shown in the `outage` phase, where `recover` judges them), duplicate %, stall
 count and longest stall, recovery after an outage (median, p90, tracks that never recovered), SFU-closed
 sessions, signaling closes, lost seats, rejoins and their total downtime, ICE disconnects and failures,
 and the Mbit/s each participant received (all its tracks together; in the bw phase this is what shows
@@ -357,7 +357,10 @@ baseline whose samples end more than a minute before the subject's (killed for m
 compared over the minutes it ran, and the report says so; the subject's absolute rules still cover its
 whole run. Over those minutes a phase that started fewer than three times on either side is shown as
 `too few to judge` and not gated: one or two outages say more about where they fell than about the
-server. The self-drift of the subject: first clean
+server. So is every comparison row (`all`, the `clean` group, attacks, SFU) when the baseline ran for
+less than one phase cycle (the gap between two `clean` phases in the log, else 20 minutes), and an
+`all` row whose phases are all too few; sessions the server closed or lost (`closes`, `sig_closes`,
+`lost_seats`) stay judged. The self-drift of the subject: first clean
 window against last (`freeze_rate_*`, `audio_gap_*`, judged only with `min_clean_window_min` of clean
 time in each window), and `rss_slope_mb_per_h_max` (only on runs with `rss_slope_min_span_min`
 minutes after `warmup_min`). During attacks the clean group is judged the same way (it is innocent in every window), with one
