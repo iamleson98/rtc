@@ -239,6 +239,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for byte (found by a differential run against pion rtp v1.10.6).
 
 ### Fixed
+- `rtc-interceptor`, `rtc`: NACK and RTX. A packet repaired over RTX now counts as received: the
+  generator credits an RTX packet to the stream it repairs under its original sequence number
+  (RFC 4588), where before it stayed "missing" and was asked for until it left the receive log.
+  Repair flows (RTX and FlexFEC) are also bound with no RTCP feedback, as pion does, so the gaps in
+  an RTX stream's own sequence numbers are no longer NACKed and its SSRC is no longer sent PLIs.
 - `rtc`: a retransmission sent on the primary SSRC (no RTX negotiated) now counts in the outbound
   stream's `retransmitted_packets_sent` and `retransmitted_bytes_sent`; only RTX-SSRC copies did.
 - `rtc-mdns`: the next record starts where the previous record's `RDLENGTH` ends, as in

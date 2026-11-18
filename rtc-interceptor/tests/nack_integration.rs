@@ -2499,3 +2499,125 @@ fn test_nack_generator_paces_requests_by_the_measured_round_trip() {
         "without a report the 100 ms fallback paces the requests"
     );
 }
+
+// =============================================================================
+// RTX: a repair credits the primary stream
+// =============================================================================
+
+const RTX_PRIMARY: u32 = 0x1111_0001;
+const RTX_REPAIR: u32 = 0x1111_0002;
+
+/// What the chain would ask for at `at`: each NACK's media SSRC and the sequence numbers it names.
+fn nacks_at(chain: &mut impl Interceptor, epoch: Instant, at: Duration) -> Vec<(u32, Vec<u16>)> {
+    chain.handle_timeout(epoch + at).unwrap();
+    let mut nacks = Vec::new();
+    while let Some(pkt) = chain.poll_write() {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
+            for rtcp_pkt in rtcp_packets {
+                if let Some(nack) = rtcp_pkt
+                    .as_any()
+                    .downcast_ref::<rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>()
+                {
+                    let seqs = nack.nacks.iter().flat_map(|p| p.packet_list()).collect();
+                    nacks.push((nack.media_ssrc, seqs));
+                }
+            }
+        }
+    }
+    nacks
+}
+
+/// An RTX packet on the repair SSRC whose payload is `osn` then `body`.
+fn rtx_packet(now: Instant, rtx_seq: u16, osn: u16, body: &[u8]) -> TaggedPacket {
+    let mut packet = create_rtp_packet_with_time(now, RTX_REPAIR, rtx_seq, 0, 0);
+    if let Packet::Rtp(ref mut rtp) = packet.message.packet {
+        let mut payload = osn.to_be_bytes().to_vec();
+        payload.extend_from_slice(body);
+        rtp.payload = payload.into();
+    }
+    packet
+}
+
+/// A generator with the primary bound (naming its RTX flow) and the RTX flow bound without
+/// feedback, as the peer connection does (`repair_flows_are_bound_without_feedback` there), after the primary has seen 0, 1, 2, 4, 5: 3 is missing.
+fn generator_with_rtx_and_gap(epoch: Instant) -> impl Interceptor {
+    let mut chain = Registry::new()
+        .with(Slot::NackGenerator, NackGeneratorBuilder::new().build())
+        .build();
+    chain.bind_remote_stream(&nack_rtx_stream_info(RTX_PRIMARY, RTX_REPAIR, 97));
+    chain.bind_remote_stream(&no_nack_stream_info(RTX_REPAIR));
+    for seq in [0u16, 1, 2, 4, 5] {
+        chain
+            .handle_read(create_rtp_packet_with_time(
+                epoch,
+                RTX_PRIMARY,
+                seq,
+                seq as u32 * 3000,
+                100,
+            ))
+            .unwrap();
+    }
+    while chain.poll_read().is_some() {}
+    chain
+}
+
+#[test]
+fn a_packet_repaired_over_rtx_is_not_asked_for_again() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let ms = Duration::from_millis;
+
+    assert_eq!(
+        vec![(RTX_PRIMARY, vec![3])],
+        nacks_at(&mut chain, epoch, ms(100)),
+        "the gap is asked for"
+    );
+
+    chain
+        .handle_read(rtx_packet(epoch + ms(150), 0, 3, &[1, 2, 3]))
+        .unwrap();
+    while chain.poll_read().is_some() {}
+
+    assert!(
+        nacks_at(&mut chain, epoch, ms(300)).is_empty(),
+        "the RTX packet carried original sequence number 3"
+    );
+}
+
+#[test]
+fn an_rtx_packet_without_an_original_sequence_number_repairs_nothing() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let ms = Duration::from_millis;
+
+    // A padding-only RTX packet: no payload, or under two bytes, so no OSN to read.
+    for (rtx_seq, payload) in [(0u16, &[][..]), (1, &[0x00][..])] {
+        let mut packet = rtx_packet(epoch, rtx_seq, 0, &[]);
+        if let Packet::Rtp(ref mut rtp) = packet.message.packet {
+            rtp.payload = payload.to_vec().into();
+        }
+        chain.handle_read(packet).unwrap();
+    }
+    while chain.poll_read().is_some() {}
+
+    assert_eq!(
+        vec![(RTX_PRIMARY, vec![3])],
+        nacks_at(&mut chain, epoch, ms(100)),
+        "3 is still missing"
+    );
+}
+
+#[test]
+fn unbinding_the_primary_forgets_its_rtx_flow() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let info = nack_rtx_stream_info(RTX_PRIMARY, RTX_REPAIR, 97);
+    chain.unbind_remote_stream(&no_nack_stream_info(RTX_REPAIR));
+    chain.unbind_remote_stream(&info);
+
+    // Rebound with no RTX flow, an RTX-SSRC packet is just an unknown stream's packet.
+    chain.bind_remote_stream(&nack_stream_info(RTX_PRIMARY));
+    chain.handle_read(rtx_packet(epoch, 0, 3, &[1])).unwrap();
+    while chain.poll_read().is_some() {}
+    assert!(nacks_at(&mut chain, epoch, Duration::from_millis(100)).is_empty());
+}
