@@ -2053,3 +2053,571 @@ fn test_nack_responder_rtx_retransmits_exactly_the_sent_packets() {
         "each retransmission names its own original sequence number; never-sent 13 is excluded"
     );
 }
+
+// =============================================================================
+// Retry pacing: a repair is given one round trip to arrive before it is asked for again
+// =============================================================================
+
+const NACK_SSRC: u32 = 0x0BAD_CAFE;
+
+/// A chain with only a generator that has seen 0, 1, 2, 6, 7, so 3, 4 and 5 are missing.
+fn generator_with_gap(builder: NackGeneratorBuilder, epoch: Instant) -> impl Interceptor {
+    let mut chain = Registry::new()
+        .with(Slot::NackGenerator, builder.build())
+        .build();
+    chain.bind_remote_stream(&nack_stream_info(NACK_SSRC));
+    for seq in [0u16, 1, 2, 6, 7] {
+        chain
+            .handle_read(create_rtp_packet_with_time(
+                epoch,
+                NACK_SSRC,
+                seq,
+                seq as u32 * 3000,
+                100,
+            ))
+            .unwrap();
+    }
+    while chain.poll_read().is_some() {}
+    chain
+}
+
+/// Drive `chain` to `until` in `step` increments and return the time of every NACK it emitted.
+fn nack_times(
+    chain: &mut impl Interceptor,
+    epoch: Instant,
+    step: Duration,
+    until: Duration,
+) -> Vec<Duration> {
+    let mut times = Vec::new();
+    let mut at = step;
+    while at <= until {
+        chain.handle_timeout(epoch + at).unwrap();
+        while let Some(pkt) = chain.poll_write() {
+            if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
+                for rtcp_pkt in rtcp_packets {
+                    if rtcp_pkt
+                        .as_any()
+                        .downcast_ref::<rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>()
+                        .is_some()
+                    {
+                        times.push(at);
+                    }
+                }
+            }
+        }
+        at += step;
+    }
+    times
+}
+
+/// A packet that is still missing is asked for once per round trip, not on every tick: the
+/// 100 ms tick that followed the first NACK used to name it again before any repair could have
+/// arrived, and over a slow path every lost packet was requested (and resent) many times.
+#[test]
+fn test_nack_generator_asks_again_only_after_one_round_trip() {
+    let epoch = Instant::now();
+    let rtt = Duration::from_millis(300);
+    let mut chain = generator_with_gap(
+        NackGeneratorBuilder::new()
+            .with_interval(Duration::from_millis(100))
+            .with_rtt(rtt),
+        epoch,
+    );
+
+    let times = nack_times(
+        &mut chain,
+        epoch,
+        Duration::from_millis(100),
+        Duration::from_millis(1000),
+    );
+
+    assert_eq!(
+        vec![
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            Duration::from_millis(700),
+            Duration::from_millis(1000),
+        ],
+        times,
+        "one NACK per round trip, not one per tick"
+    );
+}
+
+/// A packet still missing a round trip after it was asked for is asked for again, and the
+/// requests stop the moment it arrives.
+#[test]
+fn test_nack_generator_rerequests_after_rtt_until_the_packet_arrives() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_gap(
+        NackGeneratorBuilder::new()
+            .with_interval(Duration::from_millis(50))
+            .with_rtt(Duration::from_millis(200)),
+        epoch,
+    );
+
+    let before = nack_times(
+        &mut chain,
+        epoch,
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+    );
+    assert_eq!(
+        vec![Duration::from_millis(50), Duration::from_millis(250)],
+        before,
+        "asked at the first tick, then again exactly one round trip later"
+    );
+
+    // The three missing packets turn up; nothing is left to ask for.
+    for seq in [3u16, 4, 5] {
+        chain
+            .handle_read(create_rtp_packet_with_time(
+                epoch + Duration::from_millis(260),
+                NACK_SSRC,
+                seq,
+                seq as u32 * 3000,
+                100,
+            ))
+            .unwrap();
+    }
+    let mut at = Duration::from_millis(300);
+    while at <= Duration::from_millis(1000) {
+        chain.handle_timeout(epoch + at).unwrap();
+        assert!(
+            chain.poll_write().is_none(),
+            "no NACK once the packets have arrived"
+        );
+        at += Duration::from_millis(50);
+    }
+}
+
+/// A packet the path never repairs is given up on after libwebrtc's ten requests rather than
+/// being asked for until it leaves the log.
+#[test]
+fn test_nack_generator_stops_after_the_retry_cap() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_gap(
+        NackGeneratorBuilder::new()
+            .with_interval(Duration::from_millis(100))
+            .with_rtt(Duration::from_millis(100)),
+        epoch,
+    );
+
+    let times = nack_times(
+        &mut chain,
+        epoch,
+        Duration::from_millis(100),
+        Duration::from_millis(5000),
+    );
+
+    assert_eq!(
+        10,
+        times.len(),
+        "the default cap is ten requests per packet"
+    );
+    assert_eq!(Duration::from_millis(1000), *times.last().unwrap());
+}
+
+/// The same packet requested twice within one round trip is retransmitted once; a request
+/// made a round trip after the retransmission gets a second copy.
+#[test]
+fn test_nack_responder_does_not_resend_the_same_packet_within_one_rtt() {
+    const SSRC: u32 = 0x5151_5151;
+    let epoch = Instant::now();
+    let mut chain = Registry::new()
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new()
+                .with_rtt(Duration::from_millis(100))
+                .build(),
+        )
+        .build();
+    chain.bind_local_stream(&nack_stream_info(SSRC));
+    chain
+        .handle_write(create_rtp_packet_with_time(epoch, SSRC, 1, 1000, 100))
+        .unwrap();
+    while chain.poll_write().is_some() {}
+
+    let mut retransmissions_after = |at_ms: u64| {
+        chain
+            .handle_read(create_nack_packet(
+                epoch + Duration::from_millis(at_ms),
+                0,
+                SSRC,
+                vec![rtcp::transport_feedbacks::transport_layer_nack::NackPair {
+                    packet_id: 1,
+                    lost_packets: 0,
+                }],
+            ))
+            .unwrap();
+        while chain.poll_read().is_some() {}
+        let mut copies = 0;
+        while let Some(pkt) = chain.poll_write() {
+            if matches!(pkt.message.packet, Packet::Rtp(_)) {
+                copies += 1;
+            }
+        }
+        copies
+    };
+
+    assert_eq!(
+        1,
+        retransmissions_after(10),
+        "the first request is answered"
+    );
+    assert_eq!(
+        0,
+        retransmissions_after(60),
+        "a repeat 50 ms later comes before the first copy could have arrived"
+    );
+    assert_eq!(
+        1,
+        retransmissions_after(110),
+        "a request a round trip after the retransmission is answered again"
+    );
+}
+
+// =============================================================================
+// Measured round trip: receiver reports answering the responder's sender reports
+// =============================================================================
+
+const LOCAL_SSRC: u32 = 0x1000_0001;
+/// The middle 32 bits of the NTP time the test sender reports carry (what the report block echoes).
+const SR_LSR: u32 = 0x0001_8000;
+
+fn sender_report_written_at(now: Instant) -> TaggedPacket {
+    TaggedPacket {
+        now,
+        transport: TransportContext::default(),
+        message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(
+            rtcp::sender_report::SenderReport {
+                ssrc: LOCAL_SSRC,
+                ntp_time: u64::from(SR_LSR) << 16,
+                ..Default::default()
+            },
+        )])),
+    }
+}
+
+/// A receiver report about `LOCAL_SSRC` echoing `lsr`, held `delay_ms` by the remote.
+fn receiver_report_at(now: Instant, lsr: u32, delay_ms: u32) -> TaggedPacket {
+    TaggedPacket {
+        now,
+        transport: TransportContext::default(),
+        message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(
+            rtcp::receiver_report::ReceiverReport {
+                ssrc: 0x2000_0002,
+                reports: vec![rtcp::reception_report::ReceptionReport {
+                    ssrc: LOCAL_SSRC,
+                    last_sender_report: lsr,
+                    delay: delay_ms * 65536 / 1000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )])),
+    }
+}
+
+fn measured_round_trip(pkt: &TaggedPacket) -> Option<Duration> {
+    match pkt
+        .message
+        .get(&rtc_interceptor::Attribute::RoundTripTime {
+            rtt: Duration::ZERO,
+        })? {
+        rtc_interceptor::Attribute::RoundTripTime { rtt } => Some(*rtt),
+        _ => None,
+    }
+}
+
+/// A receiver report that answers a sender report gives the responder the path's round trip
+/// (arrival less send time less the remote's hold time), which then replaces the configured one
+/// as the window within which a repeated request is ignored, and rides the report up the chain.
+#[test]
+fn test_nack_responder_measures_the_round_trip_from_receiver_reports() {
+    let epoch = Instant::now();
+    let ms = Duration::from_millis;
+    let mut chain = Registry::new()
+        .with(Slot::NackResponder, NackResponderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&nack_stream_info(LOCAL_SSRC));
+    chain
+        .handle_write(create_rtp_packet_with_time(epoch, LOCAL_SSRC, 1, 1000, 100))
+        .unwrap();
+    chain.handle_write(sender_report_written_at(epoch)).unwrap();
+    while chain.poll_write().is_some() {}
+
+    chain
+        .handle_read(receiver_report_at(epoch + ms(350), SR_LSR, 50))
+        .unwrap();
+    let report = chain
+        .poll_read()
+        .expect("the report continues up the chain");
+    let rtt = measured_round_trip(&report).expect("it carries the measured round trip");
+    assert!(
+        rtt > ms(299) && rtt < ms(301),
+        "350 ms since the SR less 50 ms held is 300 ms, got {rtt:?}"
+    );
+
+    let mut copies_after = |at: Duration| {
+        chain
+            .handle_read(create_nack_packet(
+                epoch + at,
+                0,
+                LOCAL_SSRC,
+                vec![rtcp::transport_feedbacks::transport_layer_nack::NackPair {
+                    packet_id: 1,
+                    lost_packets: 0,
+                }],
+            ))
+            .unwrap();
+        while chain.poll_read().is_some() {}
+        let mut copies = 0;
+        while let Some(pkt) = chain.poll_write() {
+            copies += usize::from(matches!(pkt.message.packet, Packet::Rtp(_)));
+        }
+        copies
+    };
+    assert_eq!(1, copies_after(ms(400)), "the first request is answered");
+    assert_eq!(
+        0,
+        copies_after(ms(600)),
+        "200 ms after the retransmission is inside the measured 300 ms round trip"
+    );
+    assert_eq!(
+        1,
+        copies_after(ms(710)),
+        "310 ms after the retransmission the first copy would have been reported"
+    );
+}
+
+/// Reports that answer nothing the responder sent, or that echo no sender report at all, measure
+/// nothing: no round trip rides on them, so the chain's terminus has nothing to deliver.
+#[test]
+fn test_nack_responder_ignores_reports_that_answer_nothing() {
+    let epoch = Instant::now();
+    let mut chain = Registry::new()
+        .with(Slot::NackResponder, NackResponderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&nack_stream_info(LOCAL_SSRC));
+    chain.handle_write(sender_report_written_at(epoch)).unwrap();
+    while chain.poll_write().is_some() {}
+
+    for lsr in [0, SR_LSR + 1] {
+        chain
+            .handle_read(receiver_report_at(
+                epoch + Duration::from_millis(100),
+                lsr,
+                0,
+            ))
+            .unwrap();
+        assert!(
+            chain.poll_read().is_none(),
+            "lsr {lsr:#x} matches no sender report, so nothing is measured"
+        );
+    }
+}
+
+/// A new round-trip sample moves the smoothed value by an eighth, so one outlier does not
+/// reset the pacing.
+#[test]
+fn test_nack_responder_smooths_round_trip_samples() {
+    let epoch = Instant::now();
+    let ms = Duration::from_millis;
+    let mut chain = Registry::new()
+        .with(Slot::NackResponder, NackResponderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&nack_stream_info(LOCAL_SSRC));
+    chain.handle_write(sender_report_written_at(epoch)).unwrap();
+    while chain.poll_write().is_some() {}
+
+    chain
+        .handle_read(receiver_report_at(epoch + ms(100), SR_LSR, 0))
+        .unwrap();
+    let first = measured_round_trip(&chain.poll_read().unwrap()).unwrap();
+    chain
+        .handle_read(receiver_report_at(epoch + ms(900), SR_LSR, 0))
+        .unwrap();
+    let second = measured_round_trip(&chain.poll_read().unwrap()).unwrap();
+
+    assert_eq!(ms(100), first, "the first sample is taken as it is");
+    // 100 ms * 7/8 + 900 ms * 1/8 = 200 ms
+    assert!(
+        second > ms(199) && second < ms(201),
+        "one eighth of the new sample, got {second:?}"
+    );
+}
+
+/// A chain with both halves: the responder measures the round trip from a receiver report and
+/// the generator then asks for a still-missing packet once per measured round trip (rounded up
+/// to its tick), where without any report it falls back to the configured 100 ms.
+#[test]
+fn test_nack_generator_paces_requests_by_the_measured_round_trip() {
+    let epoch = Instant::now();
+    let ms = Duration::from_millis;
+    let build = || {
+        let mut chain = Registry::new()
+            .with(Slot::NackResponder, NackResponderBuilder::new().build())
+            .with(
+                Slot::NackGenerator,
+                NackGeneratorBuilder::new().with_interval(ms(100)).build(),
+            )
+            .build();
+        chain.bind_local_stream(&nack_stream_info(LOCAL_SSRC));
+        chain.bind_remote_stream(&nack_stream_info(NACK_SSRC));
+        for seq in [0u16, 1, 2, 6, 7] {
+            chain
+                .handle_read(create_rtp_packet_with_time(
+                    epoch,
+                    NACK_SSRC,
+                    seq,
+                    seq as u32 * 3000,
+                    100,
+                ))
+                .unwrap();
+        }
+        chain.handle_write(sender_report_written_at(epoch)).unwrap();
+        while chain.poll_write().is_some() {}
+        while chain.poll_read().is_some() {}
+        chain
+    };
+
+    let mut measured = build();
+    measured
+        .handle_read(receiver_report_at(epoch + ms(600), SR_LSR, 0))
+        .unwrap();
+    while measured.poll_read().is_some() {}
+    assert_eq!(
+        vec![ms(100), ms(700), ms(1300), ms(1900)],
+        nack_times(&mut measured, epoch, ms(100), ms(2000)),
+        "one request per measured 600 ms round trip"
+    );
+
+    let mut unmeasured = build();
+    assert_eq!(
+        vec![ms(100), ms(200), ms(300), ms(400), ms(500)],
+        nack_times(&mut unmeasured, epoch, ms(100), ms(500)),
+        "without a report the 100 ms fallback paces the requests"
+    );
+}
+
+// =============================================================================
+// RTX: a repair credits the primary stream
+// =============================================================================
+
+const RTX_PRIMARY: u32 = 0x1111_0001;
+const RTX_REPAIR: u32 = 0x1111_0002;
+
+/// What the chain would ask for at `at`: each NACK's media SSRC and the sequence numbers it names.
+fn nacks_at(chain: &mut impl Interceptor, epoch: Instant, at: Duration) -> Vec<(u32, Vec<u16>)> {
+    chain.handle_timeout(epoch + at).unwrap();
+    let mut nacks = Vec::new();
+    while let Some(pkt) = chain.poll_write() {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
+            for rtcp_pkt in rtcp_packets {
+                if let Some(nack) = rtcp_pkt
+                    .as_any()
+                    .downcast_ref::<rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>()
+                {
+                    let seqs = nack.nacks.iter().flat_map(|p| p.packet_list()).collect();
+                    nacks.push((nack.media_ssrc, seqs));
+                }
+            }
+        }
+    }
+    nacks
+}
+
+/// An RTX packet on the repair SSRC whose payload is `osn` then `body`.
+fn rtx_packet(now: Instant, rtx_seq: u16, osn: u16, body: &[u8]) -> TaggedPacket {
+    let mut packet = create_rtp_packet_with_time(now, RTX_REPAIR, rtx_seq, 0, 0);
+    if let Packet::Rtp(ref mut rtp) = packet.message.packet {
+        let mut payload = osn.to_be_bytes().to_vec();
+        payload.extend_from_slice(body);
+        rtp.payload = payload.into();
+    }
+    packet
+}
+
+/// A generator with the primary bound (naming its RTX flow) and the RTX flow bound without
+/// feedback, as the peer connection does (`repair_flows_are_bound_without_feedback` there), after the primary has seen 0, 1, 2, 4, 5: 3 is missing.
+fn generator_with_rtx_and_gap(epoch: Instant) -> impl Interceptor {
+    let mut chain = Registry::new()
+        .with(Slot::NackGenerator, NackGeneratorBuilder::new().build())
+        .build();
+    chain.bind_remote_stream(&nack_rtx_stream_info(RTX_PRIMARY, RTX_REPAIR, 97));
+    chain.bind_remote_stream(&no_nack_stream_info(RTX_REPAIR));
+    for seq in [0u16, 1, 2, 4, 5] {
+        chain
+            .handle_read(create_rtp_packet_with_time(
+                epoch,
+                RTX_PRIMARY,
+                seq,
+                seq as u32 * 3000,
+                100,
+            ))
+            .unwrap();
+    }
+    while chain.poll_read().is_some() {}
+    chain
+}
+
+#[test]
+fn a_packet_repaired_over_rtx_is_not_asked_for_again() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let ms = Duration::from_millis;
+
+    assert_eq!(
+        vec![(RTX_PRIMARY, vec![3])],
+        nacks_at(&mut chain, epoch, ms(100)),
+        "the gap is asked for"
+    );
+
+    chain
+        .handle_read(rtx_packet(epoch + ms(150), 0, 3, &[1, 2, 3]))
+        .unwrap();
+    while chain.poll_read().is_some() {}
+
+    assert!(
+        nacks_at(&mut chain, epoch, ms(300)).is_empty(),
+        "the RTX packet carried original sequence number 3"
+    );
+}
+
+#[test]
+fn an_rtx_packet_without_an_original_sequence_number_repairs_nothing() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let ms = Duration::from_millis;
+
+    // A padding-only RTX packet: no payload, or under two bytes, so no OSN to read.
+    for (rtx_seq, payload) in [(0u16, &[][..]), (1, &[0x00][..])] {
+        let mut packet = rtx_packet(epoch, rtx_seq, 0, &[]);
+        if let Packet::Rtp(ref mut rtp) = packet.message.packet {
+            rtp.payload = payload.to_vec().into();
+        }
+        chain.handle_read(packet).unwrap();
+    }
+    while chain.poll_read().is_some() {}
+
+    assert_eq!(
+        vec![(RTX_PRIMARY, vec![3])],
+        nacks_at(&mut chain, epoch, ms(100)),
+        "3 is still missing"
+    );
+}
+
+#[test]
+fn unbinding_the_primary_forgets_its_rtx_flow() {
+    let epoch = Instant::now();
+    let mut chain = generator_with_rtx_and_gap(epoch);
+    let info = nack_rtx_stream_info(RTX_PRIMARY, RTX_REPAIR, 97);
+    chain.unbind_remote_stream(&no_nack_stream_info(RTX_REPAIR));
+    chain.unbind_remote_stream(&info);
+
+    // Rebound with no RTX flow, an RTX-SSRC packet is just an unknown stream's packet.
+    chain.bind_remote_stream(&nack_stream_info(RTX_PRIMARY));
+    chain.handle_read(rtx_packet(epoch, 0, 3, &[1])).unwrap();
+    while chain.poll_read().is_some() {}
+    assert!(nacks_at(&mut chain, epoch, Duration::from_millis(100)).is_empty());
+}

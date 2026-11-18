@@ -103,6 +103,17 @@ ATTACK_KEYS = ("freezes", "freeze_rate", "freeze_ms", "stalls", "stall_max", "cl
                "never")
 ATTACK_FILL = "#a855f7"
 EARLY_STOP_S = 60  # a baseline whose samples end this much before the subject's stopped early
+# Over the minutes a baseline that stopped early ran, a phase seen fewer times than this is shown
+# but not judged: one or two outages say more about where they fell than about the server.
+MIN_PHASE_SAMPLES = 3
+# The soak's phase cycle (run.sh CYCLE_MIN default) when the log does not show two cycles: a baseline
+# that stopped before one cycle has not been through what the comparison is about, so nothing of it
+# is judged (the first minutes are join warm-up).
+DEFAULT_CYCLE_S = 20 * 60
+# Sessions the server closed or lost are not noise of a short span: they stay judged.
+HARD_KEYS = ("closes", "sig_closes", "lost_seats")
+# Judged in the `recover` phase, not in `outage`: a few samples say where they fell.
+OUTAGE_INFO_KEYS = ("audio_gap", "loss")
 WINDOW_LIST_MAX = 200  # the per-window table lists every window up to this many, then only those with an impact
 PHASE_FILL = {"loss": "#facc15", "burst": "#fb923c", "bw": "#60a5fa", "outage": "#ef4444"}
 CLOSES = ("the SFU closed the session",)
@@ -826,6 +837,22 @@ def judge(key, s, b, rules, kind=None):
     return ("ok" if s <= lim else "BREACH"), lim
 
 
+def phase_count(ents, group, name, t_end):
+    """How many times the phase `name` of `group` started before `t_end` (the fewest of the runs)."""
+    return min((sum(1 for t, n in e.run.phases(group) if n == name and t < t_end) for e in ents), default=0)
+
+
+def cycle_s(ents):
+    """The soak's phase cycle in seconds: the gap between two starts of the `clean` phase in the
+    log, else the run.sh default (a profile without cycles, such as abuse, has no phase to count)."""
+    gaps = []
+    for e in ents:
+        for g in e.run.timeline:
+            starts = [t for t, n in e.run.phases(g) if n == "clean"]
+            gaps += [b - a for a, b in zip(starts, starts[1:]) if b - a >= 60]
+    return min(gaps, default=DEFAULT_CYCLE_S)
+
+
 def freezes_only_if_frozen(key, verdict, s_m, b_m):
     """More freezes of less frozen time is a stream that plays, not one that breaks: freezes per
     minute breach only when the freeze ms per minute is worse too."""
@@ -865,10 +892,15 @@ def compare(ents, rules):
             s_span, b_span = server_span(s_ents), server_span(b_ents)
             if b_span < max(e.t1 for e in b_ents):
                 b_ents = clipped(b_ents, b_span)
+            short = None  # the compared span when the baseline stopped early
+            cycle = cycle_s(s_ents)
             if b_span < s_span - EARLY_STOP_S:
                 add(False, where + ": the baseline stopped early", "after %.1f of %.1f min" % (
                     b_span / 60.0, s_span / 60.0), "compared over its %.1f min" % (b_span / 60.0), None)
                 s_ents = clipped(s_ents, b_span)
+                short = b_span
+            # Less than one cycle of the baseline: nothing in the comparison is judged.
+            brief = short is not None and short < cycle
             groups = sorted({s.group for e in s_ents + b_ents for s in e.series.values() if s.kind == "recv"},
                             key=lambda g: (g != "clean", g))
             for g in rules["require_groups"] if spec.get("require", True) else []:
@@ -887,12 +919,21 @@ def compare(ents, rules):
                         continue
                     if sm is None:
                         continue
+                    def seen(n, g=g):
+                        return min(phase_count(s_ents, g, n, short), phase_count(b_ents, g, n, short))
+                    few = brief or (short is not None and (
+                        seen(ph) < MIN_PHASE_SAMPLES if ph is not None
+                        else bool(phases[1:]) and all(seen(n) < MIN_PHASE_SAMPLES for n in phases[1:])))
                     for key, _, nd, kind, _ in METRICS:
                         s_v, b_v = sm.get(key), bm.get(key)
                         if s_v is None and b_v is None:
                             continue
                         verdict, lim = judge(key, s_v, b_v, rules) if kind else ("", None)
                         verdict = freezes_only_if_frozen(key, verdict, sm, bm)
+                        if ph == "outage" and key in OUTAGE_INFO_KEYS:
+                            verdict, lim = "", None
+                        if few and verdict == "BREACH" and key not in HARD_KEYS:
+                            verdict = "too few to judge"
                         rows.append({"arch": arch, "pair": name, "scope": g, "phase": ph or "all", "key": key,
                                      "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                      "gated": gated, "where": where})
@@ -909,6 +950,8 @@ def compare(ents, rules):
                         if s_v is None and b_v is None:
                             continue
                         verdict, lim = judge(key, s_v, b_v, rules)
+                        if brief and verdict == "BREACH" and key not in HARD_KEYS:
+                            verdict = "too few to judge"
                         rows.append({"arch": arch, "pair": name, "scope": "sfu", "phase": ph or "all", "key": key,
                                      "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                      "gated": gated, "where": where})
@@ -926,6 +969,8 @@ def compare(ents, rules):
                     kind = "count" if key == "freezes" else KIND.get(key)
                     verdict, lim = judge(key, s_v, b_v, rules, kind)
                     verdict = freezes_only_if_frozen(key, verdict, sm, bm)
+                    if brief and verdict == "BREACH" and key not in HARD_KEYS:
+                        verdict = "too few to judge"
                     rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": cls, "key": key,
                                  "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                  "gated": gated, "where": where})

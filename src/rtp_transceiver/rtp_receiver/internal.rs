@@ -351,6 +351,40 @@ impl RTCRtpReceiverInternal {
         }
     }
 
+    /// Binds or unbinds a repair flow (RTX or FEC) in its own right.
+    ///
+    /// The flow is a real RTP stream with its own SSRC and sequence-number space, so an
+    /// interceptor tracking arrivals has to know it exists, but it negotiates no RTCP feedback of
+    /// its own: `nack` and `nack pli` belong to the primary stream, and a repair flow carrying
+    /// them would have its own sequence-number gaps NACKed and its SSRC sent PLIs. pion binds its
+    /// repair flows with no feedback for the same reason. Header extensions are kept, as
+    /// transport-wide congestion control reads them.
+    pub(crate) fn interceptor_remote_repair_stream_op(
+        interceptor: &mut dyn Interceptor,
+        is_binding: bool,
+        ssrc: SSRC,
+        payload_type: PayloadType,
+        rtp_codec: &RTCRtpCodec,
+        header_extensions: &[RTCRtpHeaderExtensionParameters],
+    ) {
+        let codec = RTCRtpCodec {
+            rtcp_feedback: vec![],
+            ..rtp_codec.clone()
+        };
+        Self::interceptor_remote_stream_op(
+            interceptor,
+            is_binding,
+            ssrc,
+            None,
+            None,
+            payload_type,
+            None,
+            None,
+            &codec,
+            header_extensions,
+        );
+    }
+
     pub(crate) fn interceptor_remote_streams_op(
         &mut self,
         media_engine: &MediaEngine,
@@ -395,30 +429,22 @@ impl RTCRtpReceiverInternal {
                 // tracks arrival needs to know it exists. RTX and FEC are treated identically
                 // here — they are the same shape of thing.
                 if let Some((ssrc_rtx, payload_type_rtx)) = rtx {
-                    RTCRtpReceiverInternal::interceptor_remote_stream_op(
+                    RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                         interceptor,
                         is_binding,
                         ssrc_rtx,
-                        None,
-                        None,
                         payload_type_rtx,
-                        None,
-                        None,
                         &codec.rtp_codec,
                         &parameters.rtp_parameters.header_extensions,
                     );
                 }
 
                 if let Some((ssrc_fec, payload_type_fec)) = fec {
-                    RTCRtpReceiverInternal::interceptor_remote_stream_op(
+                    RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
                         interceptor,
                         is_binding,
                         ssrc_fec,
-                        None,
-                        None,
                         payload_type_fec,
-                        None,
-                        None,
                         &codec.rtp_codec,
                         &parameters.rtp_parameters.header_extensions,
                     );
@@ -448,6 +474,7 @@ mod repair_association_test {
     use crate::peer_connection::configuration::media_engine::{
         MIME_TYPE_FLEX_FEC03, MIME_TYPE_RTX, MIME_TYPE_VP8, MediaEngine,
     };
+    use crate::rtp_transceiver::rtp_sender::RTCPFeedback;
     use crate::rtp_transceiver::rtp_sender::rtp_codec_parameters::RTCRtpCodecParameters;
     use crate::rtp_transceiver::rtp_sender::rtp_coding_parameters::RTCRtpCodingParameters;
     use crate::rtp_transceiver::rtp_sender::rtp_encoding_parameters::RTCRtpEncodingParameters;
@@ -670,6 +697,37 @@ mod repair_association_test {
             streams.iter().any(|info| info.ssrc == 3000),
             "the FEC flow is bound: {streams:?}"
         );
+    }
+
+    /// `nack` and `nack pli` belong to the media stream. A repair flow bound with them would have
+    /// the gaps in its own sequence numbers NACKed (nobody retransmits a retransmission) and its
+    /// SSRC sent PLIs; pion binds its repair flows with no feedback.
+    #[test]
+    fn repair_flows_are_bound_without_feedback() {
+        let mut media_engine = media_engine();
+        media_engine.register_feedback(
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            RtpCodecKind::Video,
+        );
+        let streams = run(
+            &media_engine,
+            vec![encoding("", 1000, Some(2000), Some(3000))],
+            true,
+        );
+
+        assert!(
+            !primary(&streams, 1000).rtcp_feedback.is_empty(),
+            "the media stream keeps its feedback: {streams:?}"
+        );
+        for ssrc in [2000, 3000] {
+            assert!(
+                primary(&streams, ssrc).rtcp_feedback.is_empty(),
+                "repair flow {ssrc} must negotiate no feedback: {streams:?}"
+            );
+        }
     }
 
     /// Both halves or neither. A repair SSRC whose payload type was never negotiated is not a

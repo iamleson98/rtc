@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
@@ -72,9 +73,10 @@ def side(impl, **kw):
     """A lesson-like run: a clean student, two impaired ones, the SFU process."""
     rows = list(TIMELINE) + proc(impl, END, **{k: kw[k] for k in ("cpu", "rss") if k in kw})
     rows += track(impl, "c01/video:teacher", "clean", END, bytes_per_s=kw.get("clean_bps", 200_000),
-                  freezes=kw.get("clean_freezes", lambda t: 0), flowing=kw.get("clean_flow", lambda t: True))
+                  freezes=kw.get("clean_freezes", lambda t: 0), flowing=kw.get("clean_flow", lambda t: True),
+                  freeze_ms=kw.get("clean_freeze_ms", lambda t: 0))
     rows += track(impl, "s17/video:teacher", "impaired", END, bytes_per_s=300_000,
-                  flowing=lambda t: not (120 <= t < 125))
+                  flowing=lambda t: not (120 <= t < 125), **kw.get("impaired", {}))
     rows += kw.get("extra", [])
     return rows
 
@@ -376,15 +378,78 @@ class EarlyStop(Fixture):
 
     def test_what_the_subject_did_while_the_baseline_ran_is_still_compared(self):
         early = [event("rtcd-rs", 70, "s17", "error", "the SFU closed the session")]
-        status, md, _, _ = run_report(side("rtcd-rs", extra=early), self.stopped(100))
+        with mock.patch.object(report, "DEFAULT_CYCLE_S", 50):  # the baseline ran a whole cycle
+            status, md, _, _ = run_report(side("rtcd-rs", extra=early), self.stopped(100))
         self.assertEqual(status, 1)
         self.assertIn("SFU-closed sessions", md.split("## Breaches")[1].split("## ")[0])
+
+    # a freeze of a second every 5 s through the bw phase (cumulative counters)
+    BW_FREEZES = {"impaired": {"freezes": lambda t: min(max(t - 60, 0), 60) // STEP,
+                               "freeze_ms": lambda t: min(max(t - 60, 0), 60) // STEP * 1000}}
+
+    def test_a_phase_seen_too_few_times_before_the_baseline_stopped_is_not_judged(self):
+        _, md, _, _ = run_report(side("rtcd-rs", **self.BW_FREEZES), self.stopped(150))
+        row = [l for l in md.splitlines() if l.startswith("| impaired | bw | Freezes / min (video) |")]
+        self.assertTrue(row and row[0].endswith("| too few to judge |"), row)
+        self.assertNotIn("impaired / bw / Freezes", md.split("## Breaches")[1].split("## ")[0])
+
+    def test_the_same_phase_is_judged_when_the_baseline_ran_to_the_end(self):
+        status, md, _, _ = run_report(side("rtcd-rs", **self.BW_FREEZES), side("rtcd-go"))
+        self.assertEqual(status, 1, md)
+        self.assertIn("impaired / bw / Freezes / min (video)", md)
+        self.assertNotIn("too few to judge", md)
 
     def test_the_subjects_absolute_rules_cover_its_whole_run(self):
         late = {"clean_freezes": lambda t: 1 if t > 200 else 0}
         status, md, _, _ = run_report(side("rtcd-rs", **late), self.stopped(100))
         self.assertEqual(status, 1)
         self.assertIn("clean group, subject Freezes (count) must be zero", md)
+
+
+class ShortBaseline(Fixture):
+    """A baseline that stopped before one cycle has not been through what is compared."""
+
+    @staticmethod
+    def stopped(t_end):
+        return EarlyStop.stopped(t_end)
+
+    # the impaired and the clean student both freeze for good from t=70 (cumulative counters)
+    FREEZE = {"clean_freezes": lambda t: max(t - 70, 0) // STEP * 2,
+              "clean_freeze_ms": lambda t: max(t - 70, 0) // STEP * 2000,
+              "impaired": {"freezes": lambda t: max(t - 70, 0) // STEP * 2,
+                           "freeze_ms": lambda t: max(t - 70, 0) // STEP * 2000}}
+
+    def test_nothing_is_judged_over_less_than_one_cycle(self):
+        _, md, _, _ = run_report(side("rtcd-rs", **self.FREEZE), self.stopped(150))
+        for scope, ph in (("clean", "all"), ("impaired", "all")):
+            row = [l for l in md.splitlines() if l.startswith("| %s | %s | Freezes / min (video) |" % (scope, ph))]
+            self.assertTrue(row and row[0].endswith("| too few to judge |"), (scope, row))
+        self.assertNotIn("Freezes / min (video)", md.split("## Breaches")[1].split("## ")[0])
+
+    def test_a_full_length_baseline_still_fails_a_real_regression_on_all_and_clean(self):
+        status, md, _, _ = run_report(side("rtcd-rs", **self.FREEZE), side("rtcd-go"))
+        self.assertEqual(status, 1, md)
+        breaches = md.split("## Breaches")[1].split("## ")[0]
+        self.assertIn("clean / all / Freezes / min (video)", breaches)
+        self.assertIn("impaired / all / Freezes / min (video)", breaches)
+        self.assertNotIn("too few to judge", md)
+
+    def test_an_all_row_is_too_few_when_every_phase_in_it_is(self):
+        rules = dict(RULES, compare=[{"subject": "rtcd-rs", "baseline": "rtcd-go"}])
+        with mock.patch.object(report, "DEFAULT_CYCLE_S", 100):  # one cycle is shorter than the baseline's run
+            _, md, _, _ = run_report(side("rtcd-rs", **self.FREEZE), self.stopped(150), rules)
+        row = [l for l in md.splitlines() if l.startswith("| impaired | all | Freezes / min (video) |")]
+        self.assertTrue(row and row[0].endswith("| too few to judge |"), row)
+
+    def test_outage_audio_gap_is_left_to_the_recover_phase(self):
+        audio = track("rtcd-rs", "s17/audio:teacher", "impaired", END, bytes_per_s=20_000, media="audio",
+                      flowing=lambda t: not (120 <= t < 125))
+        for r in audio:  # audio stops through the outage, as the subject's does and the baseline's does not
+            r["audio_gap_ms"] = 4000 if 120 <= (r["ts"] - ts(0)) / 1000.0 < 130 else 0
+        _, md, _, _ = run_report(side("rtcd-rs", extra=audio), side("rtcd-go"))
+        row = [l for l in md.splitlines() if l.startswith("| impaired | outage | Audio gap %")]
+        self.assertTrue(row and not row[0].rstrip("| ").endswith(("BREACH", "ok")), row)
+        self.assertNotIn("impaired / outage / Audio gap", md.split("## Breaches")[1].split("## ")[0])
 
 
 class CleanZeroPerPair(Fixture):
