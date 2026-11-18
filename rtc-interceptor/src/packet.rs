@@ -1,6 +1,7 @@
 use shared::TransportMessage;
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// RTP/RTCP Packet
 ///
@@ -96,6 +97,18 @@ pub enum Attribute {
         bits_per_second: f64,
     },
 
+    /// The round-trip time a receiver report measured, in the report's own packet.
+    ///
+    /// Rides inbound on the RTCP packet carrying the report block it was measured from. The NACK
+    /// responder, which knows when it sent each sender report, derives it and attaches it so the
+    /// NACK generator further along the read walk can pace its requests by the real path rather
+    /// than a configured guess.
+    RoundTripTime {
+        /// The measured round trip, send of the sender report to arrival of its report block,
+        /// less the time the remote held the report before answering.
+        rtt: Duration,
+    },
+
     /// Anything an application defines, so this enum is never a bottleneck on it.
     ///
     /// `Arc` rather than `Box` so an attributed packet stays cheap to clone — the NACK responder
@@ -114,6 +127,9 @@ impl std::fmt::Debug for Attribute {
                 .debug_struct("TargetBitrateChanged")
                 .field("bits_per_second", bits_per_second)
                 .finish(),
+            Self::RoundTripTime { rtt } => {
+                f.debug_struct("RoundTripTime").field("rtt", rtt).finish()
+            }
             // The payload is `dyn Any`, which is not `Debug`.
             Self::Custom(_) => f.write_str("Custom(..)"),
         }

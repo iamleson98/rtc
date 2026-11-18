@@ -4,11 +4,11 @@ use super::receive_log::ReceiveLog;
 use super::stream_supports_nack;
 use crate::Interceptor;
 use crate::stream_info::StreamInfo;
-use crate::{AttributedPacket, Packet, TaggedPacket};
+use crate::{Attribute, AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Decides which remote streams this generator tracks, on top of the NACK feedback check.
@@ -28,6 +28,8 @@ pub type GeneratorStreamsFilter = Box<dyn Fn(&StreamInfo) -> bool + Send + Sync>
 ///         .with_size(512)
 ///         .with_interval(Duration::from_millis(100))
 ///         .with_skip_last_n(2)
+///         .with_rtt(Duration::from_millis(100))
+///         .with_max_nacks_per_packet(10)
 ///         .build())
 ///     .build();
 /// ```
@@ -40,9 +42,17 @@ pub struct NackGeneratorBuilder {
     skip_last_n: u16,
     /// Maximum number of NACKs to send per missing packet (0 = unlimited).
     max_nacks_per_packet: u16,
+    /// Round-trip time assumed between asking for a packet and its repair arriving.
+    rtt: Duration,
     /// Extra per-stream gate, applied on top of the NACK feedback check.
     streams_filter: Option<GeneratorStreamsFilter>,
 }
+
+/// libwebrtc's `kMaxNackRetries`: a packet still missing after this many requests is given up on.
+const DEFAULT_MAX_NACKS_PER_PACKET: u16 = 10;
+
+/// libwebrtc's `kDefaultRtt`: assumed until the application supplies a measured round trip.
+const DEFAULT_RTT: Duration = Duration::from_millis(100);
 
 impl Default for NackGeneratorBuilder {
     fn default() -> Self {
@@ -50,7 +60,8 @@ impl Default for NackGeneratorBuilder {
             size: 512,
             interval: Duration::from_millis(100),
             skip_last_n: 0,
-            max_nacks_per_packet: 0,
+            max_nacks_per_packet: DEFAULT_MAX_NACKS_PER_PACKET,
+            rtt: DEFAULT_RTT,
             streams_filter: None,
         }
     }
@@ -87,9 +98,27 @@ impl NackGeneratorBuilder {
 
     /// Set the maximum number of NACKs to send per missing packet.
     ///
-    /// Set to 0 (default) for unlimited NACKs.
+    /// A packet still missing after this many requests is given up on, so a path that cannot
+    /// repair it is not asked forever. Defaults to 10, libwebrtc's `kMaxNackRetries`; set to 0
+    /// for unlimited NACKs.
     pub fn with_max_nacks_per_packet(mut self, max: u16) -> Self {
         self.max_nacks_per_packet = max;
+        self
+    }
+
+    /// Set the round-trip time assumed for a repair to arrive, used until a round trip is
+    /// measured from RTCP reports.
+    ///
+    /// The NACK responder earlier in the chain measures it from receiver reports and passes it on
+    /// as [`Attribute::RoundTripTime`](crate::Attribute::RoundTripTime); from then on that value
+    /// replaces this one.
+    ///
+    /// A missing packet is asked for again only once this long has passed since it was last
+    /// asked for: earlier than that, the first repair is still in flight and another request
+    /// only makes the sender transmit the same packet twice. Defaults to 100 ms, libwebrtc's
+    /// `kDefaultRtt`.
+    pub fn with_rtt(mut self, rtt: Duration) -> Self {
+        self.rtt = rtt;
         self
     }
 
@@ -125,6 +154,7 @@ impl NackGeneratorBuilder {
             self.interval,
             self.skip_last_n,
             self.max_nacks_per_packet,
+            self.rtt,
             self.streams_filter,
         )
     }
@@ -141,6 +171,9 @@ pub struct NackGeneratorInterceptor {
     interval: Duration,
     skip_last_n: u16,
     max_nacks_per_packet: u16,
+    rtt: Duration,
+    /// Round trip measured by the responder, once it has one; replaces `rtt`.
+    measured_rtt: Option<Duration>,
     /// Extra per-stream gate from the builder, applied with the NACK feedback check.
     streams_filter: Option<GeneratorStreamsFilter>,
 
@@ -153,13 +186,21 @@ pub struct NackGeneratorInterceptor {
     /// Receive logs per remote stream SSRC
     receive_logs: HashMap<u32, ReceiveLog>,
 
-    /// NACK count per (SSRC, sequence number) for max_nacks_per_packet limiting
-    nack_counts: HashMap<u32, HashMap<u16, u16>>,
+    /// When and how often each still-missing (SSRC, sequence number) was last asked for
+    nack_states: HashMap<u32, HashMap<u16, NackState>>,
 
     /// Queue for outgoing NACK packets
     write_queue: VecDeque<TaggedPacket>,
     /// Inbound packets ready for the next interceptor.
     read_queue: VecDeque<TaggedPacket>,
+}
+
+/// What has been asked for so far about one missing packet.
+struct NackState {
+    /// When the packet was last named in a NACK.
+    last_sent: Instant,
+    /// How many NACKs have named it.
+    count: u16,
 }
 
 impl NackGeneratorInterceptor {
@@ -168,6 +209,7 @@ impl NackGeneratorInterceptor {
         interval: Duration,
         skip_last_n: u16,
         max_nacks_per_packet: u16,
+        rtt: Duration,
         streams_filter: Option<GeneratorStreamsFilter>,
     ) -> Self {
         Self {
@@ -176,53 +218,61 @@ impl NackGeneratorInterceptor {
             interval,
             skip_last_n,
             max_nacks_per_packet,
+            rtt,
+            measured_rtt: None,
             streams_filter,
             next_timeout: None,
             sender_ssrc: rand::random(),
             receive_logs: HashMap::new(),
-            nack_counts: HashMap::new(),
+            nack_states: HashMap::new(),
             write_queue: VecDeque::new(),
         }
     }
 
     /// Generate NACKs for all streams with missing packets.
     fn generate_nacks(&mut self, now: Instant) {
+        let rtt = self.measured_rtt.unwrap_or(self.rtt);
         for (&ssrc, receive_log) in &self.receive_logs {
             let missing = receive_log.missing_seq_numbers(self.skip_last_n);
             if missing.is_empty() {
-                // Clear nack counts for this SSRC if no missing packets
-                self.nack_counts.remove(&ssrc);
+                self.nack_states.remove(&ssrc);
                 continue;
             }
 
-            // Initialize nack counts for this SSRC if needed
-            let nack_count = self.nack_counts.entry(ssrc).or_default();
+            // Forget packets that arrived or fell out of the log, then pick the ones due: a
+            // packet asked for less than one round trip ago has its repair still in flight, and
+            // one asked for `max_nacks_per_packet` times is given up on.
+            let state = self.nack_states.entry(ssrc).or_default();
+            let still_missing: HashSet<u16> = missing.iter().copied().collect();
+            state.retain(|seq, _| still_missing.contains(seq));
 
-            // Filter by max_nacks_per_packet if configured
-            let filtered: Vec<u16> = if self.max_nacks_per_packet > 0 {
-                missing
-                    .iter()
-                    .filter(|&&seq| {
-                        let count = nack_count.entry(seq).or_insert(0);
-                        if *count < self.max_nacks_per_packet {
-                            *count += 1;
-                            true
-                        } else {
-                            false
+            let filtered: Vec<u16> = missing
+                .iter()
+                .copied()
+                .filter(|&seq| {
+                    let due = match state.get(&seq) {
+                        None => true,
+                        Some(sent) => {
+                            now.saturating_duration_since(sent.last_sent) >= rtt
+                                && (self.max_nacks_per_packet == 0
+                                    || sent.count < self.max_nacks_per_packet)
                         }
-                    })
-                    .copied()
-                    .collect()
-            } else {
-                missing.clone()
-            };
+                    };
+                    if due {
+                        let sent = state.entry(seq).or_insert(NackState {
+                            last_sent: now,
+                            count: 0,
+                        });
+                        sent.last_sent = now;
+                        sent.count = sent.count.saturating_add(1);
+                    }
+                    due
+                })
+                .collect();
 
             if filtered.is_empty() {
                 continue;
             }
-
-            // Clean up nack counts for packets no longer missing
-            nack_count.retain(|seq, _| missing.contains(seq));
 
             // Create NACK packet
             let nack = rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack {
@@ -250,6 +300,13 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackGeneratorInterceptor {
     type Time = Instant;
 
     fn handle_read(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+        // The responder times receiver reports against its sender reports and says so
+        if let Some(Attribute::RoundTripTime { rtt }) = msg.message.get(&Attribute::RoundTripTime {
+            rtt: Duration::ZERO,
+        }) {
+            self.measured_rtt = Some(*rtt);
+        }
+
         // Track incoming RTP packets
         if let Packet::Rtp(ref rtp_packet) = msg.message.packet
             && let Some(receive_log) = self.receive_logs.get_mut(&rtp_packet.header.ssrc)
@@ -320,7 +377,7 @@ impl Interceptor for NackGeneratorInterceptor {
 
     fn unbind_remote_stream(&mut self, info: &StreamInfo) {
         self.receive_logs.remove(&info.ssrc);
-        self.nack_counts.remove(&info.ssrc);
+        self.nack_states.remove(&info.ssrc);
     }
 
     fn bind_local_stream(&mut self, _info: &StreamInfo) {}

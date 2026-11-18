@@ -9,7 +9,7 @@ use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Decides which local streams this responder buffers, on top of the NACK feedback check.
 /// pion's `ResponderStreamsFilter`.
@@ -25,20 +25,27 @@ pub type ResponderStreamsFilter = Box<dyn Fn(&StreamInfo) -> bool + Send + Sync>
 /// let chain = Registry::new()
 ///     .with(Slot::NackResponder, NackResponderBuilder::new()
 ///         .with_size(1024)
+///         .with_rtt(std::time::Duration::from_millis(100))
 ///         .build())
 ///     .build();
 /// ```
 pub struct NackResponderBuilder {
     /// Size of the send buffer (must be power of 2: 1, 2, 4, ..., 32768).
     size: u16,
+    /// A packet already retransmitted within this long is not retransmitted again.
+    rtt: Duration,
     /// Extra per-stream gate, applied on top of the NACK feedback check.
     streams_filter: Option<ResponderStreamsFilter>,
 }
+
+/// libwebrtc's `kDefaultRtt`: assumed until the application supplies a measured round trip.
+const DEFAULT_RTT: Duration = Duration::from_millis(100);
 
 impl Default for NackResponderBuilder {
     fn default() -> Self {
         Self {
             size: 1024,
+            rtt: DEFAULT_RTT,
             streams_filter: None,
         }
     }
@@ -56,6 +63,21 @@ impl NackResponderBuilder {
     /// Larger buffers can retransmit older packets but use more memory.
     pub fn with_size(mut self, size: u16) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Set the round-trip time assumed for a retransmission to reach the receiver, used until a
+    /// round trip is measured from RTCP reports.
+    ///
+    /// Once a receiver report answers one of this responder's sender reports, the measured round
+    /// trip (smoothed over reports) replaces this value for that stream, as in pion's responder.
+    ///
+    /// A packet that was retransmitted less than a round trip ago is not retransmitted again when
+    /// it is requested once more: the first copy is still on its way, and a second one only
+    /// adds load to a path that is already losing packets (libwebrtc skips these the same way).
+    /// Defaults to 100 ms, libwebrtc's `kDefaultRtt`. Zero retransmits every request.
+    pub fn with_rtt(mut self, rtt: Duration) -> Self {
+        self.rtt = rtt;
         self
     }
 
@@ -87,7 +109,7 @@ impl NackResponderBuilder {
     /// that buffers nothing; [`Self::try_build`] turns the same configuration into an error
     /// instead.
     pub fn build(self) -> NackResponderInterceptor {
-        NackResponderInterceptor::new(self.size, self.streams_filter)
+        NackResponderInterceptor::new(self.size, self.rtt, self.streams_filter)
     }
 }
 
@@ -101,7 +123,21 @@ struct LocalStream {
     payload_type_rtx: Option<u8>,
     /// Sequence number counter for RTX packets.
     rtx_sequence_number: u16,
+    /// When each buffered packet was last retransmitted, so a repeat request within one round
+    /// trip can be ignored.
+    last_retransmit: HashMap<u16, Instant>,
+    /// The last few sender reports written on this stream, by the middle 32 bits of their NTP
+    /// time (what a report block echoes back as its LSR) and when they went out.
+    sent_reports: VecDeque<(u32, Instant)>,
+    /// Round trip measured from receiver reports, smoothed; `None` until the first one.
+    rtt: Option<Duration>,
 }
+
+/// How many sender reports are remembered to match a report block's LSR against.
+const SENT_REPORTS_KEPT: usize = 8;
+
+/// Weight of a new round-trip sample in the smoothed value.
+const RTT_SMOOTHING: f64 = 1.0 / 8.0;
 
 /// Interceptor that responds to NACK requests by retransmitting packets.
 ///
@@ -110,6 +146,7 @@ struct LocalStream {
 pub struct NackResponderInterceptor {
     /// Configuration
     size: u16,
+    rtt: Duration,
     /// Extra per-stream gate from the builder, applied with the NACK feedback check.
     streams_filter: Option<ResponderStreamsFilter>,
 
@@ -123,14 +160,85 @@ pub struct NackResponderInterceptor {
 }
 
 impl NackResponderInterceptor {
-    fn new(size: u16, streams_filter: Option<ResponderStreamsFilter>) -> Self {
+    fn new(size: u16, rtt: Duration, streams_filter: Option<ResponderStreamsFilter>) -> Self {
         Self {
             read_queue: VecDeque::new(),
             size,
+            rtt,
             streams_filter,
             streams: HashMap::new(),
             write_queue: VecDeque::new(),
         }
+    }
+
+    /// Remember the sender reports in `packets`, so a later report block can be timed against them.
+    fn record_sender_reports(&mut self, now: Instant, packets: &[Box<dyn rtcp::packet::Packet>]) {
+        for packet in packets {
+            if let Some(sr) = packet
+                .as_any()
+                .downcast_ref::<rtcp::sender_report::SenderReport>()
+                && let Some(stream) = self.streams.get_mut(&sr.ssrc)
+            {
+                if stream.sent_reports.len() == SENT_REPORTS_KEPT {
+                    stream.sent_reports.pop_front();
+                }
+                stream
+                    .sent_reports
+                    .push_back(((sr.ntp_time >> 16) as u32, now));
+            }
+        }
+    }
+
+    /// Time every report block in `packets` that answers one of our sender reports, fold the
+    /// samples into the stream's smoothed round trip and return the latest smoothed value.
+    ///
+    /// The sample is the time since the sender report went out, less the delay the remote held it
+    /// for (RFC 3550 section 6.4.1), which is what pion's responder measures too.
+    fn measure_rtt(
+        &mut self,
+        now: Instant,
+        packets: &[Box<dyn rtcp::packet::Packet>],
+    ) -> Option<Duration> {
+        let mut measured = None;
+        for packet in packets {
+            let any = packet.as_any();
+            let blocks =
+                if let Some(rr) = any.downcast_ref::<rtcp::receiver_report::ReceiverReport>() {
+                    &rr.reports
+                } else if let Some(sr) = any.downcast_ref::<rtcp::sender_report::SenderReport>() {
+                    &sr.reports
+                } else {
+                    continue;
+                };
+            for block in blocks {
+                if block.last_sender_report == 0 {
+                    continue;
+                }
+                let Some(stream) = self.streams.get_mut(&block.ssrc) else {
+                    continue;
+                };
+                let Some(&(_, sent_at)) = stream
+                    .sent_reports
+                    .iter()
+                    .rev()
+                    .find(|(lsr, _)| *lsr == block.last_sender_report)
+                else {
+                    continue;
+                };
+                let held = Duration::from_secs_f64(f64::from(block.delay) / 65536.0);
+                let sample = now.saturating_duration_since(sent_at).saturating_sub(held);
+                let smoothed = match stream.rtt {
+                    None => sample,
+                    Some(old) => Duration::from_secs_f64(
+                        old.as_secs_f64() * (1.0 - RTT_SMOOTHING)
+                            + sample.as_secs_f64() * RTT_SMOOTHING,
+                    ),
+                };
+                stream.rtt = Some(smoothed);
+                measured = Some(smoothed);
+            }
+        }
+        measured
     }
 
     /// Handle a NACK request by queuing retransmissions.
@@ -159,11 +267,25 @@ impl NackResponderInterceptor {
             return;
         };
 
+        // Entries older than one round trip no longer suppress anything; dropping them keeps the
+        // map to the packets that were retransmitted recently.
+        let rtt = stream.rtt.unwrap_or(self.rtt);
+        stream
+            .last_retransmit
+            .retain(|_, sent| now.saturating_duration_since(*sent) < rtt);
+
         // Queue retransmissions
         for seq in seqs_to_retransmit {
             let Some(original_packet) = stream.send_buffer.get(seq) else {
                 continue;
             };
+
+            // The copy sent less than one round trip ago has not had time to arrive and be
+            // reported, so this request was made before it could have helped.
+            if stream.last_retransmit.contains_key(&seq) {
+                continue;
+            }
+            stream.last_retransmit.insert(seq, now);
 
             let packet = if let (Some(ssrc_rtx), Some(pt_rtx)) =
                 (stream.ssrc_rtx, stream.payload_type_rtx)
@@ -243,7 +365,14 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
     type Error = Error;
     type Time = Instant;
 
-    fn handle_read(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+    fn handle_read(&mut self, mut msg: TaggedPacket) -> Result<(), Self::Error> {
+        // Time receiver reports against our sender reports, and tell what follows about it
+        if let Packet::Rtcp(ref rtcp_packets) = msg.message.packet
+            && let Some(rtt) = self.measure_rtt(msg.now, rtcp_packets)
+        {
+            msg.message.add(Attribute::RoundTripTime { rtt });
+        }
+
         // Process NACK packets
         if let Packet::Rtcp(ref rtcp_packets) = msg.message.packet {
             for rtcp_packet in rtcp_packets {
@@ -266,6 +395,11 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
     }
 
     fn handle_write(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+        // Remember outgoing sender reports, to time the receiver reports that answer them
+        if let Packet::Rtcp(ref rtcp_packets) = msg.message.packet {
+            self.record_sender_reports(msg.now, rtcp_packets);
+        }
+
         // Buffer outgoing RTP packets
         if let Packet::Rtp(ref rtp_packet) = msg.message.packet
             && let Some(stream) = self.streams.get_mut(&rtp_packet.header.ssrc)
@@ -284,6 +418,10 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
                     > rtp_packet.payload.len();
 
             if !malformed_rtx_padding {
+                // A reused sequence number is a new packet, whatever became of the old one.
+                stream
+                    .last_retransmit
+                    .remove(&rtp_packet.header.sequence_number);
                 stream.send_buffer.add(rtp_packet.clone());
             }
         }
@@ -324,6 +462,9 @@ impl Interceptor for NackResponderInterceptor {
                     ssrc_rtx: info.ssrc_rtx,
                     payload_type_rtx: info.payload_type_rtx,
                     rtx_sequence_number: 0,
+                    last_retransmit: HashMap::new(),
+                    sent_reports: VecDeque::new(),
+                    rtt: None,
                 },
             );
         }

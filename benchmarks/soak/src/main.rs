@@ -792,8 +792,13 @@ fn report(
     now: Instant,
 ) {
     let (mut nack, mut pli, mut rtt) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let mut retx_sent: HashMap<RtpCodecKind, u64> = HashMap::new();
     for e in pc.get_stats(now, StatsSelector::None).iter() {
         match e {
+            RTCStatsReportEntry::OutboundRtp(s) => {
+                let k = s.sent_rtp_stream_stats.rtp_stream_stats.kind;
+                *retx_sent.entry(k).or_default() += s.retransmitted_packets_sent;
+            }
             RTCStatsReportEntry::InboundRtp(s) => {
                 let k = s.received_rtp_stream_stats.rtp_stream_stats.kind;
                 nack.insert(k, s.nack_count);
@@ -816,15 +821,16 @@ fn report(
             RtpCodecKind::Video
         };
         let rtt = rtt.get(&kind).map_or(Value::Null, |v| json!(v));
-        lines.push((
-            format!("{id}-{}", r.media),
-            r.snapshot(
-                now,
-                *nack.get(&kind).unwrap_or(&0),
-                *pli.get(&kind).unwrap_or(&0),
-                rtt,
-            ),
-        ));
+        let mut fields = r.snapshot(
+            now,
+            *nack.get(&kind).unwrap_or(&0),
+            *pli.get(&kind).unwrap_or(&0),
+            rtt,
+        );
+        // What this peer's own sender retransmitted for the same kind: next to `nack` (what it
+        // asked for) it shows which side of a call amplifies repairs on a lossy path.
+        fields["retx_sent"] = json!(retx_sent.get(&kind).unwrap_or(&0));
+        lines.push((format!("{id}-{}", r.media), fields));
     }
     for (rid, fields) in lines {
         log.emit("recv", &rid, fields);

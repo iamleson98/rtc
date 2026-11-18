@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `rtc-interceptor`: NACK retry pacing, as libwebrtc does it. The generator asks for a missing
+  packet again only after a round trip has passed since it last did (`NackGeneratorBuilder::with_rtt`,
+  100 ms until a round trip is measured) and gives up after `with_max_nacks_per_packet` requests,
+  which now defaults to 10 instead of unlimited. The responder measures the round trip from receiver
+  reports answering its sender reports (smoothed, new sample weighted 1/8) and skips a packet it
+  already retransmitted within one round trip (`NackResponderBuilder::with_rtt`, the same
+  100 ms fallback). The measurement reaches the generator as the new
+  `Attribute::RoundTripTime`. Before, every missing packet was requested on every 100 ms tick and
+  resent every time, so a small loss on a slow path flooded the bottleneck with repeats.
 - `rtc-turn`: TCP allocations ([RFC 6062]). `Client::allocate_tcp`, `Relay::connect` and
   `Relay::connection_bind`, with the events `ConnectResponse`, `ConnectError`,
   `ConnectionBindResponse`, `ConnectionBindError` and `ConnectionAttempt`. The server accepts a TCP
@@ -113,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   I-DATA messages than the cap is aborted with a protocol violation. Off by default.
 
 ### Changed
+- `rtc-interceptor`: `NackGeneratorBuilder::with_max_nacks_per_packet` defaults to 10 (libwebrtc's
+  `kMaxNackRetries`) rather than 0, so a packet the path cannot repair is given up on; pass 0 for
+  the old unlimited behaviour.
 - perf: a connected peer connection with a data channel holds 62 KiB of heap instead of 150 KiB
   (pion v4.2.24: 353 KiB; `tests/memory_per_connection.rs` measures and guards it,
   `benchmarks/pion-compare/memory` is the pion side). SCTP no longer zero-fills a buffer of
@@ -227,6 +239,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for byte (found by a differential run against pion rtp v1.10.6).
 
 ### Fixed
+- `rtc`: a retransmission sent on the primary SSRC (no RTX negotiated) now counts in the outbound
+  stream's `retransmitted_packets_sent` and `retransmitted_bytes_sent`; only RTX-SSRC copies did.
 - `rtc-mdns`: the next record starts where the previous record's `RDLENGTH` ends, as in
   `dnsmessage`, not where its body parser stopped: a packet with a wrong `RDLENGTH` was split into
   different records than every other parser splits it into.
