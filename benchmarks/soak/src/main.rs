@@ -145,6 +145,7 @@ struct Args {
     profile: String,
     seed: u64,
     only: Vec<String>,
+    udp_port: u16,
 }
 
 fn parse_args() -> Args {
@@ -157,6 +158,7 @@ fn parse_args() -> Args {
         profile: "call".into(),
         seed: 1,
         only: Vec::new(),
+        udp_port: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -169,6 +171,7 @@ fn parse_args() -> Args {
             "id" => a.id = v,
             "profile" => a.profile = v,
             "only" => a.only = v.split(',').map(str::to_owned).collect(),
+            "udp-port" => a.udp_port = v.parse().unwrap_or_else(|_| usage()),
             "seed" => a.seed = v.parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
@@ -186,7 +189,7 @@ fn parse_args() -> Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: soak-rtc [--role offerer|answerer] [--signal HOST:PORT] [--minutes N] [--out FILE.jsonl] [--id NAME] [--profile call|abuse|trace] [--seed N] [--only CLASS,...]"
+        "usage: soak-rtc [--role offerer|answerer] [--signal HOST:PORT] [--minutes N] [--out FILE.jsonl] [--id NAME] [--profile call|abuse|trace] [--seed N] [--only CLASS,...] [--udp-port PORT]"
     );
     std::process::exit(2);
 }
@@ -412,7 +415,7 @@ fn candidate_port(c: &RTCIceCandidateInit) -> Option<u16> {
 
 fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let _ = ctrlc_stop();
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let socket = UdpSocket::bind(("127.0.0.1", a.udp_port))?;
     let local_addr = socket.local_addr()?;
 
     let Peer {
@@ -480,6 +483,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         pli_wanted: Vec::new(),
         failed: false,
         connected: false,
+        tx: stats::TxCounts::default(),
     };
     let mut proc = ProcSampler::default();
     let mut audio: Option<Out> = None;
@@ -627,6 +631,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         while let Some(msg) = pc.poll_write() {
+            state.tx.add(&msg.message);
             let _ = socket.send_to(&msg.message, msg.transport.peer_addr);
         }
 
@@ -708,6 +713,7 @@ struct Loop {
     pli_wanted: Vec<RTCRtpReceiverId>,
     failed: bool,
     connected: bool,
+    tx: stats::TxCounts,
 }
 
 impl Loop {
@@ -839,6 +845,9 @@ fn report(
         log.emit("recv", &rid, fields);
     }
     log.emit("proc", id, proc.sample());
+    let mut tx = st.tx.fields();
+    tx["retx"] = json!(retx_sent.values().sum::<u64>());
+    log.emit("tx", id, tx);
     let lat = std::mem::take(&mut st.dc_lat);
     log.emit("dc", id, json!({"sent": st.dc_sent, "recv": st.dc_recv, "lat_ms_p50": percentile(&lat, 50.0), "lat_ms_p99": percentile(&lat, 99.0)}));
 }

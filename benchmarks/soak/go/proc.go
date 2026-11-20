@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,15 @@ type procSampler struct {
 }
 
 func (p *procSampler) sample() map[string]any {
-	out := map[string]any{"rss_mb": 0.0, "cpu_pct": 0.0, "threads": 0, "fds": 0, "udp_rcvbuf_err": 0, "udp_sndbuf_err": 0}
+	out := map[string]any{"rss_mb": 0.0, "cpu_pct": 0.0, "threads": 0, "fds": 0, "udp_rcvbuf_err": 0, "udp_sndbuf_err": 0,
+		"cpus": runtime.NumCPU()}
+	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
+		if f := strings.Fields(string(b)); len(f) > 0 {
+			if v, err := strconv.ParseFloat(f[0], 64); err == nil {
+				out["load1"] = v
+			}
+		}
+	}
 	if b, err := os.ReadFile("/proc/self/status"); err == nil {
 		for _, line := range strings.Split(string(b), "\n") {
 			f := strings.Fields(line)

@@ -47,6 +47,15 @@ DEFAULTS = {
     "global_load": ["load-hold", "udp-junk", "stun-flood", "dtls-junk"],
     # A proc sample at or above this CPU % (of a core) counts as saturated.
     "cpu_sat_pct": 190,
+    # Run validity (see `validity`): the most the peers' direction of video may differ, the most the
+    # runs' total delivered packets may differ, and the share of samples (%) that may be CPU
+    # saturated (a peer) or have a load average above the CPU count (the host) before the run is void.
+    "valid_direction_ratio": 3.0,
+    "valid_total_ratio": 2.0,
+    "valid_cpu_sat_pct_max": 5.0,
+    "valid_load_pct_max": 10.0,
+    # The input files may start at most this many hours apart (one run, its pairs run one after the other).
+    "valid_start_span_h": 24.0,
 }
 # (key, title, decimals, kind, default slack): `rate` metrics are held to ratio and slack, `count`
 # metrics to the baseline plus slack. Lower is better for every one but `higher` (the subject must
@@ -60,6 +69,7 @@ METRICS = [
     ("loss", "Residual loss %", 2, "rate", 0.5),
     ("dup", "Duplicate packets %", 2, "rate", 0.5),
     ("stalls", "Stalls outside outage", 0, "count", 0),
+    ("quiet_stalls", "Stalls with no network attack active", 0, "count", 0),
     ("stall_max", "Longest stall s", 1, "rate", 2),
     ("rec_med", "Recovery after outage, median s", 1, "rate", 2),
     ("rec_p90", "Recovery after outage, p90 s", 1, "rate", 3),
@@ -287,7 +297,7 @@ def build_entities(runs):
         end = lesson_end(r)
         for o in r.rows:
             k = o["kind"]
-            if k not in ("recv", "proc", "dc", "event") or not o.get("impl"):
+            if k not in ("recv", "proc", "dc", "tx", "event") or not o.get("impl"):
                 continue
             if k == "recv" and o["t"] > end:
                 continue
@@ -767,6 +777,38 @@ def window_metrics(ent, win, rules, clean_only=False):
     return m
 
 
+# The attack classes that shape the network path: only these are charged with stalls and freezes. The
+# others (junk, floods, extra connections) are judged on whether the call survives them (closes,
+# ICE, recovery); a stall during one of them with no shaping on is reported by `quiet_stalls`.
+NETWORK_ATTACKS = frozenset(("reorder", "duplicate", "jitter", "asym-loss", "bw-flap", "nat-rebind", "mtu",
+                             "trace-stall", "trace-low"))
+SHAPED_PHASES = frozenset(("loss", "burst", "bw", "outage"))
+
+
+def network_attack(name):
+    return name in NETWORK_ATTACKS or name.startswith("outage")
+
+
+def quiet_stalls(ents, rules):
+    """The stalls outside outage that began with no network-shaping attack active for the receiver
+    (a shaped phase, or a network attack window naming it until `recover_window_s` after its end);
+    None without receivers."""
+    rw = rules["recover_window_s"]
+    sers = [s for e in ents for s in e.series.values() if s.kind == "recv"]
+    if not sers:
+        return None
+    n = 0
+    for s in sers:
+        wins = [w for w in s.run.attacks if w["arch"] == s.ent.arch and network_attack(w["name"])
+                and attacked(w, s.group, s.who)]
+        for t, _ in stalls(s):
+            if s.run.phase_at(s.group, t - SAMPLE_S)[0] in SHAPED_PHASES or s.run.phase_at(s.group, t)[0] in SHAPED_PHASES:
+                continue
+            if not any(w["start"] - SAMPLE_S <= t <= w["end"] + rw for w in wins):
+                n += 1
+    return n
+
+
 def attack_windows(ents, pick_name):
     return [(e, w) for e in ents for w in e.run.attacks if w["arch"] == e.arch and pick_name(w["name"])]
 
@@ -791,10 +833,12 @@ def attack_metrics(ents, pick_name, rules, clean_only=False):
     st = list({(w["name"], sid, t): d for (_, w), p in zip(wins, per) for sid, t, d in p["stalls"]}.values())
     never = len({(w["name"], x) for (_, w), p in zip(wins, per) for x in p["never_at"]})
     p90 = [quantile(p["rec"], 0.9) for p in per if p["rec"]]
-    used = any(p["n_iv"] for p in per)  # a class whose receivers were all under another attack has no verdict
+    # A class whose receivers were all under another attack has no verdict, and a class that does not
+    # shape the network is not charged with freezes or stalls.
+    used = any(p["n_iv"] for p in per) and all(network_attack(w["name"]) for _, w in wins)
     return {"freezes": fz if used else None,
-            "freeze_rate": fz * 60.0 / dt if dt > 0 else None,
-            "freeze_ms": fzms * 60.0 / dt if dt > 0 else None,
+            "freeze_rate": fz * 60.0 / dt if dt > 0 and used else None,
+            "freeze_ms": fzms * 60.0 / dt if dt > 0 and used else None,
             "stalls": len(st) if used else None, "stall_max": max(st, default=0.0) if used else None,
             "closes": events("closes"), "sig_closes": events("sig_closes"), "ice_disc": events("ice_disc"),
             "recover_s": max(p90) if p90 else None,
@@ -974,6 +1018,14 @@ def compare(ents, rules):
                     rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": cls, "key": key,
                                  "subject": s_v, "baseline": b_v, "verdict": verdict, "limit": lim,
                                  "gated": gated, "where": where})
+            sq, bq = quiet_stalls(s_ents, rules), quiet_stalls(b_ents, rules)
+            if sq is not None or bq is not None:
+                verdict, lim = judge("quiet_stalls", sq, bq, rules, "count")
+                if brief and verdict == "BREACH":
+                    verdict = "too few to judge"
+                rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": "(no network attack)",
+                             "key": "quiet_stalls", "subject": sq, "baseline": bq, "verdict": verdict, "limit": lim,
+                             "gated": gated, "where": where})
             # The clean group is never impaired: whatever it shows is the server's, except while an
             # attack that loads the whole server (`global_load`) runs.
             drop = global_drop(rules)
@@ -1055,6 +1107,21 @@ def verdict_checks(rows, checks):
     return out + checks
 
 
+def tx_table(ents):
+    """Who fills the queue: what each peer sent, by datagram class (packets, and the share of its bytes)."""
+    body = []
+    for e in sorted(ents, key=lambda e: (e.run.stem, e.impl)):
+        for (k, sid), s in sorted(e.series.items()):
+            if k != "tx" or not s.s:
+                continue
+            last = s.s[-1]
+            total = sum(last.get(c + "_bytes") or 0 for c in ("rtp", "rtcp", "dtls", "stun", "other")) or 1
+            body.append([e.run.stem, sid] + ["%d (%.0f %%)" % (last.get(c + "_pkts") or 0, 100.0 * (last.get(c + "_bytes") or 0) / total)
+                                           for c in ("rtp", "rtcp", "dtls", "stun", "other")] +
+                        [str(last.get("retx") or 0)])
+    return ("Sent by class (packets, share of bytes)", ["File", "Peer", "RTP", "RTCP", "DTLS/SCTP", "STUN", "Other", "Retransmits"], body) if body else None
+
+
 def window_table(ents, rules):
     """The attack windows with what their innocent receivers saw: every window up to WINDOW_LIST_MAX,
     beyond that the ones with an impact."""
@@ -1081,7 +1148,7 @@ def window_table(ents, rules):
              "Recover s"], [b[1] for b in body])
 
 
-def tables(rows, extra, runs, ents=None, rules=None):
+def tables(rows, extra, runs, ents=None, rules=None, val=None):
     """List of (title, header, rows) shared by the markdown and html renderers."""
     out = []
     infos = []
@@ -1091,6 +1158,12 @@ def tables(rows, extra, runs, ents=None, rules=None):
         n = sum(1 for o in r.rows if o["kind"] == "recv")
         infos.append([r.stem, ", ".join(impls), ", ".join(archs), "%.1f" % ((r.t1 - r.t0) / 60.0), str(n)])
     out.append(("Inputs", ["File", "Implementations", "Architectures", "Minutes", "Receiver samples"], infos))
+    if val:
+        out.append(("Run validity", ["Scope", "Check", "Value", "Result"],
+                    [[sc, rule, value, "ok" if ok else "INVALID"] for sc, rule, value, ok in val]))
+    tx = tx_table(ents) if ents else None
+    if tx:
+        out.append(tx)
     groups = defaultdict(list)
     for r in rows:
         groups[(r["arch"], r["pair"])].append(r)
@@ -1116,12 +1189,14 @@ def tables(rows, extra, runs, ents=None, rules=None):
     return out
 
 
-def markdown(rows, checks, runs, failed, ents=None, rules=None):
+def markdown(rows, checks, runs, failed, ents=None, rules=None, val=None):
     breaches = [c for c in verdict_checks(rows, checks) if c["status"] in ("FAIL", "breach")]
-    lines = ["# Soak report", "", "**%s**" % ("GATE FAILED" if failed else "gates held"), ""]
+    reason = invalid_reason(val or [])
+    lines = ["# Soak report: INVALID RUN, no verdict (%s)" % reason if reason else "# Soak report", "",
+             "**%s**" % ("GATE FAILED" if failed else "gates held"), ""]
     lines += ["## Breaches", ""] + (["- %s: %s (%s, limit %s)" % (c["status"], c["rule"], c["value"], c["limit"])
                                      for c in breaches] or ["None."]) + [""]
-    for title, head, body in tables(rows, checks, runs, ents, rules):
+    for title, head, body in tables(rows, checks, runs, ents, rules, val):
         lines += ["## " + title, "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         lines += ["| " + " | ".join(str(c).replace("|", "/") for c in r) + " |" for r in body]
         lines.append("")
@@ -1212,7 +1287,7 @@ def svg_chart(title, data, colors, phases, span_min, attacks=()):
     return "".join(o)
 
 
-def html_report(rows, checks, runs, ents, rules, failed):
+def html_report(rows, checks, runs, ents, rules, failed, val=None):
     parts = ["<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
              "<title>Soak report</title><style>"
              ":root{--bg:#fff;--fg:#111;--mut:#666;--grid:#ddd;--bd:#ccc}"
@@ -1224,6 +1299,9 @@ def html_report(rows, checks, runs, ents, rules, failed):
              ".sw{display:inline-block;width:10px;height:10px;margin:0 4px -1px 12px;opacity:.5}"
              ".f{color:#dc2626;font-weight:600}</style>",
              "<h1>Soak report</h1><p class=%s>%s</p>" % ('"f"' if failed else '"m"', "GATE FAILED" if failed else "Gates held.")]
+    reason = invalid_reason(val or [])
+    if reason:
+        parts.append("<p class=f>INVALID RUN, no verdict: %s</p>" % html.escape(reason))
     legend = dict(PHASE_FILL)
     if any(r.attacks for r in runs):
         legend["attack"] = ATTACK_FILL
@@ -1255,12 +1333,117 @@ def html_report(rows, checks, runs, ents, rules, failed):
                 data = {"subject": proc_points(s_ents, field, bin_s), "baseline": proc_points(b_ents, field, bin_s)}
                 if any(data.values()):
                     parts.append(svg_chart(title, data, colors, ref.run.phases(), span, atk))
-    for title, head, body in tables(rows, checks, runs, ents, rules):
+    for title, head, body in tables(rows, checks, runs, ents, rules, val):
         parts.append("<h2>%s</h2><table><tr>%s</tr>%s</table>" % (
             html.escape(title), "".join("<th>%s</th>" % html.escape(h) for h in head),
             "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(c)) for c in r) for r in body)))
     parts.append("</html>")
     return "".join(parts)
+
+
+# ---------------------------------------------------------------- run validity
+
+TX_COUNTERS = ("retx", "rtp_pkts", "rtcp_pkts", "dtls_pkts", "stun_pkts")
+
+
+def role_of(who):
+    for role in ("offerer", "answerer"):
+        if who.endswith("-" + role):
+            return role
+    return None
+
+
+def has_loss(run):
+    """Whether the profile of the run impairs the path (a shaped phase or a network attack)."""
+    shaped = any(n in SHAPED_PHASES for g in run.timeline for _, n in run.phases(g))
+    return shaped or any(network_attack(w["name"]) for w in run.attacks)
+
+
+def validity(runs, ents, rules):
+    """The checks that decide whether the runs may be compared at all: [(scope, rule, value, ok)]. A
+    failing one makes the report INVALID: the comparison is not given, whoever looks better. They look
+    for a rig that is unfair (one direction starved, a counter that never moves on one side), a host
+    that is not the peers' to use (saturated, loaded) and files that are not one run."""
+    out = []
+
+    def add(scope, rule, value, ok):
+        out.append((scope, rule, value, ok))
+
+    # (d) one run: one run record per file, the same seed, profile and length, started together.
+    recs = {}
+    for r in runs:
+        recs[r.stem] = [o for o in r.rows if o.get("kind") == "event" and o.get("what") == "run"]
+    for stem, rs in recs.items():
+        if len(rs) > 1:
+            add(stem, "one run per file", "%d run records: runs were merged" % len(rs), False)
+    first = {stem: rs[0] for stem, rs in recs.items() if rs}
+    if len(first) >= 2:
+        keys = {(o.get("seed"), o.get("profile"), o.get("minutes")) for o in first.values()}
+        add("all files", "one seed, profile and length", "%d different (seed, profile, minutes)" % len(keys), len(keys) == 1)
+        starts = [o["ts"] / 3.6e6 for o in first.values()]
+        span = max(starts) - min(starts)
+        add("all files", "started together", "%.1f h apart" % span, span <= rules["valid_start_span_h"])
+
+    # (a), (b), (c) per run (file).
+    totals = {}
+    for run in runs:
+        es = [e for e in ents if e.run is run]
+        sers = [s for e in es for s in e.series.values()]
+        recv = [s for s in sers if s.kind == "recv"]
+        video = defaultdict(int)
+        for s in recv:
+            if s.media == "video" and role_of(s.who):
+                video[role_of(s.who)] += sum(i["packets"] for i in s.ivs)
+        if len(video) == 2:
+            totals[run.stem] = sum(i["packets"] for s in recv for i in s.ivs)
+            hi, lo = max(video.values()), min(video.values())
+            ratio = hi / lo if lo else math.inf
+            add(run.stem, "video delivered, offerer vs answerer", "%d vs %d (%s:1)" % (
+                video["offerer"], video["answerer"], "inf" if math.isinf(ratio) else "%.1f" % ratio),
+                ratio <= rules["valid_direction_ratio"])
+        if has_loss(run):
+            vals = defaultdict(lambda: defaultdict(int))
+            seen_tx = False
+            for s in sers:
+                role = role_of(s.who)
+                if role is None or not s.s:
+                    continue
+                if s.kind == "recv":
+                    vals[role]["nack"] += max(r.get("nack") or 0 for r in s.s)
+                elif s.kind == "tx":
+                    seen_tx = True
+                    for k in TX_COUNTERS:
+                        vals[role][k] += max(r.get(k) or 0 for r in s.s)
+            if len(vals) == 2:
+                for k in ("nack",) + (TX_COUNTERS if seen_tx else ()):
+                    a, b = vals["offerer"][k], vals["answerer"][k]
+                    add(run.stem, "%s counted on both sides" % k, "offerer %d, answerer %d" % (a, b), a > 0 and b > 0)
+        for s in sers:
+            if s.kind != "proc":
+                continue
+            cpus = [r["cpu_pct"] for r in s.s if r.get("cpu_pct") is not None]
+            if cpus:
+                pct = 100.0 * sum(1 for c in cpus if c >= rules["cpu_sat_pct"]) / len(cpus)
+                add(run.stem, "%s CPU not saturated" % s.id, "%.1f %% of samples at or above %g %%" % (
+                    pct, rules["cpu_sat_pct"]), pct <= rules["valid_cpu_sat_pct_max"])
+            loads = [(r["load1"], r["cpus"]) for r in s.s if r.get("load1") is not None and r.get("cpus")]
+            if loads:
+                pct = 100.0 * sum(1 for ld, n in loads if ld > n) / len(loads)
+                add(run.stem, "%s host load average within the CPU count" % s.id,
+                    "%.1f %% of samples above it" % pct, pct <= rules["valid_load_pct_max"])
+    # (a) the peer pairs of one report deliver comparable amounts (an SFU soak has no pairs).
+    if len(totals) >= 2 and min(totals.values()) > 0:
+        ratio = max(totals.values()) / min(totals.values())
+        add("all files", "total delivered packets, between files", "%s (%.1f:1)" % (
+            ", ".join("%s %d" % kv for kv in sorted(totals.items())), ratio), ratio <= rules["valid_total_ratio"])
+    elif len(totals) >= 2:
+        add("all files", "total delivered packets, between files", "a file delivered nothing", False)
+    return out
+
+
+def invalid_reason(val):
+    bad = [v for v in val if not v[3]]
+    return "%s: %s (%s)" % (bad[0][0], bad[0][1], bad[0][2]) if bad else None
 
 
 def analyse(runs, rules):
@@ -1285,7 +1468,12 @@ def main(argv=None):
     for r in runs:
         if r.bad:
             print("report.py: %s: skipped %d malformed lines" % (r.path, r.bad), file=sys.stderr)
-    ents, rows, checks = analyse(runs, rules)
+    val = validity(runs, build_entities(runs), rules)
+    invalid = invalid_reason(val) is not None
+    if invalid:
+        ents, rows, checks = build_entities(runs), [], []
+    else:
+        ents, rows, checks = analyse(runs, rules)
     if not ents or not any(e.series for e in ents):
         print("report.py: no recv/proc/dc samples in the input", file=sys.stderr)
         return 2
@@ -1293,12 +1481,14 @@ def main(argv=None):
         print("report.py: the rules have no `compare` pair", file=sys.stderr)
         return 2
     allc = verdict_checks(rows, checks)
-    failed = any(c["status"] == "FAIL" for c in allc)
+    failed = invalid or any(c["status"] == "FAIL" for c in allc)
+    if invalid:
+        print("INVALID %s" % invalid_reason(val), file=sys.stderr)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "summary.md"), "w") as f:
-        f.write(markdown(rows, checks, runs, failed, ents, rules))
+        f.write(markdown(rows, checks, runs, failed, ents, rules, val))
     with open(os.path.join(a.out, "report.html"), "w") as f:
-        f.write(html_report(rows, checks, runs, ents, rules, failed))
+        f.write(html_report(rows, checks, runs, ents, rules, failed, val))
     for c in allc:
         if c["status"] in ("FAIL", "breach"):
             print("%s %s (%s, limit %s)" % (c["status"], c["rule"], c["value"], c["limit"]), file=sys.stderr)

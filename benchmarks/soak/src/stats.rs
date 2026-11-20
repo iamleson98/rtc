@@ -76,6 +76,40 @@ impl Logger {
     }
 }
 
+/// What one peer put on the wire, by datagram class (RFC 7983 demultiplexing, RTP and RTCP told apart
+/// by RFC 5761): packets and bytes, cumulative. DTLS holds the SCTP of the data channel.
+#[derive(Default)]
+pub struct TxCounts {
+    counts: [(u64, u64); 5],
+}
+
+const TX_CLASSES: [&str; 5] = ["rtp", "rtcp", "dtls", "stun", "other"];
+
+impl TxCounts {
+    pub fn add(&mut self, d: &[u8]) {
+        let class = match d.first() {
+            Some(0..=3) => 3,
+            Some(20..=63) => 2,
+            Some(128..=191) => match d.get(1) {
+                Some(192..=223) => 1,
+                _ => 0,
+            },
+            _ => 4,
+        };
+        self.counts[class].0 += 1;
+        self.counts[class].1 += d.len() as u64;
+    }
+
+    pub fn fields(&self) -> Value {
+        let mut m = Map::new();
+        for (name, (pkts, bytes)) in TX_CLASSES.iter().zip(self.counts) {
+            m.insert(format!("{name}_pkts"), json!(pkts));
+            m.insert(format!("{name}_bytes"), json!(bytes));
+        }
+        Value::Object(m)
+    }
+}
+
 /// Nearest-rank percentile of an unsorted slice; `null` when empty.
 pub fn percentile(xs: &[f64], p: f64) -> Value {
     if xs.is_empty() {
@@ -351,7 +385,12 @@ impl ProcSampler {
                 }
             }
         }
+        // The host's load next to the process's own CPU: a loaded host is not a fair rig.
+        let load1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+        let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
         json!({"rss_mb": rss, "cpu_pct": cpu_pct, "threads": threads, "fds": fds,
-               "udp_rcvbuf_err": rcv, "udp_sndbuf_err": snd})
+               "udp_rcvbuf_err": rcv, "udp_sndbuf_err": snd, "load1": load1, "cpus": cpus})
     }
 }

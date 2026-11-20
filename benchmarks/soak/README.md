@@ -51,6 +51,31 @@ docker run --rm --cap-add NET_ADMIN -v "$PWD":/rtc -v /path/to/peers:/peers -v /
   <image> /rtc/benchmarks/soak/run.sh rtc-pion 3 /out/run
 ```
 
+### Topology
+
+A real student has an uplink and a downlink that queue separately; the soak has one host and `lo`. One
+root `netem` on `lo` would put both directions of the call, the signaling, the churn and the attack
+traffic in a single queue with a single rate, and one direction could starve the other. So `run.sh`
+gives every peer a fixed UDP port (`--udp-port`: the offerer `B`, the answerer `B+4`, `B` a multiple
+of four) and runs `netem.sh` with `NETEM_PORTS=B:2`, `NETEM_WHO=all`, `NETEM_INGRESS=0`: two flows, each
+an htb class with its own `netem` leaf picked by the *source* port, so a packet is shaped once, by the
+queue of whoever sent it. Every direction gets the full profile (the 1.5 Mbit/s cap of `bw` is per
+direction) and the same schedule in the call profile; in the abuse and trace profiles each direction
+runs its own schedule (or recorded link), derived from the seed, so both pairs of one `SEED` see the
+same one. Unshaped: the signaling (TCP) and the hostile datagrams of the abuse profile (ephemeral
+ports). `tc -s qdisc show dev lo` shows the drops of each direction in its own leaf.
+
+### Run validity
+
+`report.py` first asks whether the input may be compared at all, and prints the answers in the "Run
+validity" section. A failing check makes the report INVALID: the first line of `summary.md` says why,
+the gate fails and no comparison is given. The checks: the two directions of a call delivered video
+within 3:1 of each other, and the files within 2:1 of each other in total packets; `nack`, the
+retransmissions and the per-class send counters (`tx`) are non-zero on both peers wherever the profile
+impairs the path; no peer CPU-saturated and the host load average within its CPU count (more than 5 %
+and 10 % of the samples); and the files are one run (one `run` record each, the same seed, profile and
+length, started within 24 h).
+
 Runs of a few minutes are smoke tests of the harness: the windows are too short to judge drift, so
 the drift rules report `n/a` (see `min_clean_window_min`).
 
@@ -121,7 +146,7 @@ What is shaped is chosen by `NETEM_PORTS`:
 
 | `NETEM_PORTS` | Shaped | Use |
 |---|---|---|
-| unset | everything crossing `<iface>`, one flow | a peer pair: one participant per side, so per flow is per peer (`lo` is crossed by both directions, so its total cap is doubled) |
+| unset | everything crossing `<iface>`, one flow | one flow and one queue for everything that crosses the interface: on `lo` both directions of a call would share it, so `run.sh` does not use it (see Topology) |
 | `udp` | all UDP of the network namespace, one flow | one participant that has a namespace of its own (a browser in its own container) |
 | `<base>:<count>` | `<count>` flows, flow k = the UDP ports `<base>+4k` to `<base>+4k+3` | many participants in one namespace, each with a cap, delay and loss of its own |
 
@@ -273,7 +298,7 @@ One JSON object per line. Every line has:
 | `ts` | integer | unix time, milliseconds |
 | `impl` | string | `rtcd-rs`, `rtcd-go`, `rtc`, `pion`, `chrome-...`; free text. `netem` for phase lines |
 | `arch` | string | `x86_64` or `aarch64` (`uname -m`) |
-| `kind` | string | `recv`, `proc`, `dc`, `event` or `phase` |
+| `kind` | string | `recv`, `proc`, `dc`, `tx`, `event` or `phase` |
 | `id` | string | what the line is about: a track (`rtc-offerer-video`), a process, a peer |
 
 `recv`, one per received track every 5 s, counters cumulative since start:
@@ -296,6 +321,12 @@ One JSON object per line. Every line has:
 
 `proc`, one per process every 5 s: `rss_mb`, `cpu_pct`, `threads`, `fds`, `udp_rcvbuf_err`,
 `udp_sndbuf_err` (the host's UDP `RcvbufErrors` / `SndbufErrors`).
+
+`tx`, every 5 s, cumulative: what this peer sent through its media socket, `<class>_pkts` and
+`<class>_bytes` for the classes `rtp`, `rtcp`, `dtls` (with the data channel's SCTP), `stun` and `other`,
+and `retx`, the RTP packets that were retransmissions (rtc: its sender's count; pion: writes carrying the
+NACK responder's resend key). `proc` also carries the host's `load1` and `cpus`. The `run` event (id
+`run`, written by `run.sh`) records `seed`, `profile` and `minutes`.
 
 `dc`, every 5 s: `sent`, `recv` (cumulative), `lat_ms_p50`, `lat_ms_p99` (this window; null when no
 message arrived). The peers send `{"n":<count>,"ts":<unix microseconds>}` at 10 messages/s on a
