@@ -16,6 +16,11 @@
 # Mahimahi LTE traces (SEED picks the trace and offset of each direction), which this script fetches
 # with traces.sh into TRACE_DIR (default <outdir>/traces) and checks against pinned hashes; the rules
 # are the call profile's. See README.md, "Trace replay".
+# Each direction of the call is its own shaped queue: the peers bind fixed UDP ports (--udp-port), the
+# offerer's block and the answerer's block, and netem.sh shapes them as two flows (NETEM_PORTS=<base>:2)
+# on the interface (each flow its own ifb device: NETEM_FLOW_DEVS), egress only, so a packet is shaped once, by the queue of whoever sent it. The
+# signaling (TCP) and the hostile traffic of the abuse profile (ephemeral ports) are not shaped. See
+# README.md, "Topology".
 # Needs Linux, python3, iproute2 and root (or sudo) for tc. Writes machine.txt (architecture, cores, CPU).
 # Exits non-zero when a peer exits non-zero or logs a panic or fatal error (a crash is a failure; it is
 # also written to the JSONL as an `error` event of id `sfu`, which the report gates at zero) or, when rtc-rtc.jsonl and
@@ -61,6 +66,9 @@ if [ "$profile" = trace ]; then
 fi
 jsonl=$outdir/$pair.jsonl
 : >"$jsonl"
+# The run record: report.py refuses input files that do not share one seed, profile and length.
+printf '{"ts":%s,"impl":"run","arch":"%s","kind":"event","id":"run","what":"run","detail":"%s","seed":"%s","profile":"%s","minutes":%s}\n' \
+  "$(date +%s%3N)" "$(uname -m)" "$pair seed $seed" "$seed" "$profile" "$minutes" >>"$jsonl"
 {
   echo "arch: $(uname -m)"
   echo "kernel: $(uname -sr)"
@@ -86,6 +94,8 @@ bin() { if [ "$1" = rtc ]; then echo "$rtc_bin"; else echo "$pion_bin"; fi; }
 
 offerer=${pair%-*} answerer=${pair#*-}
 port=$((7100 + 4 * (RANDOM % 125))) # the abuse profile also uses port+1 and port+2
+udp_base=$((20000 + 8 * (RANDOM % 1000))) # the offerer's media port; the answerer's is udp_base+4
+netem_env=(NETEM_PORTS="$udp_base:2" NETEM_FLOW_DEVS=1 NETEM_WHO=all NETEM_INGRESS=0)
 pids=()
 cleanup() {
   trap - EXIT INT TERM
@@ -97,10 +107,10 @@ trap cleanup EXIT
 trap 'exit 143' INT TERM
 
 "$(bin "$offerer")" --role offerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
-  --id "$offerer-offerer" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.offerer.log" &
+  --id "$offerer-offerer" --udp-port "$udp_base" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.offerer.log" &
 pids+=($!)
 "$(bin "$answerer")" --role answerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
-  --id "$answerer-answerer" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.answerer.log" &
+  --id "$answerer-answerer" --udp-port "$((udp_base + 4))" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.answerer.log" &
 pids+=($!)
 
 # Impair only once both sides are connected, so the rendezvous and the handshake run clean.
@@ -110,13 +120,13 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 if [ "$profile" = abuse ]; then
-  $sudo env NETEM_PROFILE=abuse NETEM_SEED="$seed" NETEM_NAMES="$offerer-offerer $answerer-answerer" \
+  $sudo env "${netem_env[@]}" NETEM_PROFILE=abuse NETEM_SEED="$seed" NETEM_NAMES="$offerer-offerer $answerer-answerer" \
     "$here/netem.sh" "$iface" "$minutes" "$cycle" "$jsonl" &
 elif [ "$profile" = trace ]; then
-  $sudo env NETEM_PROFILE=trace NETEM_SEED="$seed" NETEM_NAMES="$offerer-offerer $answerer-answerer" \
+  $sudo env "${netem_env[@]}" NETEM_PROFILE=trace NETEM_SEED="$seed" NETEM_NAMES="$offerer-offerer $answerer-answerer" \
     NETEM_TRACE_DIR="$trace_dir" "$here/netem.sh" "$iface" "$minutes" "$cycle" "$jsonl" &
 else
-  $sudo "$here/netem.sh" "$iface" "$minutes" "$cycle" "$jsonl" &
+  $sudo env "${netem_env[@]}" "$here/netem.sh" "$iface" "$minutes" "$cycle" "$jsonl" &
 fi
 pids+=($!)
 

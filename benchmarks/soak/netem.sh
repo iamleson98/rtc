@@ -10,19 +10,23 @@
 #
 # What is shaped (NETEM_PORTS):
 #
-#   unset            everything that crosses <iface>: one flow, the path of a peer pair. The caps are
-#                    per direction. `lo` is one device that both directions cross, so there the
-#                    cap is doubled and each direction gets about the set cap.
+#   unset            everything that crosses <iface>: one flow, one queue. On `lo` both directions of
+#                    a call cross the same device and would share that queue (one rate, one drop-tail),
+#                    so run.sh does not use this mode for a peer pair: see `<base>:<count>`.
 #   udp              all UDP of the namespace, one flow: a participant (a browser) that has a
 #                    namespace of its own. TCP, such as its signaling websocket, is not touched.
 #   <base>:<count>   <count> flows, each with its own cap, delay and loss: flow k is the UDP packets
 #                    to and from the ports <base>+4k to <base>+4k+3 (<base> a multiple of four).
 #                    `lms-sim lesson --udp-base <base>` binds participant k to its block, so every
 #                    participant gets the cap to itself instead of sharing one with the others.
-#                    Everything else (TCP, other UDP) is not shaped.
+#                    Everything else (TCP, other UDP) is not shaped. run.sh gives a soak pair two
+#                    flows, the offerer's ports and the answerer's: each direction of the call is its
+#                    own queue with the full profile (a student's uplink and downlink), and the
+#                    signaling (TCP) is not shaped. NETEM_WHO=all names every participant in the
+#                    `attack` lines of every flow (a direction hurts the sender and the receiver).
 #
 # The bw cap per direction: NETEM_BW_UP_MBIT (what the shaped side sends) and NETEM_BW_DOWN_MBIT
-# (what it receives), both default to NETEM_BW_MBIT (1.5; 3 on `lo`). NETEM_DELAY (80ms) is added
+# (what it receives), both default to NETEM_BW_MBIT (1.5). NETEM_DELAY (80ms) is added
 # in the bw phase. NETEM_GROUP names the group the phase lines are for (default `impaired`); the
 # samples of that group are assigned to these phases, other groups are not impaired.
 #
@@ -43,6 +47,12 @@
 # for 2 s are logged as `attack` windows named `trace-stall` and `trace-low`, with a `trace` phase line
 # at the start. Without ingress shaping (`lo`) only the uplink trace is replayed.
 #
+# NETEM_FLOW_DEVS=1 (with <base>:<count>) gives every flow a device of its own instead of an htb class:
+# the UDP of flow k is redirected at the egress of <iface> (tc clsact, mirred) to `ifb-soak-<k>`, whose root
+# is the flow's netem. A device holds one netem, which `duplicate` needs (the kernel refuses a duplicating
+# netem in a tree with other netems, which is what the htb classes are), and it is what run.sh uses for
+# the two directions of a peer pair.
+#
 # Egress is always impaired. Ingress is impaired too, through an `ifb` device, except on `lo`
 # (a packet crosses lo's egress and ingress both, so the egress shaping already covers each
 # direction once). Override with NETEM_INGRESS=0|1|auto. Linux only; needs root/NET_ADMIN (and
@@ -61,12 +71,14 @@ if [ "$ingress" = auto ]; then
   if [ "$iface" = lo ]; then ingress=0; else ingress=1; fi
 fi
 
-bw_mbit=${NETEM_BW_MBIT:-$([ "$iface" = lo ] && echo 3 || echo 1.5)}
+bw_mbit=${NETEM_BW_MBIT:-1.5}
 bw_up=${NETEM_BW_UP_MBIT:-$bw_mbit}
 bw_down=${NETEM_BW_DOWN_MBIT:-$bw_mbit}
 delay=${NETEM_DELAY:-80ms}
 group=${NETEM_GROUP:-impaired}
 ports=${NETEM_PORTS:-}
+flow_devs=${NETEM_FLOW_DEVS:-0}
+fdev() { echo "ifb-soak-$1"; }
 nflows=0
 if [ -n "$ports" ] && [ "$ports" != udp ]; then
   port_base=${ports%%:*}
@@ -87,7 +99,12 @@ cleanup() {
     kill "${pids[@]}" 2>/dev/null || true
     wait "${pids[@]}" 2>/dev/null || true
   fi
-  tc qdisc del dev "$iface" root 2>/dev/null || true
+  if [ "$flow_devs" = 1 ]; then
+    tc qdisc del dev "$iface" clsact 2>/dev/null || true
+    for ((k = 0; k < nflows; k++)); do ip link del "$(fdev "$k")" 2>/dev/null || true; done
+  else
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+  fi
   if [ "$ingress" = 1 ]; then
     tc qdisc del dev "$iface" ingress 2>/dev/null || true
     tc qdisc del dev "$ifb" root 2>/dev/null || true
@@ -120,6 +137,20 @@ setup_flows() { # <dev> <sport|dport>
 flows=$nflows
 [ "$ports" = udp ] && flows=1
 
+# setup_flow_devs: a device per flow, the flow's UDP redirected to it at <iface>'s egress.
+setup_flow_devs() {
+  local k
+  modprobe ifb 2>/dev/null || true
+  tc qdisc add dev "$iface" clsact
+  for ((k = 0; k < nflows; k++)); do
+    ip link add "$(fdev "$k")" type ifb
+    ip link set "$(fdev "$k")" up
+    tc qdisc add dev "$(fdev "$k")" root netem
+    tc filter add dev "$iface" egress protocol ip prio 1 u32 match ip protocol 17 0xff \
+      match ip sport $((port_base + 4 * k)) 0xfffc action mirred egress redirect dev "$(fdev "$k")"
+  done
+}
+
 if [ "$ingress" = 1 ]; then
   modprobe ifb 2>/dev/null || true
   ip link add "$ifb" type ifb
@@ -128,7 +159,9 @@ if [ "$ingress" = 1 ]; then
   tc filter add dev "$iface" parent ffff: protocol all u32 match u32 0 0 \
     action mirred egress redirect dev "$ifb"
 fi
-if [ "$flows" -gt 0 ]; then
+if [ "$flow_devs" = 1 ]; then
+  setup_flow_devs
+elif [ "$flows" -gt 0 ]; then
   setup_flows "$iface" sport
   [ "$ingress" = 1 ] && setup_flows "$ifb" dport
 fi
@@ -141,7 +174,12 @@ reset='delay 0ms reorder 0% duplicate 0% loss 0% rate 0'
 shape() {
   local dev=$1 k minor
   shift
-  if [ "$flows" -gt 0 ]; then
+  if [ "$flow_devs" = 1 ]; then
+    for ((k = 0; k < flows; k++)); do
+      # shellcheck disable=SC2086
+      tc qdisc replace dev "$(fdev "$k")" root netem $reset "$@"
+    done
+  elif [ "$flows" -gt 0 ]; then
     for ((k = 0; k < flows; k++)); do
       minor=$(printf '%x' $((k + 2)))
       # shellcheck disable=SC2086 # reset is words
@@ -191,7 +229,10 @@ read -r -a names <<<"${NETEM_NAMES:-}"
 shape_flow() {
   local dev=$1 k=$2 minor
   shift 2
-  if [ "$flows" -gt 0 ]; then
+  if [ "$flow_devs" = 1 ]; then
+    # shellcheck disable=SC2086
+    tc qdisc replace dev "$(fdev "$k")" root netem $reset "$@"
+  elif [ "$flows" -gt 0 ]; then
     minor=$(printf '%x' $((k + 2)))
     # shellcheck disable=SC2086
     tc qdisc replace dev "$dev" parent "1:$minor" handle "$minor:" netem $reset "$@"
@@ -203,7 +244,7 @@ shape_flow() {
 # who_json <flow>: the participants of a flow as a JSON array body, empty when unknown.
 who_json() {
   local k=$1 n out=''
-  if [ "$ports" = udp ] || [ "$flows" -eq 0 ]; then
+  if [ "$ports" = udp ] || [ "$flows" -eq 0 ] || [ "${NETEM_WHO:-}" = all ]; then
     for n in "${names[@]}"; do out="$out${out:+,}\"$n\""; done
   elif [ -n "${names[$k]:-}" ]; then
     out="\"${names[$k]}\""
@@ -316,6 +357,7 @@ run_trace() {
   local args=()
   [ "$ingress" = 1 ] && args+=(--ifb "$ifb")
   if [ "$ports" = udp ]; then args+=(--all-names); fi
+  [ "$flow_devs" = 1 ] && args+=(--flow-devs ifb-soak-)
   python3 "$(dirname "$0")/tracereplay.py" play --dir "${NETEM_TRACE_DIR:?NETEM_TRACE_DIR is where traces.sh put the traces}" \
     --seed "$seed" --seconds "$(left "$((minutes * 60))")" --iface "$iface" --flows "$flows" \
     --delay "${NETEM_TRACE_DELAY:-40ms}" --limit "${NETEM_TRACE_LIMIT:-100}" --step-ms "${NETEM_TRACE_STEP_MS:-200}" \

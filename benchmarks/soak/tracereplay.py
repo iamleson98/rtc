@@ -171,7 +171,9 @@ def play(args):
         verb = "replace" if step == 0 else "change"
         batch = []
         for f in flows:
-            batch.append(tc_line(verb, args.iface, f.k, args.flows, f.rates["up"][step], args))
+            devs = getattr(args, "flow_devs", "")
+            batch.append(tc_line(verb, devs + str(f.k) if devs else args.iface, f.k, args.flows and not devs,
+                                 f.rates["up"][step], args))
             if args.ifb:
                 batch.append(tc_line(verb, args.ifb, f.k, args.flows, f.rates["down"][step], args))
         text = "\n".join(batch) + "\n"
@@ -206,6 +208,7 @@ def main():
     pl.add_argument("--iface", required=True)
     pl.add_argument("--ifb", default="", help="the device of what the shaped side receives; empty: not shaped")
     pl.add_argument("--flows", type=int, default=0, help="htb flow classes of netem.sh; 0: one netem at the root")
+    pl.add_argument("--flow-devs", default="", help="flow k has a device of its own, this prefix and k, with one netem at its root")
     pl.add_argument("--delay", default="40ms", help="one-way base delay")
     pl.add_argument("--limit", type=int, default=100, help="queue of the netem, in packets")
     pl.add_argument("--step-ms", type=int, default=200)

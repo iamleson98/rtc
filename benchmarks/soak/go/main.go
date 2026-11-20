@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -89,6 +90,7 @@ func main() {
 	id := flag.String("id", "", "peer id (default pion-<role>)")
 	profile := flag.String("profile", "call", "call; abuse: hostile connections and traffic next to the call; trace: the call over a recorded link (patient ICE)")
 	seed := flag.Uint64("seed", 1, "seed of the abuse profile's schedule")
+	udpPort := flag.Int("udp-port", 0, "UDP port of the media socket (0: any)")
 	only := flag.String("only", "", "abuse profile: only these attack classes (comma separated)")
 	flag.Parse()
 	if *profile != "call" && *profile != "abuse" && *profile != "trace" {
@@ -107,7 +109,7 @@ func main() {
 		log.event("seed", fmt.Sprintf("profile abuse seed %d", *seed))
 	}
 	ab := abuseOpts{enabled: *profile == "abuse", seed: *seed, only: *only, out: *out, signal: *addr}
-	if err := run(log, *role, *addr, *id, time.Duration(*minutes*float64(time.Minute)), *profile != "call", ab); err != nil {
+	if err := run(log, *role, *addr, *id, time.Duration(*minutes*float64(time.Minute)), *profile != "call", ab, *udpPort); err != nil {
 		log.event("error", err.Error())
 		fmt.Fprintln(os.Stderr, "soak-pion:", err)
 		os.Exit(1)
@@ -125,7 +127,8 @@ var (
 // A patient one lets ICE ride out a long outage (the measured call of the abuse profile, whose
 // network goes down for up to two minutes, and of the trace profile, whose recorded links stall
 // for over a minute) instead of failing after 25 s.
-func newPeerConnection(patient bool) (*webrtc.PeerConnection, error) {
+// tx and mux are nil for the abuse profile's extra connections, which are not measured.
+func newPeerConnection(patient bool, tx *txCounts, mux ice.UDPMux) (*webrtc.PeerConnection, error) {
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: opusCap, PayloadType: 111}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, err
@@ -137,12 +140,18 @@ func newPeerConnection(patient bool) (*webrtc.PeerConnection, error) {
 		return nil, err
 	}
 	ir := &interceptor.Registry{}
+	if tx != nil {
+		ir.Add(countingFactory{tx})
+	}
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
 		return nil, err
 	}
 	se := webrtc.SettingEngine{}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetIncludeLoopbackCandidate(true)
+	if mux != nil {
+		se.SetICEUDPMux(mux)
+	}
 	se.SetInterfaceFilter(func(n string) bool { return n == "lo" || n == "lo0" })
 	if patient {
 		se.SetICETimeouts(5*time.Second, patientICEFailed, 2*time.Second)
@@ -151,9 +160,17 @@ func newPeerConnection(patient bool) (*webrtc.PeerConnection, error) {
 	return api.NewPeerConnection(webrtc.Configuration{})
 }
 
-// patient: ICE rides out long outages (the abuse and trace profiles).
-func run(log *logger, role, addr, id string, dur time.Duration, patient bool, ab abuseOpts) error {
-	pc, err := newPeerConnection(patient)
+// patient: ICE rides out long outages (the abuse and trace profiles). udpPort is the media socket's
+// port (0: any); every datagram the peer sends through it is counted.
+func run(log *logger, role, addr, id string, dur time.Duration, patient bool, ab abuseOpts, udpPort int) error {
+	tx := &txCounts{}
+	sock, err := net.ListenPacket("udp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(udpPort)))
+	if err != nil {
+		return err
+	}
+	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: countingConn{sock, tx}})
+	defer mux.Close()
+	pc, err := newPeerConnection(patient, tx, mux)
 	if err != nil {
 		return err
 	}
@@ -266,6 +283,7 @@ func run(log *logger, role, addr, id string, dur time.Duration, patient bool, ab
 				}
 			}
 		}
+		nack["video"] = uint32(tx.nacks.Load()) // pion's stats leave NACKCount at zero: the interceptor counts them
 		statsMu.Lock()
 		for media, rs := range stats {
 			r, ok := rtt[media]
@@ -276,6 +294,7 @@ func run(log *logger, role, addr, id string, dur time.Duration, patient bool, ab
 		}
 		statsMu.Unlock()
 		log.emit("proc", id, proc.sample())
+		log.emit("tx", id, tx.fields())
 		var window []float64
 		for drained := false; !drained; {
 			select {

@@ -482,19 +482,19 @@ class Attacks(Fixture):
         other = track("rtcd-rs", "s18/video:teacher", "impaired", END, freezes=lambda t: 2 if t > 100 else 0)
         base = side("rtcd-rs", extra=other)
         base = [r for r in base if not r["id"].startswith("s17")] + hit
-        rows = base + window(100, 110, "a1", "pli-flood", ["s17"])
+        rows = base + window(100, 110, "a1", "reorder", ["s17"])
         e = self.ents(rows)[0]
-        m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        m = report.attack_metrics([e], lambda n: n == "reorder", dict(report.DEFAULTS))
         self.assertEqual(m["freezes"], 2)  # s18's, not s17's
-        none = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS), clean_only=True)
+        none = report.attack_metrics([e], lambda n: n == "reorder", dict(report.DEFAULTS), clean_only=True)
         self.assertEqual(none["freezes"], 0)
 
     def test_a_receiver_is_innocent_only_while_no_other_window_names_it(self):
         def ents(freezes):
             rows = lone_track("rtcd-rs", 0, freezes=freezes)
-            rows += window(20, 100, "a1", "rtcp-garbage", ["s18"]) + window(30, 40, "a2", "bw-flap", ["s17"])
+            rows += window(20, 100, "a1", "jitter", ["s18"]) + window(30, 40, "a2", "bw-flap", ["s17"])
             return self.ents(rows)
-        count = lambda e: report.attack_metrics(e, lambda n: n == "rtcp-garbage", dict(report.DEFAULTS))["freezes"]
+        count = lambda e: report.attack_metrics(e, lambda n: n == "jitter", dict(report.DEFAULTS))["freezes"]
         self.assertEqual(count(ents(lambda t: 1 if t >= 35 else 0)), 0)  # during bw-flap, which names s17
         self.assertEqual(count(ents(lambda t: (1 if t >= 35 else 0) + (1 if t >= 70 else 0))), 1)  # outside it
 
@@ -539,9 +539,9 @@ class Attacks(Fixture):
         self.assertEqual((m["never"], m["recover_s"]), (0, 0.0))
 
     def test_overlapping_windows_of_one_class_count_a_stall_once(self):
-        wins = window(20, 50, "a1", "pli-flood", ["s99"]) + window(25, 55, "a2", "pli-flood", ["s99"])
+        wins = window(20, 50, "a1", "reorder", ["s99"]) + window(25, 55, "a2", "reorder", ["s99"])
         e = self.ents(self.late_outage_rows(wins, stalled=(30, 35)))[0]
-        m = report.attack_metrics([e], lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        m = report.attack_metrics([e], lambda n: n == "reorder", dict(report.DEFAULTS))
         self.assertEqual(m["stalls"], 1)
 
     def test_an_event_in_two_overlapping_windows_of_one_class_counts_once(self):
@@ -584,7 +584,7 @@ class Attacks(Fixture):
         b = [r for r in side("rtcd-go", extra=[dict(r, impl="rtcd-go") for r in flood])
              if not (r["kind"] == "proc" and r["ts"] > ts(200))]
         _, md, _, _ = run_report(s, b)
-        self.assertIn("| pli-flood | Freezes (count) | 0 | 0 | ok |", md)
+        self.assertIn("| pli-flood | SFU-closed sessions | 0 | 0 | ok |", md)
         self.assertNotIn("| reorder | Freezes", md)
         self.assertIn("attack reorder | only the subject has it | both sides need it | n/a", md)
 
@@ -604,3 +604,140 @@ class Attacks(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def peer_pair(impl, off_every=5, ans_every=5, timeline=None, nack=(3, 3), retx=(2, 2), cpu=40.0, load=(1.0, 4), seed="7",
+              start=0, stalled=()):
+    """A call of two peers (offerer, answerer), one file: `*_every` is how often (s) each one's receiver
+    gets a burst of packets (5: every sample); the counters are what each peer logs."""
+    rows = list(TIMELINE if timeline is None else timeline)
+    rows.append({"ts": ts(start), "impl": "run", "arch": "x86_64", "kind": "event", "id": "run", "what": "run",
+                 "seed": seed, "profile": "call", "minutes": 4, "group": "impaired"})
+    for k, (role, every) in enumerate((("offerer", off_every), ("answerer", ans_every))):
+        pid = "%s-%s" % (impl, role)
+        rec = track(impl, pid + "-video", "impaired", END, bytes_per_s=100_000, flowing=lambda t, e=every: t % e == 0)
+        for r in rec:
+            r["nack"] = nack[k]
+            if r["ts"] in {ts(t) for t in stalled} and k == 0:
+                r["stalled"] = True
+        rows += rec
+        rows += [{"ts": ts(t), "impl": impl, "arch": "x86_64", "kind": "proc", "id": pid, "rss_mb": 50.0, "cpu_pct": cpu,
+                  "threads": 10, "fds": 20, "udp_rcvbuf_err": 0, "udp_sndbuf_err": 0, "load1": load[0], "cpus": load[1]}
+                 for t in range(0, END + 1, STEP)]
+        rows += [{"ts": ts(t), "impl": impl, "arch": "x86_64", "kind": "tx", "id": pid, "retx": retx[k] * t,
+                  "rtp_pkts": 10 * t, "rtp_bytes": 1000 * t, "rtcp_pkts": t, "rtcp_bytes": 50 * t, "dtls_pkts": t,
+                  "dtls_bytes": 100 * t, "stun_pkts": t, "stun_bytes": 20 * t, "other_pkts": 0, "other_bytes": 0}
+                 for t in range(0, END + 1, STEP)]
+    return rows
+
+
+def validate(*files, rules=None):
+    d = tempfile.mkdtemp()
+    paths = []
+    for name, rows in files:
+        paths.append(os.path.join(d, name + ".jsonl"))
+        with open(paths[-1], "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+    runs = report.load(paths)
+    return report.validity(runs, report.build_entities(runs), dict(report.DEFAULTS, **(rules or {}))), runs, d
+
+
+def failed_checks(val):
+    return [v[1] for v in val if not v[3]]
+
+
+class RunValidity(unittest.TestCase):
+    def test_a_fair_pair_is_valid(self):
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc")), ("pion-pion", peer_pair("pion")))
+        self.assertEqual(failed_checks(val), [], val)
+
+    def test_a_direction_starved_beyond_three_to_one_is_invalid(self):
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=20)))  # 4:1
+        self.assertEqual(failed_checks(val), ["video delivered, offerer vs answerer"])
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=10)))  # 2:1
+        self.assertEqual(failed_checks(val), [])
+
+    def test_files_that_deliver_more_than_two_to_one_apart_are_invalid(self):
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc")), ("pion-pion", peer_pair("pion", 15, 15)))
+        self.assertEqual(failed_checks(val), ["total delivered packets, between files"])
+
+    def test_a_counter_that_is_zero_on_one_side_is_invalid_where_the_path_is_impaired(self):
+        val, _, _ = validate(("pion-pion", peer_pair("pion", nack=(3, 0))))
+        self.assertEqual(failed_checks(val), ["nack counted on both sides"])
+        val, _, _ = validate(("pion-pion", peer_pair("pion", retx=(2, 0))))
+        self.assertEqual(failed_checks(val), ["retx counted on both sides"])
+        clean = [phase(0, "clean")]
+        val, _, _ = validate(("pion-pion", peer_pair("pion", nack=(3, 0), retx=(2, 0), timeline=clean)))
+        self.assertEqual(failed_checks(val), [])
+
+    def test_a_send_class_that_is_zero_on_one_side_is_invalid(self):
+        rows = peer_pair("rtc")
+        for r in rows:
+            if r["kind"] == "tx" and r["id"] == "rtc-answerer":
+                r["stun_pkts"] = 0
+        val, _, _ = validate(("rtc-rtc", rows))
+        self.assertEqual(failed_checks(val), ["stun_pkts counted on both sides"])
+
+    def test_a_saturated_peer_or_a_loaded_host_is_invalid(self):
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", cpu=250.0)))
+        self.assertEqual(sorted(failed_checks(val)), ["rtc-answerer CPU not saturated", "rtc-offerer CPU not saturated"])
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", load=(9.0, 4))))
+        self.assertEqual(len(failed_checks(val)), 2)
+        self.assertTrue(all("load average" in c for c in failed_checks(val)))
+
+    def test_files_must_be_one_run(self):
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc")), ("pion-pion", peer_pair("pion", seed="8")))
+        self.assertEqual(failed_checks(val), ["one seed, profile and length"])
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc")), ("pion-pion", peer_pair("pion", start=3 * 86400)))
+        self.assertIn("started together", failed_checks(val))
+        merged = peer_pair("rtc") + [r for r in peer_pair("rtc", seed="9") if r.get("what") == "run"]
+        val, _, _ = validate(("rtc-rtc", merged))
+        self.assertEqual(failed_checks(val), ["one run per file"])
+
+    def test_an_invalid_run_gets_no_verdict_and_fails_the_gate(self):
+        d = tempfile.mkdtemp()
+        paths = []
+        for name, rows in (("rtc-rtc", peer_pair("rtc", ans_every=20)), ("pion-pion", peer_pair("pion"))):
+            paths.append(os.path.join(d, name + ".jsonl"))
+            with open(paths[-1], "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows)
+        rules = os.path.join(d, "rules.json")
+        with open(rules, "w") as f:
+            json.dump({"compare": [{"subject": "rtc", "baseline": "pion"}]}, f)
+        self.assertEqual(report.main(["--rules", rules, "--out", os.path.join(d, "out")] + paths), 1)
+        with open(os.path.join(d, "out", "summary.md")) as f:
+            md = f.read()
+        self.assertTrue(md.splitlines()[0].startswith("# Soak report: INVALID RUN, no verdict (rtc-rtc: video delivered"), md[:200])
+        self.assertIn("## Run validity", md)
+        self.assertIn("## Sent by class", md)
+        self.assertNotIn("Freezes / min", md)
+
+
+class NetworkAttribution(unittest.TestCase):
+    def ents(self, rows):
+        _, runs, _ = validate(("rtc-rtc", rows))
+        return report.build_entities(runs)
+
+    def test_only_network_classes_are_charged_with_freezes_and_stalls(self):
+        rows = peer_pair("rtc", timeline=[phase(0, "clean")], stalled=(30, 35))
+        rows += window(20, 50, "a1", "pli-flood", ["s99"]) + window(20, 50, "a2", "reorder", ["s99"])
+        e = [x for x in self.ents(rows) if x.impl == "rtc"]
+        net = report.attack_metrics(e, lambda n: n == "reorder", dict(report.DEFAULTS))
+        other = report.attack_metrics(e, lambda n: n == "pli-flood", dict(report.DEFAULTS))
+        self.assertEqual(net["stalls"], 1)
+        self.assertEqual([other[k] for k in ("stalls", "stall_max", "freezes", "freeze_rate", "freeze_ms")], [None] * 5)
+        self.assertIsNotNone(other["closes"])
+
+    def test_stalls_with_no_network_attack_active(self):
+        timeline = [phase(0, "clean")]
+        e = lambda rows: [x for x in self.ents(rows) if x.impl == "rtc"]
+        rules = dict(report.DEFAULTS)
+        quiet = peer_pair("rtc", timeline=timeline, stalled=(30, 35))
+        self.assertEqual(report.quiet_stalls(e(quiet), rules), 1)
+        with_net = quiet + window(20, 50, "a1", "jitter")
+        self.assertEqual(report.quiet_stalls(e(with_net), rules), 0)
+        with_junk = quiet + window(20, 50, "a1", "udp-junk")
+        self.assertEqual(report.quiet_stalls(e(with_junk), rules), 1)
+        shaped = peer_pair("rtc", timeline=[phase(0, "clean"), phase(25, "loss"), phase(60, "clean")], stalled=(30, 35))
+        self.assertEqual(report.quiet_stalls(e(shaped), rules), 0)

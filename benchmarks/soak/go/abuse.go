@@ -272,7 +272,7 @@ type sess struct {
 }
 
 func newSess(conn net.Conn, polite bool, seed uint64) (*sess, error) {
-	pc, err := newPeerConnection(false)
+	pc, err := newPeerConnection(false, nil, nil)
 	if err != nil {
 		return nil, err
 	}
