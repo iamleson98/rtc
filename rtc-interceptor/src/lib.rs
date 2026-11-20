@@ -320,7 +320,9 @@ pub use jitterbuffer::receiver::{
 };
 pub use keyframe_requests::{KeyframeRequestForwarderBuilder, KeyframeRequestForwarderInterceptor};
 pub use nack::generator::{GeneratorStreamsFilter, NackGeneratorBuilder, NackGeneratorInterceptor};
-pub use nack::responder::{NackResponderBuilder, NackResponderInterceptor, ResponderStreamsFilter};
+pub use nack::responder::{
+    NackResponderBuilder, NackResponderInterceptor, NackResponderStats, ResponderStreamsFilter,
+};
 pub use noop::NoopInterceptor;
 pub use pacing::pacer::{MIN_BURST_BITS as PACER_MIN_BURST_BITS, Pacer};
 pub use pacing::sender::{

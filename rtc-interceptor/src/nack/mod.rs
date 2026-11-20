@@ -8,6 +8,7 @@
 //! - [RFC 4585](https://datatracker.ietf.org/doc/html/rfc4585) - RTP/AVPF (NACK feedback)
 //! - [RFC 4588](https://datatracker.ietf.org/doc/html/rfc4588) - RTP Retransmission (RTX)
 pub(crate) mod generator;
+pub(crate) mod rate_window;
 pub(crate) mod receive_log;
 pub(crate) mod responder;
 pub(crate) mod send_buffer;
