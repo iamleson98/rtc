@@ -7,14 +7,70 @@ use crate::{Attribute, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
 use shared::marshal::MarshalSize;
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Rate used when none is configured: 1 Mb/s.
 pub const DEFAULT_BITRATE: f64 = 1_000_000.0;
 
 /// Packets held before new ones are refused.
 pub const DEFAULT_QUEUE_LIMIT: usize = 4096;
+
+/// Burst window of the send-rate mode unless configured: 5 ms.
+pub const DEFAULT_SEND_RATE_BURST_WINDOW: Duration = Duration::from_millis(5);
+
+/// Multiplier of the send-rate mode unless configured.
+pub const DEFAULT_SEND_RATE_MULTIPLIER: f64 = 2.0;
+
+/// Width of one slot of the send-rate window.
+const SLOT: Duration = Duration::from_millis(100);
+
+/// Slots in the send-rate window: ten of 100 ms make about a second.
+const SLOTS: usize = 10;
+
+/// What sets the pace rate.
+#[derive(Debug, Clone, Copy)]
+enum PaceMode {
+    /// Follow the congestion controller's target bitrate.
+    FollowTarget,
+    /// `multiplier` times the paced bytes sent over the last second, floored at `min_bitrate`.
+    SendRate { multiplier: f64, min_bitrate: f64 },
+}
+
+/// Paced bits sent over roughly the last second, in fixed slots so nothing grows per packet.
+#[derive(Debug, Clone, Default)]
+struct SendRate {
+    start: Option<Instant>,
+    ids: [u64; SLOTS],
+    bits: [f64; SLOTS],
+}
+
+impl SendRate {
+    fn slot_id(&mut self, now: Instant) -> u64 {
+        let start = *self.start.get_or_insert(now);
+        (now.saturating_duration_since(start).as_millis() / SLOT.as_millis()) as u64
+    }
+
+    fn record(&mut self, now: Instant, bits: f64) {
+        let id = self.slot_id(now);
+        let index = (id % SLOTS as u64) as usize;
+        if self.ids[index] != id {
+            self.ids[index] = id;
+            self.bits[index] = 0.0;
+        }
+        self.bits[index] += bits;
+    }
+
+    /// Bits per second over the slots still inside the window.
+    fn bits_per_second(&mut self, now: Instant) -> f64 {
+        let current = self.slot_id(now);
+        let total: f64 = (0..SLOTS)
+            .filter(|&i| self.ids[i] <= current && self.ids[i] + SLOTS as u64 > current)
+            .map(|i| self.bits[i])
+            .sum();
+        total / (SLOT.as_secs_f64() * SLOTS as f64)
+    }
+}
 
 /// Builder for [`PacerInterceptor`].
 ///
@@ -31,6 +87,8 @@ pub struct PacerBuilder {
     bitrate: f64,
     burst_bits: Option<f64>,
     queue_limit: usize,
+    mode: PaceMode,
+    burst_window: Option<Duration>,
 }
 
 impl Default for PacerBuilder {
@@ -39,6 +97,8 @@ impl Default for PacerBuilder {
             bitrate: DEFAULT_BITRATE,
             burst_bits: None,
             queue_limit: DEFAULT_QUEUE_LIMIT,
+            mode: PaceMode::FollowTarget,
+            burst_window: None,
         }
     }
 }
@@ -69,13 +129,66 @@ impl PacerBuilder {
         self
     }
 
+    /// Pace at `multiplier` times the paced bytes sent over the last second instead of following
+    /// the congestion controller's target (default multiplier 2.0).
+    ///
+    /// The pacer then never throttles the steady rate — whoever chooses the bitrate decides it —
+    /// and only spreads bursts out. The rate is floored at [`PacerBuilder::with_min_bitrate`],
+    /// which is also the rate before anything has been sent. Audio is sent unpaced and does not
+    /// count towards the rate.
+    pub fn with_send_rate_multiplier(mut self, multiplier: f64) -> Self {
+        let min_bitrate = match self.mode {
+            PaceMode::SendRate { min_bitrate, .. } => min_bitrate,
+            PaceMode::FollowTarget => DEFAULT_BITRATE,
+        };
+        self.mode = PaceMode::SendRate {
+            multiplier,
+            min_bitrate,
+        };
+        self
+    }
+
+    /// The lowest rate the send-rate mode paces at, in bits per second (default 1 Mb/s).
+    ///
+    /// Enables the send-rate mode with the default multiplier if it is not on yet.
+    pub fn with_min_bitrate(mut self, bits_per_second: f64) -> Self {
+        let multiplier = match self.mode {
+            PaceMode::SendRate { multiplier, .. } => multiplier,
+            PaceMode::FollowTarget => DEFAULT_SEND_RATE_MULTIPLIER,
+        };
+        self.mode = PaceMode::SendRate {
+            multiplier,
+            min_bitrate: bits_per_second,
+        };
+        self
+    }
+
+    /// How much time at the pace rate one burst covers, floored at one packet.
+    ///
+    /// Defaults to 5 ms in the send-rate mode and 100 ms when following the target. Ignored when
+    /// [`PacerBuilder::with_burst_bits`] is set.
+    pub fn with_burst_window(mut self, window: Duration) -> Self {
+        self.burst_window = Some(window);
+        self
+    }
+
     /// Build the interceptor.
     pub fn build(self) -> PacerInterceptor {
-        let bucket = match self.burst_bits {
-            Some(burst_bits) => LeakyBucket::new(self.bitrate).with_burst_bits(burst_bits),
-            None => LeakyBucket::new(self.bitrate),
+        let (bitrate, window) = match self.mode {
+            PaceMode::FollowTarget => (self.bitrate, self.burst_window),
+            PaceMode::SendRate { min_bitrate, .. } => (
+                min_bitrate,
+                Some(self.burst_window.unwrap_or(DEFAULT_SEND_RATE_BURST_WINDOW)),
+            ),
         };
-        PacerInterceptor::new(bucket, self.queue_limit)
+        let mut bucket = LeakyBucket::new(bitrate);
+        if let Some(window) = window {
+            bucket = bucket.with_burst_window(window);
+        }
+        if let Some(burst_bits) = self.burst_bits {
+            bucket = bucket.with_burst_bits(burst_bits);
+        }
+        PacerInterceptor::new(bucket, self.queue_limit, self.mode)
     }
 }
 
@@ -92,6 +205,14 @@ impl PacerBuilder {
 /// the pacer on the belt, so they are metered along with everything else. Under the nested chain
 /// they bypassed it entirely.
 ///
+/// # What is not paced
+///
+/// RTCP, and RTP of local audio streams (bound with an `audio/` MIME type), go straight out: audio
+/// is small and latency-sensitive, and held behind a video backlog it would arrive late. This
+/// holds in both modes — following the congestion controller's target and
+/// [`PacerBuilder::with_send_rate_multiplier`] — and audio does not count towards the send rate
+/// the second mode measures.
+///
 /// # Differences from upstream
 ///
 /// - **No ticker and no goroutine.** Upstream runs a loop on a 5 ms `time.Ticker`; here the
@@ -106,6 +227,11 @@ pub struct PacerInterceptor {
     pacer: LeakyBucket,
     queue: VecDeque<TaggedPacket>,
     queue_limit: usize,
+    mode: PaceMode,
+    /// Paced bits sent recently; feeds the send-rate mode.
+    sent: SendRate,
+    /// SSRCs of local audio streams, which skip the queue.
+    audio_ssrcs: HashSet<u32>,
     /// Packets refused because the queue was full.
     dropped: u64,
     /// Packets the budget has released, waiting to join the belt.
@@ -118,8 +244,11 @@ pub struct PacerInterceptor {
 }
 
 impl PacerInterceptor {
-    fn new(pacer: LeakyBucket, queue_limit: usize) -> Self {
+    fn new(pacer: LeakyBucket, queue_limit: usize, mode: PaceMode) -> Self {
         Self {
+            mode,
+            sent: SendRate::default(),
+            audio_ssrcs: HashSet::new(),
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
             released: VecDeque::new(),
@@ -158,6 +287,18 @@ impl PacerInterceptor {
         }
     }
 
+    /// In the send-rate mode, set the rate from what was sent over the last second.
+    fn update_rate(&mut self, now: Instant) {
+        if let PaceMode::SendRate {
+            multiplier,
+            min_bitrate,
+        } = self.mode
+        {
+            let rate = (self.sent.bits_per_second(now) * multiplier).max(min_bitrate);
+            self.pacer.set_target_bitrate(rate);
+        }
+    }
+
     /// The instant the head of the queue can next be released.
     fn next_release(&self) -> Option<Instant> {
         let head = self.queue.front()?;
@@ -183,10 +324,11 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
         //
         // Observed, not consumed: the packet carries on with the attribute attached, so anything
         // further along reads the same number.
-        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) =
-            msg.message.get(&Attribute::TargetBitrateChanged {
-                bits_per_second: 0.0,
-            })
+        if matches!(self.mode, PaceMode::FollowTarget)
+            && let Some(Attribute::TargetBitrateChanged { bits_per_second }) =
+                msg.message.get(&Attribute::TargetBitrateChanged {
+                    bits_per_second: 0.0,
+                })
         {
             self.pacer.set_target_bitrate(*bits_per_second);
         }
@@ -212,9 +354,19 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
             return Ok(());
         }
 
+        // Audio is small and latency-sensitive: held behind a video backlog it arrives late, so it
+        // goes out like RTCP and is not metered.
+        if let Packet::Rtp(rtp) = &msg.message.packet
+            && self.audio_ssrcs.contains(&rtp.header.ssrc)
+        {
+            self.write_queue.push_back(msg);
+            return Ok(());
+        }
+
         // Keeping the budget current at enqueue time is what lets `poll_timeout` compute a
         // deadline that is never in the past, even before the first `handle_timeout`.
         self.pacer.refill(msg.now);
+        self.update_rate(msg.now);
 
         if self.queue.len() >= self.queue_limit {
             // Refuse the arrival rather than evicting something already queued: the queued
@@ -240,6 +392,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.pacer.refill(now);
+        self.update_rate(now);
 
         while let Some(head) = self.queue.front() {
             let bits = Self::bits_of(head);
@@ -249,6 +402,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
 
             let mut packet = self.queue.pop_front().expect("front just checked");
             self.pacer.consume(bits);
+            self.sent.record(now, bits);
             // Rule 3: the packet departs now. Anything below recording departure — the send
             // history congestion control reads — must see the release instant, not the enqueue
             // instant, or this queueing delay is charged to the network.
@@ -266,11 +420,180 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
 }
 
 impl Interceptor for PacerInterceptor {
-    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_local_stream(&mut self, info: &StreamInfo) {
+        if info.mime_type.to_ascii_lowercase().starts_with("audio/") {
+            self.audio_ssrcs.insert(info.ssrc);
+        }
+    }
 
-    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, info: &StreamInfo) {
+        self.audio_ssrcs.remove(&info.ssrc);
+    }
 
     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
 
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AttributedPacket;
+    use shared::TransportContext;
+
+    /// 1500 bytes on the wire.
+    const PACKET_BITS: f64 = 12_000.0;
+
+    fn stream(ssrc: u32, mime_type: &str) -> StreamInfo {
+        StreamInfo {
+            ssrc,
+            mime_type: mime_type.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn rtp(now: Instant, ssrc: u32, sequence_number: u16) -> TaggedPacket {
+        TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
+                header: rtp::header::Header {
+                    version: 2,
+                    ssrc,
+                    sequence_number,
+                    ..Default::default()
+                },
+                payload: vec![0u8; 1488].into(),
+            })),
+        }
+    }
+
+    fn sequence(packet: &TaggedPacket) -> u16 {
+        match &packet.message.packet {
+            Packet::Rtp(rtp) => rtp.header.sequence_number,
+            Packet::Rtcp(_) => unreachable!("only RTP is written"),
+        }
+    }
+
+    fn drain(pacer: &mut PacerInterceptor) -> Vec<u16> {
+        std::iter::from_fn(|| pacer.poll_write())
+            .map(|packet| sequence(&packet))
+            .collect()
+    }
+
+    #[test]
+    fn audio_goes_out_before_a_queued_video_backlog() {
+        let now = Instant::now();
+        let mut pacer = PacerBuilder::new().with_send_rate_multiplier(2.0).build();
+        pacer.bind_local_stream(&stream(1, "video/VP8"));
+        pacer.bind_local_stream(&stream(2, "audio/opus"));
+
+        for seq in 0..5 {
+            pacer.handle_write(rtp(now, 1, seq)).unwrap();
+        }
+        pacer.handle_write(rtp(now, 2, 100)).unwrap();
+
+        assert_eq!(Some(100), pacer.poll_write().map(|p| sequence(&p)));
+        assert!(pacer.poll_write().is_none(), "video is still queued");
+        assert_eq!(5, pacer.queued());
+    }
+
+    #[test]
+    fn unbinding_forgets_the_audio_ssrc() {
+        let now = Instant::now();
+        let mut pacer = PacerBuilder::new().with_send_rate_multiplier(2.0).build();
+        let audio = stream(2, "audio/opus");
+        pacer.bind_local_stream(&audio);
+        pacer.unbind_local_stream(&audio);
+
+        pacer.handle_write(rtp(now, 2, 1)).unwrap();
+
+        assert_eq!(1, pacer.queued(), "paced like anything else again");
+        assert!(pacer.poll_write().is_none());
+    }
+
+    #[test]
+    fn the_pace_rate_follows_twice_the_send_rate() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new()
+            .with_send_rate_multiplier(2.0)
+            .with_min_bitrate(100_000.0)
+            .build();
+        assert_eq!(100_000.0, pacer.pacer().target_bitrate());
+
+        // 50 packets over the first half second, released as the budget allows.
+        for seq in 0..50 {
+            pacer.handle_write(rtp(start, 1, seq)).unwrap();
+        }
+        let mut at = Duration::ZERO;
+        while at < Duration::from_millis(500) {
+            at += Duration::from_millis(1);
+            pacer.handle_timeout(start + at).unwrap();
+        }
+        let sent_bits = (50 - pacer.queued()) as f64 * PACKET_BITS;
+        assert!(sent_bits > 0.0);
+
+        // Inside the window the rate is twice what went out, over one second.
+        pacer
+            .handle_timeout(start + Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(2.0 * sent_bits, pacer.pacer().target_bitrate());
+
+        // Two seconds on, the window is empty and the floor holds.
+        pacer
+            .handle_timeout(start + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(100_000.0, pacer.pacer().target_bitrate());
+    }
+
+    #[test]
+    fn the_rate_never_falls_below_the_min_bitrate() {
+        let now = Instant::now();
+        let mut pacer = PacerBuilder::new().with_min_bitrate(3_000_000.0).build();
+        pacer.handle_write(rtp(now, 1, 0)).unwrap();
+        pacer.handle_timeout(now).unwrap();
+        assert_eq!(3_000_000.0, pacer.pacer().target_bitrate());
+    }
+
+    #[test]
+    fn the_send_rate_mode_ignores_the_congestion_target() {
+        let now = Instant::now();
+        let mut pacer = PacerBuilder::new().with_min_bitrate(500_000.0).build();
+        let mut msg = TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![])),
+        };
+        msg.message.add(Attribute::TargetBitrateChanged {
+            bits_per_second: 9_000_000.0,
+        });
+        pacer.handle_read(msg).unwrap();
+        assert_eq!(500_000.0, pacer.pacer().target_bitrate());
+    }
+
+    #[test]
+    fn the_burst_is_five_milliseconds_of_the_rate() {
+        // 8 Mb/s for 5 ms is 40 000 bits; the floor is one packet.
+        let pacer = PacerBuilder::new().with_min_bitrate(8_000_000.0).build();
+        assert_eq!(40_000.0, pacer.pacer().burst_bits());
+
+        let slow = PacerBuilder::new().with_min_bitrate(100_000.0).build();
+        assert_eq!(PACKET_BITS, slow.pacer().burst_bits());
+
+        // The target-following mode keeps its 100 ms burst.
+        let follow = PacerBuilder::new().with_target_bitrate(8_000_000.0).build();
+        assert_eq!(800_000.0, follow.pacer().burst_bits());
+    }
+
+    #[test]
+    fn a_backlog_leaves_in_five_millisecond_bursts() {
+        let start = Instant::now();
+        // 8 Mb/s: a burst is 40 000 bits, three whole packets.
+        let mut pacer = PacerBuilder::new().with_min_bitrate(8_000_000.0).build();
+        for seq in 0..20 {
+            pacer.handle_write(rtp(start, 1, seq)).unwrap();
+        }
+        pacer.handle_timeout(start).unwrap();
+        assert_eq!(3, drain(&mut pacer).len());
+    }
 }
