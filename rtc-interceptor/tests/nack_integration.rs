@@ -1084,8 +1084,12 @@ fn test_continuous_stream_with_nack_recovery() {
                     // Collect retransmissions from sender
                     while let Some(retrans_pkt) = sender.poll_write() {
                         if let Packet::Rtp(rtp) = &retrans_pkt.message.packet {
-                            // Mark as received via retransmission
+                            // Mark as received via retransmission, and tell the receiver so it
+                            // stops asking: a receiver that never learns of a repair re-asks for
+                            // it every interval, which the responder's budget rightly refuses.
                             received_seqs.insert(rtp.header.sequence_number);
+                            receiver.handle_read(retrans_pkt).unwrap();
+                            while receiver.poll_read().is_some() {}
                         }
                     }
                 }
@@ -1110,6 +1114,8 @@ fn test_continuous_stream_with_nack_recovery() {
             while let Some(retrans_pkt) = sender.poll_write() {
                 if let Packet::Rtp(rtp) = &retrans_pkt.message.packet {
                     received_seqs.insert(rtp.header.sequence_number);
+                    receiver.handle_read(retrans_pkt).unwrap();
+                    while receiver.poll_read().is_some() {}
                 }
             }
         }

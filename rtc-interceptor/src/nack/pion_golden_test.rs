@@ -47,7 +47,7 @@ fn run(kind: &str, size: u16, ops: &[&str]) -> Vec<String> {
                     String::new()
                 }
                 ("a", _, Some(buf)) => {
-                    buf.add(packet(arg as u16));
+                    buf.add(packet(arg as u16), std::time::Instant::now());
                     String::new()
                 }
                 ("g", Some(log), _) => u8::from(log.get(arg as u16)).to_string(),

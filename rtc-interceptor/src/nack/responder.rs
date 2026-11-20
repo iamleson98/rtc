@@ -1,5 +1,6 @@
 //! NACK Responder Interceptor - Responds to NACK requests by retransmitting packets.
 
+use super::rate_window::RateWindow;
 use super::send_buffer::SendBuffer;
 use super::stream_supports_nack;
 use crate::Interceptor;
@@ -8,6 +9,7 @@ use crate::{Attribute, AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
+use shared::marshal::MarshalSize;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -36,7 +38,20 @@ pub struct NackResponderBuilder {
     rtt: Duration,
     /// Extra per-stream gate, applied on top of the NACK feedback check.
     streams_filter: Option<ResponderStreamsFilter>,
+    /// Whether retransmissions are capped to a byte budget.
+    budget: bool,
+    /// Width of the sliding window the budget is counted over.
+    budget_window: Duration,
+    /// Age past which a buffered packet is no longer retransmitted; `None` keeps it until the
+    /// buffer overwrites it.
+    max_packet_age: Option<Duration>,
 }
+
+/// libwebrtc's `kRetransmitWindowSizeMs` and pion's retransmission window.
+const DEFAULT_BUDGET_WINDOW: Duration = Duration::from_millis(500);
+
+/// Span the stream's own send rate is measured over when no target bitrate is known.
+const MEDIA_RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// libwebrtc's `kDefaultRtt`: assumed until the application supplies a measured round trip.
 const DEFAULT_RTT: Duration = Duration::from_millis(100);
@@ -47,6 +62,9 @@ impl Default for NackResponderBuilder {
             size: 1024,
             rtt: DEFAULT_RTT,
             streams_filter: None,
+            budget: true,
+            budget_window: DEFAULT_BUDGET_WINDOW,
+            max_packet_age: None,
         }
     }
 }
@@ -91,6 +109,48 @@ impl NackResponderBuilder {
         self
     }
 
+    /// Turn the retransmission budget on or off. On by default.
+    ///
+    /// While on, the bytes re-sent in any [`window`](Self::with_retransmit_window) stay within a
+    /// budget. The budget is the congestion controller's target bitrate once one has been seen
+    /// going past ([`Attribute::TargetBitrateChanged`]), shared by every stream of the
+    /// connection as libwebrtc's single retransmission rate limiter is. Until then each stream
+    /// is held to its own send rate over the last second (unlimited during its first second,
+    /// which has no rate to measure). The first packet of an empty window is always sent, so a
+    /// quiet stream can still repair a single loss.
+    ///
+    /// A request is answered in order and stops at the first packet the budget refuses, as
+    /// libwebrtc's `RTPSender::OnReceivedNack` does; the rest of the request is counted in
+    /// [`NackResponderStats::budget_dropped_packets`]. The oldest packets of a request are
+    /// therefore served first and the newest are the ones left unanswered.
+    pub fn with_retransmit_budget(mut self, enabled: bool) -> Self {
+        self.budget = enabled;
+        self
+    }
+
+    /// Set the width of the window the retransmission budget is counted over.
+    ///
+    /// Defaults to 500 ms, libwebrtc's `kRetransmitWindowSizeMs`. The window is counted in
+    /// slots of a tenth of its width, so it is rounded to a whole multiple of 10 ms, with a
+    /// minimum of 10 ms.
+    pub fn with_retransmit_window(mut self, window: Duration) -> Self {
+        let tens_of_ms = ((window.as_millis() + 5) / 10).max(1) as u64;
+        self.budget_window = Duration::from_millis(tens_of_ms * 10);
+        self
+    }
+
+    /// Stop retransmitting packets older than `max_age`, or three round trips if that is longer.
+    ///
+    /// After an outage the send buffer still holds everything sent during it, and the receiver's
+    /// requests would have it all re-sent although no receiver can still use those packets.
+    /// libwebrtc's `RtpPacketHistory` drops them after `max(1 s, 3 x RTT)`; this is the same
+    /// rule with the floor of your choosing. A skipped request is counted in
+    /// [`NackResponderStats::stale_skipped_packets`]. Off by default, as in pion.
+    pub fn with_max_packet_age(mut self, max_age: Duration) -> Self {
+        self.max_packet_age = Some(max_age);
+        self
+    }
+
     /// Build the interceptor, rejecting a buffer size that could never retransmit anything.
     ///
     /// pion fails construction with `ErrInvalidSize`; the infallible [`Self::build`] keeps its
@@ -109,7 +169,13 @@ impl NackResponderBuilder {
     /// that buffers nothing; [`Self::try_build`] turns the same configuration into an error
     /// instead.
     pub fn build(self) -> NackResponderInterceptor {
-        NackResponderInterceptor::new(self.size, self.rtt, self.streams_filter)
+        NackResponderInterceptor::new(
+            self.size,
+            self.rtt,
+            self.streams_filter,
+            self.budget.then_some(self.budget_window),
+            self.max_packet_age,
+        )
     }
 }
 
@@ -131,6 +197,23 @@ struct LocalStream {
     sent_reports: VecDeque<(u32, Instant)>,
     /// Round trip measured from receiver reports, smoothed; `None` until the first one.
     rtt: Option<Duration>,
+    /// Bytes this stream sent over the last second (the budget's rate when no target is known).
+    media: RateWindow,
+    /// Bytes re-sent over the budget window.
+    resent: RateWindow,
+}
+
+/// What the responder has done, for monitoring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NackResponderStats {
+    /// Packets re-sent in answer to NACKs.
+    pub retransmitted_packets: u64,
+    /// Bytes of those packets.
+    pub retransmitted_bytes: u64,
+    /// Requested packets left unanswered because the retransmission budget was spent.
+    pub budget_dropped_packets: u64,
+    /// Requested packets not re-sent because they were older than the maximum packet age.
+    pub stale_skipped_packets: u64,
 }
 
 /// How many sender reports are remembered to match a report block's LSR against.
@@ -149,6 +232,16 @@ pub struct NackResponderInterceptor {
     rtt: Duration,
     /// Extra per-stream gate from the builder, applied with the NACK feedback check.
     streams_filter: Option<ResponderStreamsFilter>,
+    /// Width of the retransmission budget window; `None` when the budget is off.
+    budget_window: Option<Duration>,
+    /// See [`NackResponderBuilder::with_max_packet_age`].
+    max_packet_age: Option<Duration>,
+    /// The congestion controller's latest target, in bits per second.
+    target_bitrate: Option<f64>,
+    /// Bytes re-sent across all streams over the budget window; the budget while a target
+    /// bitrate is known.
+    resent: RateWindow,
+    stats: NackResponderStats,
 
     /// Send buffers per local stream SSRC
     streams: HashMap<u32, LocalStream>,
@@ -160,14 +253,50 @@ pub struct NackResponderInterceptor {
 }
 
 impl NackResponderInterceptor {
-    fn new(size: u16, rtt: Duration, streams_filter: Option<ResponderStreamsFilter>) -> Self {
+    fn new(
+        size: u16,
+        rtt: Duration,
+        streams_filter: Option<ResponderStreamsFilter>,
+        budget_window: Option<Duration>,
+        max_packet_age: Option<Duration>,
+    ) -> Self {
         Self {
+            max_packet_age,
+            budget_window,
+            target_bitrate: None,
+            resent: RateWindow::new(budget_window.unwrap_or(DEFAULT_BUDGET_WINDOW)),
+            stats: NackResponderStats::default(),
             read_queue: VecDeque::new(),
             size,
             rtt,
             streams_filter,
             streams: HashMap::new(),
             write_queue: VecDeque::new(),
+        }
+    }
+
+    /// What this responder has re-sent and refused so far.
+    pub fn stats(&self) -> NackResponderStats {
+        self.stats
+    }
+
+    /// Bytes that may be re-sent per budget window on a stream with the given send rate.
+    ///
+    /// `None` means no limit: with no target bitrate, the send rate is only trusted once the
+    /// stream has been sending for the whole rate window, since a younger stream's rate says
+    /// nothing about what it may re-send.
+    fn budget_bytes(
+        target_bitrate: Option<f64>,
+        media: &mut RateWindow,
+        now: Instant,
+        window: Duration,
+    ) -> Option<f64> {
+        match target_bitrate {
+            Some(bits_per_second) => Some(bits_per_second / 8.0 * window.as_secs_f64()),
+            None if media.age(now) < MEDIA_RATE_WINDOW => None,
+            None => {
+                Some(media.sum(now) as f64 * window.as_secs_f64() / MEDIA_RATE_WINDOW.as_secs_f64())
+            }
         }
     }
 
@@ -275,16 +404,54 @@ impl NackResponderInterceptor {
             .retain(|_, sent| now.saturating_duration_since(*sent) < rtt);
 
         // Queue retransmissions
-        for seq in seqs_to_retransmit {
+        let requested = seqs_to_retransmit.len();
+        for (index, seq) in seqs_to_retransmit.into_iter().enumerate() {
             let Some(original_packet) = stream.send_buffer.get(seq) else {
                 continue;
             };
+
+            // Too old for any receiver to still want, and past what the round trip could explain.
+            if let Some(max_age) = self.max_packet_age
+                && let Some(stored) = stream.send_buffer.stored_at(seq)
+                && now.saturating_duration_since(stored) > max_age.max(rtt * 3)
+            {
+                self.stats.stale_skipped_packets += 1;
+                continue;
+            }
 
             // The copy sent less than one round trip ago has not had time to arrive and be
             // reported, so this request was made before it could have helped.
             if stream.last_retransmit.contains_key(&seq) {
                 continue;
             }
+
+            let size = original_packet.marshal_size()
+                + if stream.ssrc_rtx.is_some() && stream.payload_type_rtx.is_some() {
+                    2
+                } else {
+                    0
+                };
+            if let Some(window) = self.budget_window {
+                let used = if self.target_bitrate.is_some() {
+                    self.resent.sum(now)
+                } else {
+                    stream.resent.sum(now)
+                };
+                let budget =
+                    Self::budget_bytes(self.target_bitrate, &mut stream.media, now, window);
+                // An empty window always answers one request, so a quiet stream repairs a loss.
+                if let Some(budget) = budget
+                    && used > 0
+                    && (used + size) as f64 > budget
+                {
+                    self.stats.budget_dropped_packets += (requested - index) as u64;
+                    break;
+                }
+            }
+            self.resent.add(now, size);
+            stream.resent.add(now, size);
+            self.stats.retransmitted_packets += 1;
+            self.stats.retransmitted_bytes += size as u64;
             stream.last_retransmit.insert(seq, now);
 
             let packet = if let (Some(ssrc_rtx), Some(pt_rtx)) =
@@ -373,6 +540,14 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
             msg.message.add(Attribute::RoundTripTime { rtt });
         }
 
+        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) =
+            msg.message.get(&Attribute::TargetBitrateChanged {
+                bits_per_second: 0.0,
+            })
+        {
+            self.target_bitrate = Some(*bits_per_second);
+        }
+
         // Process NACK packets
         if let Packet::Rtcp(ref rtcp_packets) = msg.message.packet {
             for rtcp_packet in rtcp_packets {
@@ -422,7 +597,8 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
                 stream
                     .last_retransmit
                     .remove(&rtp_packet.header.sequence_number);
-                stream.send_buffer.add(rtp_packet.clone());
+                stream.media.add(msg.now, rtp_packet.marshal_size());
+                stream.send_buffer.add(rtp_packet.clone(), msg.now);
             }
         }
 
@@ -465,6 +641,8 @@ impl Interceptor for NackResponderInterceptor {
                     last_retransmit: HashMap::new(),
                     sent_reports: VecDeque::new(),
                     rtt: None,
+                    media: RateWindow::new(MEDIA_RATE_WINDOW),
+                    resent: RateWindow::new(self.budget_window.unwrap_or(DEFAULT_BUDGET_WINDOW)),
                 },
             );
         }
@@ -477,4 +655,222 @@ impl Interceptor for NackResponderInterceptor {
     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
 
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack};
+
+    const SSRC: u32 = 0x1234;
+
+    fn responder(builder: NackResponderBuilder) -> NackResponderInterceptor {
+        let mut r = builder.with_rtt(Duration::ZERO).build();
+        r.bind_local_stream(&StreamInfo {
+            ssrc: SSRC,
+            rtcp_feedback: vec![crate::stream_info::RTCPFeedback {
+                typ: "nack".to_string(),
+                parameter: String::new(),
+            }],
+            ..Default::default()
+        });
+        r
+    }
+
+    /// 100 packets of 1,000 payload bytes (1,012 on the wire), one every 10 ms from `t0`.
+    fn send_media(r: &mut NackResponderInterceptor, t0: Instant) {
+        for seq in 0..100u16 {
+            r.handle_write(TaggedPacket {
+                now: t0 + Duration::from_millis(u64::from(seq) * 10),
+                transport: TransportContext::default(),
+                message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
+                    header: rtp::header::Header {
+                        version: 2,
+                        ssrc: SSRC,
+                        sequence_number: seq,
+                        ..Default::default()
+                    },
+                    payload: vec![0u8; 1000].into(),
+                })),
+            })
+            .unwrap();
+        }
+        while r.poll_write().is_some() {}
+    }
+
+    /// Ask for every sequence number in `seqs` at `now`; returns how many came back.
+    fn nack(r: &mut NackResponderInterceptor, now: Instant, seqs: std::ops::Range<u16>) -> usize {
+        nack_ssrc(r, now, SSRC, seqs)
+    }
+
+    fn nack_ssrc(
+        r: &mut NackResponderInterceptor,
+        now: Instant,
+        ssrc: u32,
+        seqs: std::ops::Range<u16>,
+    ) -> usize {
+        let nacks = seqs
+            .step_by(17)
+            .map(|packet_id| NackPair {
+                packet_id,
+                lost_packets: 0xFFFF,
+            })
+            .collect();
+        r.handle_read(TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(TransportLayerNack {
+                sender_ssrc: 1,
+                media_ssrc: ssrc,
+                nacks,
+            })])),
+        })
+        .unwrap();
+        while r.poll_read().is_some() {}
+        let mut count = 0;
+        while r.poll_write().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn storm_is_held_to_the_media_rate() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new());
+        send_media(&mut r, t0);
+        // 90 packets sent in the last second: half of that fits one window.
+        let sent = nack(&mut r, t0 + Duration::from_millis(1000), 0..85);
+        assert!((40..=45).contains(&sent), "sent {sent}");
+        let stats = r.stats();
+        assert_eq!(stats.retransmitted_packets, sent as u64);
+        assert!(stats.budget_dropped_packets >= 40);
+        assert!(stats.retransmitted_bytes <= 45_540);
+    }
+
+    #[test]
+    fn request_within_budget_is_answered() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new());
+        send_media(&mut r, t0);
+        assert_eq!(nack(&mut r, t0 + Duration::from_millis(1000), 10..11), 17);
+        assert_eq!(r.stats().budget_dropped_packets, 0);
+    }
+
+    #[test]
+    fn window_refills_after_its_width() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new());
+        send_media(&mut r, t0);
+        let first = nack(&mut r, t0 + Duration::from_millis(1000), 0..85);
+        // Inside the same window nothing more is answered.
+        assert_eq!(nack(&mut r, t0 + Duration::from_millis(1100), 0..85), 0);
+        // After it, the spent bytes have aged out and the budget is available again.
+        let later = nack(&mut r, t0 + Duration::from_millis(1600), 0..85);
+        assert!(first > 0 && later > 0, "{first} then {later}");
+    }
+
+    #[test]
+    fn target_bitrate_sets_the_budget() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new());
+        send_media(&mut r, t0);
+        // 80 kbit/s is 10,000 B/s: 5,000 B per window, four 1,012-byte packets.
+        r.handle_read(TaggedPacket {
+            now: t0 + Duration::from_millis(1000),
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![])).with(
+                Attribute::TargetBitrateChanged {
+                    bits_per_second: 80_000.0,
+                },
+            ),
+        })
+        .unwrap();
+        assert_eq!(nack(&mut r, t0 + Duration::from_millis(1000), 0..85), 4);
+    }
+
+    #[test]
+    fn target_budget_is_shared_by_all_streams() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new());
+        let second = SSRC + 1;
+        r.bind_local_stream(&StreamInfo {
+            ssrc: second,
+            rtcp_feedback: vec![crate::stream_info::RTCPFeedback {
+                typ: "nack".to_string(),
+                parameter: String::new(),
+            }],
+            ..Default::default()
+        });
+        send_media(&mut r, t0);
+        for seq in 0..100u16 {
+            r.handle_write(TaggedPacket {
+                now: t0 + Duration::from_millis(u64::from(seq) * 10),
+                transport: TransportContext::default(),
+                message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
+                    header: rtp::header::Header {
+                        version: 2,
+                        ssrc: second,
+                        sequence_number: seq,
+                        ..Default::default()
+                    },
+                    payload: vec![0u8; 1000].into(),
+                })),
+            })
+            .unwrap();
+        }
+        while r.poll_write().is_some() {}
+        let now = t0 + Duration::from_millis(1000);
+        r.handle_read(TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![])).with(
+                Attribute::TargetBitrateChanged {
+                    bits_per_second: 80_000.0,
+                },
+            ),
+        })
+        .unwrap();
+        // One 5,000-byte budget: four packets in all, not four per stream.
+        let total = nack(&mut r, now, 0..85) + nack_ssrc(&mut r, now, second, 0..85);
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn stale_packets_are_not_resent() {
+        let t0 = Instant::now();
+        let mut r =
+            responder(NackResponderBuilder::new().with_max_packet_age(Duration::from_secs(1)));
+        send_media(&mut r, t0);
+        // Packets 0..=9 left at t0..t0+90 ms; 95..=99 at t0+950..t0+990 ms. At t0+1.5 s the first
+        // are over a second old and the last are not.
+        let now = t0 + Duration::from_millis(1500);
+        assert_eq!(nack_ssrc(&mut r, now, SSRC, 0..1), 0);
+        assert_eq!(r.stats().stale_skipped_packets, 17);
+        assert_eq!(nack_ssrc(&mut r, now, SSRC, 85..86), 15);
+    }
+
+    #[test]
+    fn three_round_trips_outlast_the_max_age() {
+        let t0 = Instant::now();
+        let mut r =
+            responder(NackResponderBuilder::new().with_max_packet_age(Duration::from_secs(1)));
+        r.streams.get_mut(&SSRC).unwrap().rtt = Some(Duration::from_secs(2));
+        send_media(&mut r, t0);
+        // Packet 0 is 1.5 s old: past max_age, within 3 x 2 s.
+        assert_eq!(
+            nack_ssrc(&mut r, t0 + Duration::from_millis(1500), SSRC, 0..1),
+            17
+        );
+        assert_eq!(r.stats().stale_skipped_packets, 0);
+    }
+
+    #[test]
+    fn budget_can_be_switched_off() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new().with_retransmit_budget(false));
+        send_media(&mut r, t0);
+        assert_eq!(nack(&mut r, t0 + Duration::from_millis(1000), 0..85), 85);
+        assert_eq!(r.stats().budget_dropped_packets, 0);
+    }
 }

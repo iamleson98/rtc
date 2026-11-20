@@ -1,5 +1,7 @@
 //! Send buffer for storing RTP packets for NACK retransmission.
 
+use std::time::Instant;
+
 /// Half of u16 max value, used for sequence number wraparound detection.
 const UINT16_SIZE_HALF: u16 = 1 << 15;
 
@@ -15,7 +17,7 @@ const UINT16_SIZE_HALF: u16 = 1 << 15;
 /// number seen, so they fill from the start.
 pub(crate) struct SendBuffer {
     /// Circular buffer of packets, as long as the highest slot used so far.
-    packets: Vec<Option<rtp::Packet>>,
+    packets: Vec<Option<(rtp::Packet, Instant)>>,
     /// The sequence number of slot 0.
     origin: u16,
     /// Size of the buffer (must be power of 2).
@@ -76,13 +78,13 @@ impl SendBuffer {
     }
 
     /// Add an RTP packet to the buffer.
-    pub(crate) fn add(&mut self, packet: rtp::Packet) {
+    pub(crate) fn add(&mut self, packet: rtp::Packet, at: Instant) {
         let seq = packet.header.sequence_number;
 
         if !self.started {
             self.origin = seq;
             self.reserve_slot(0);
-            self.packets[0] = Some(packet);
+            self.packets[0] = Some((packet, at));
             self.highest_added = seq;
             self.started = true;
             return;
@@ -110,7 +112,7 @@ impl SendBuffer {
 
         let idx = self.slot(seq);
         self.reserve_slot(idx);
-        self.packets[idx] = Some(packet);
+        self.packets[idx] = Some((packet, at));
     }
 
     /// Get a packet by sequence number.
@@ -118,6 +120,15 @@ impl SendBuffer {
     /// Returns `None` if the packet is not in the buffer (either too old,
     /// never received, or was cleared).
     pub(crate) fn get(&self, seq: u16) -> Option<&rtp::Packet> {
+        self.entry(seq).map(|(packet, _)| packet)
+    }
+
+    /// When the packet with sequence number `seq` was buffered, if it still is.
+    pub(crate) fn stored_at(&self, seq: u16) -> Option<Instant> {
+        self.entry(seq).map(|(_, at)| *at)
+    }
+
+    fn entry(&self, seq: u16) -> Option<&(rtp::Packet, Instant)> {
         if !self.started {
             return None;
         }
@@ -132,14 +143,14 @@ impl SendBuffer {
             return None;
         }
 
-        let packet = self.packets.get(self.slot(seq))?.as_ref()?;
+        let entry = self.packets.get(self.slot(seq))?.as_ref()?;
 
         // Verify the sequence number matches (handle wraparound collisions)
-        if packet.header.sequence_number != seq {
+        if entry.0.header.sequence_number != seq {
             return None;
         }
 
-        Some(packet)
+        Some(entry)
     }
 }
 
@@ -179,7 +190,7 @@ mod tests {
         let mut buf = SendBuffer::new(8).unwrap();
 
         // Add packet
-        buf.add(make_packet(0));
+        buf.add(make_packet(0), Instant::now());
         assert!(buf.get(0).is_some());
         assert_eq!(buf.get(0).unwrap().header.sequence_number, 0);
 
@@ -193,7 +204,7 @@ mod tests {
 
         // Fill buffer
         for i in 0..8 {
-            buf.add(make_packet(i));
+            buf.add(make_packet(i), Instant::now());
         }
 
         // All packets should be retrievable
@@ -202,7 +213,7 @@ mod tests {
         }
 
         // Add packet that wraps (seq 8 overwrites seq 0's slot)
-        buf.add(make_packet(8));
+        buf.add(make_packet(8), Instant::now());
         assert!(buf.get(8).is_some());
         assert!(buf.get(0).is_none()); // Should be gone (different seq in same slot)
     }
@@ -211,12 +222,12 @@ mod tests {
     fn test_send_buffer_gap_clears_packets() {
         let mut buf = SendBuffer::new(8).unwrap();
 
-        buf.add(make_packet(0));
-        buf.add(make_packet(1));
-        buf.add(make_packet(2));
+        buf.add(make_packet(0), Instant::now());
+        buf.add(make_packet(1), Instant::now());
+        buf.add(make_packet(2), Instant::now());
 
         // Jump ahead, packets 3-4 should be cleared
-        buf.add(make_packet(5));
+        buf.add(make_packet(5), Instant::now());
 
         assert!(buf.get(0).is_some());
         assert!(buf.get(1).is_some());
@@ -231,12 +242,12 @@ mod tests {
         let mut buf = SendBuffer::new(8).unwrap();
 
         for i in 0..8 {
-            buf.add(make_packet(i));
+            buf.add(make_packet(i), Instant::now());
         }
 
         // Add more packets to push old ones out of range
         for i in 8..16 {
-            buf.add(make_packet(i));
+            buf.add(make_packet(i), Instant::now());
         }
 
         // Old packets should be out of range
@@ -255,10 +266,10 @@ mod tests {
         let mut buf = SendBuffer::new(8).unwrap();
 
         // Start near wraparound
-        buf.add(make_packet(65534));
-        buf.add(make_packet(65535));
-        buf.add(make_packet(0));
-        buf.add(make_packet(1));
+        buf.add(make_packet(65534), Instant::now());
+        buf.add(make_packet(65535), Instant::now());
+        buf.add(make_packet(0), Instant::now());
+        buf.add(make_packet(1), Instant::now());
 
         assert!(buf.get(65534).is_some());
         assert!(buf.get(65535).is_some());
@@ -270,9 +281,9 @@ mod tests {
     fn test_send_buffer_out_of_order() {
         let mut buf = SendBuffer::new(8).unwrap();
 
-        buf.add(make_packet(0));
-        buf.add(make_packet(2)); // Skip 1
-        buf.add(make_packet(1)); // Out of order
+        buf.add(make_packet(0), Instant::now());
+        buf.add(make_packet(2), Instant::now()); // Skip 1
+        buf.add(make_packet(1), Instant::now()); // Out of order
 
         assert!(buf.get(0).is_some());
         assert!(buf.get(1).is_some());
@@ -362,7 +373,7 @@ mod tests {
                         // The sender moves on by one.
                         _ => seq = seq.wrapping_add(1),
                     }
-                    buf.add(make_packet(seq));
+                    buf.add(make_packet(seq), Instant::now());
                     reference.add(make_packet(seq));
                     for _ in 0..4 {
                         let probe = seq.wrapping_sub((next() % (2 * u64::from(size) + 40)) as u16);
@@ -382,7 +393,7 @@ mod tests {
         let mut buf = SendBuffer::new(1024).unwrap();
         // A stream starts anywhere in the sequence space; its first packets must not cost a window.
         for seq in 40_000..40_100u16 {
-            buf.add(make_packet(seq));
+            buf.add(make_packet(seq), Instant::now());
         }
         assert!(
             buf.packets.capacity() <= 128,
@@ -391,7 +402,7 @@ mod tests {
         );
         // And it still fills to the window and no further.
         for seq in 40_100..45_000u16 {
-            buf.add(make_packet(seq));
+            buf.add(make_packet(seq), Instant::now());
         }
         assert_eq!(buf.packets.capacity(), 1024);
         assert!(buf.get(44_999).is_some());
