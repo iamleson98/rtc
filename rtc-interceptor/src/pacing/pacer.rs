@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 /// larger-than-burst path and the rate would stop being enforced at all.
 pub const MIN_BURST_BITS: f64 = 8.0 * 1500.0;
 
+/// Time a derived burst covers unless told otherwise: 100 ms.
+pub const DEFAULT_BURST_WINDOW: Duration = Duration::from_millis(100);
+
 /// A token bucket in bits, refilled from elapsed time.
 ///
 /// Unlike upstream's `rate.Limiter`, nothing here reads a clock: the budget is a pure function of
@@ -26,6 +29,8 @@ pub struct Pacer {
     /// a field instead would lose which of the two it was the moment it was written, and
     /// [`Pacer::set_target_bitrate`] could not tell whether it was allowed to replace it.
     configured_burst_bits: Option<f64>,
+    /// How much time at the current rate a derived burst covers, in seconds.
+    burst_window_secs: f64,
     /// Currently available budget, in bits.
     budget_bits: f64,
     /// When the budget was last brought up to date.
@@ -38,12 +43,25 @@ impl Pacer {
     /// Starting full rather than empty lets a connection send immediately instead of waiting out
     /// one burst's worth of accumulation, which is what upstream's limiter does too.
     pub fn new(bits_per_second: f64) -> Self {
-        Self {
+        let mut pacer = Self {
             bitrate: bits_per_second.max(0.0),
             configured_burst_bits: None,
-            budget_bits: Self::burst_for(bits_per_second),
+            burst_window_secs: DEFAULT_BURST_WINDOW.as_secs_f64(),
+            budget_bits: 0.0,
             last_refill: None,
-        }
+        };
+        pacer.budget_bits = pacer.burst_bits();
+        pacer
+    }
+
+    /// How much time at the current rate a derived burst covers (default 100 ms).
+    ///
+    /// Ignored when a burst was set with [`Pacer::with_burst_bits`]. The burst still never drops
+    /// below one packet.
+    pub fn with_burst_window(mut self, window: Duration) -> Self {
+        self.burst_window_secs = window.as_secs_f64();
+        self.budget_bits = self.budget_bits.min(self.burst_bits());
+        self
     }
 
     /// Override the burst size, in bits.
@@ -57,9 +75,9 @@ impl Pacer {
         self
     }
 
-    /// The burst that goes with a rate: a tenth of a second's worth, floored at one packet.
-    fn burst_for(bits_per_second: f64) -> f64 {
-        (bits_per_second / 10.0).max(MIN_BURST_BITS)
+    /// The burst that goes with a rate: the burst window's worth, floored at one packet.
+    fn burst_for(&self, bits_per_second: f64) -> f64 {
+        (bits_per_second * self.burst_window_secs).max(MIN_BURST_BITS)
     }
 
     /// The rate currently being paced at, in bits per second.
@@ -162,7 +180,7 @@ impl Pacer {
     /// than [`Pacer::can_afford`].
     pub fn burst_bits(&self) -> f64 {
         self.configured_burst_bits
-            .unwrap_or_else(|| Self::burst_for(self.bitrate))
+            .unwrap_or_else(|| self.burst_for(self.bitrate))
     }
 }
 
@@ -357,6 +375,17 @@ mod tests {
             "a rate change must not widen a burst the caller set"
         );
         assert_eq!(100_000_000.0, pacer.target_bitrate());
+    }
+
+    #[test]
+    fn a_burst_window_sets_the_derived_burst_and_keeps_the_one_packet_floor() {
+        // 5 ms at 8 Mb/s is 40 000 bits.
+        let mut pacer = Pacer::new(8_000_000.0).with_burst_window(Duration::from_millis(5));
+        assert_eq!(40_000.0, pacer.burst_bits());
+        assert_eq!(40_000.0, pacer.budget_bits());
+
+        pacer.set_target_bitrate(100_000.0);
+        assert_eq!(MIN_BURST_BITS, pacer.burst_bits());
     }
 
     /// The derived default still tracks the rate — pinning is opt-in, not the new default.

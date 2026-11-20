@@ -325,7 +325,9 @@ pub use noop::NoopInterceptor;
 pub use pacing::pacer::{MIN_BURST_BITS as PACER_MIN_BURST_BITS, Pacer};
 pub use pacing::sender::{
     DEFAULT_BITRATE as PACER_DEFAULT_BITRATE, DEFAULT_QUEUE_LIMIT as PACER_DEFAULT_QUEUE_LIMIT,
-    PacerBuilder, PacerInterceptor,
+    DEFAULT_SEND_RATE_BURST_WINDOW as PACER_DEFAULT_SEND_RATE_BURST_WINDOW,
+    DEFAULT_SEND_RATE_MULTIPLIER as PACER_DEFAULT_SEND_RATE_MULTIPLIER, PacerBuilder,
+    PacerInterceptor,
 };
 pub use packet::{Attribute, AttributedPacket, Packet, TaggedPacket};
 pub use packetdump::{
