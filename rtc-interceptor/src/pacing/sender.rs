@@ -33,11 +33,12 @@ const SLOTS: usize = 10;
 enum PaceMode {
     /// Follow the congestion controller's target bitrate.
     FollowTarget,
-    /// `multiplier` times the paced bytes sent over the last second, floored at `min_bitrate`.
+    /// `multiplier` times the paced bytes the application handed over in the last second, floored
+    /// at `min_bitrate`.
     SendRate { multiplier: f64, min_bitrate: f64 },
 }
 
-/// Paced bits sent over roughly the last second, in fixed slots so nothing grows per packet.
+/// Paced bits seen over roughly the last second, in fixed slots so nothing grows per packet.
 #[derive(Debug, Clone, Default)]
 struct SendRate {
     start: Option<Instant>,
@@ -129,13 +130,15 @@ impl PacerBuilder {
         self
     }
 
-    /// Pace at `multiplier` times the paced bytes sent over the last second instead of following
-    /// the congestion controller's target (default multiplier 2.0).
+    /// Pace at `multiplier` times the paced bytes the application handed over in the last second
+    /// instead of following the congestion controller's target (default multiplier 2.0).
     ///
     /// The pacer then never throttles the steady rate — whoever chooses the bitrate decides it —
-    /// and only spreads bursts out. The rate is floored at [`PacerBuilder::with_min_bitrate`],
-    /// which is also the rate before anything has been sent. Audio is sent unpaced and does not
-    /// count towards the rate.
+    /// and only spreads bursts out. The rate follows what *arrives*, not what has been released: a
+    /// rate derived from releases falls when a backlog forms, and a backlog would then lower the
+    /// rate it needs to drain. It is floored at [`PacerBuilder::with_min_bitrate`], which is also
+    /// the rate before anything has arrived. Audio is sent unpaced and does not count towards the
+    /// rate.
     pub fn with_send_rate_multiplier(mut self, multiplier: f64) -> Self {
         let min_bitrate = match self.mode {
             PaceMode::SendRate { min_bitrate, .. } => min_bitrate,
@@ -166,7 +169,9 @@ impl PacerBuilder {
     /// How much time at the pace rate one burst covers, floored at one packet.
     ///
     /// Defaults to 5 ms in the send-rate mode and 100 ms when following the target. Ignored when
-    /// [`PacerBuilder::with_burst_bits`] is set.
+    /// [`PacerBuilder::with_burst_bits`] is set. The burst limits what an idle pacer releases at
+    /// once; while packets are queued, a late wake-up is credited the time it was late up to
+    /// [`PACER_BACKLOG_CATCH_UP_WINDOW`](crate::PACER_BACKLOG_CATCH_UP_WINDOW) of the rate.
     pub fn with_burst_window(mut self, window: Duration) -> Self {
         self.burst_window = Some(window);
         self
@@ -228,8 +233,11 @@ pub struct PacerInterceptor {
     queue: VecDeque<TaggedPacket>,
     queue_limit: usize,
     mode: PaceMode,
-    /// Paced bits sent recently; feeds the send-rate mode.
-    sent: SendRate,
+    /// Paced bits handed over by the application recently; feeds the send-rate mode.
+    ///
+    /// Measured on arrival rather than release so that a backlog cannot lower the rate it is
+    /// drained at.
+    arrived: SendRate,
     /// SSRCs of local audio streams, which skip the queue.
     audio_ssrcs: HashSet<u32>,
     /// Packets refused because the queue was full.
@@ -247,7 +255,7 @@ impl PacerInterceptor {
     fn new(pacer: LeakyBucket, queue_limit: usize, mode: PaceMode) -> Self {
         Self {
             mode,
-            sent: SendRate::default(),
+            arrived: SendRate::default(),
             audio_ssrcs: HashSet::new(),
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
@@ -287,15 +295,24 @@ impl PacerInterceptor {
         }
     }
 
-    /// In the send-rate mode, set the rate from what was sent over the last second.
+    /// In the send-rate mode, set the rate from what arrived over the last second.
     fn update_rate(&mut self, now: Instant) {
         if let PaceMode::SendRate {
             multiplier,
             min_bitrate,
         } = self.mode
         {
-            let rate = (self.sent.bits_per_second(now) * multiplier).max(min_bitrate);
+            let rate = (self.arrived.bits_per_second(now) * multiplier).max(min_bitrate);
             self.pacer.set_target_bitrate(rate);
+        }
+    }
+
+    /// Bring the budget up to `now`, crediting a late wake-up in full while packets are queued.
+    fn refill(&mut self, now: Instant) {
+        if self.queue.is_empty() {
+            self.pacer.refill(now);
+        } else {
+            self.pacer.refill_backlogged(now);
         }
     }
 
@@ -365,7 +382,11 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
 
         // Keeping the budget current at enqueue time is what lets `poll_timeout` compute a
         // deadline that is never in the past, even before the first `handle_timeout`.
-        self.pacer.refill(msg.now);
+        //
+        // The arrival is metered before the limit check: a packet refused because the queue is
+        // full is still demand the pacer has to be able to drain.
+        self.arrived.record(msg.now, Self::bits_of(&msg));
+        self.refill(msg.now);
         self.update_rate(msg.now);
 
         if self.queue.len() >= self.queue_limit {
@@ -391,7 +412,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
-        self.pacer.refill(now);
+        self.refill(now);
         self.update_rate(now);
 
         while let Some(head) = self.queue.front() {
@@ -402,7 +423,6 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
 
             let mut packet = self.queue.pop_front().expect("front just checked");
             self.pacer.consume(bits);
-            self.sent.record(now, bits);
             // Rule 3: the packet departs now. Anything below recording departure — the send
             // history congestion control reads — must see the release instant, not the enqueue
             // instant, or this queueing delay is charged to the network.
@@ -513,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pace_rate_follows_twice_the_send_rate() {
+    fn the_pace_rate_follows_twice_the_arrival_rate() {
         let start = Instant::now();
         let mut pacer = PacerBuilder::new()
             .with_send_rate_multiplier(2.0)
@@ -521,29 +541,135 @@ mod tests {
             .build();
         assert_eq!(100_000.0, pacer.pacer().target_bitrate());
 
-        // 50 packets over the first half second, released as the budget allows.
+        // 50 packets over the first half second.
         for seq in 0..50 {
             pacer.handle_write(rtp(start, 1, seq)).unwrap();
         }
-        let mut at = Duration::ZERO;
-        while at < Duration::from_millis(500) {
-            at += Duration::from_millis(1);
-            pacer.handle_timeout(start + at).unwrap();
-        }
-        let sent_bits = (50 - pacer.queued()) as f64 * PACKET_BITS;
-        assert!(sent_bits > 0.0);
 
-        // Inside the window the rate is twice what went out, over one second.
+        // Inside the window the rate is twice what arrived, over one second.
         pacer
             .handle_timeout(start + Duration::from_millis(500))
             .unwrap();
-        assert_eq!(2.0 * sent_bits, pacer.pacer().target_bitrate());
+        assert_eq!(2.0 * 50.0 * PACKET_BITS, pacer.pacer().target_bitrate());
 
         // Two seconds on, the window is empty and the floor holds.
         pacer
             .handle_timeout(start + Duration::from_secs(3))
             .unwrap();
         assert_eq!(100_000.0, pacer.pacer().target_bitrate());
+    }
+
+    /// A backlog must not lower the rate it is drained at: the rate follows what arrives, so
+    /// packets that have not been released yet still count.
+    #[test]
+    fn a_backlog_does_not_lower_the_pace_rate() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new()
+            .with_send_rate_multiplier(2.0)
+            .with_min_bitrate(1_000_000.0)
+            .build();
+
+        // 6 Mb/s for a second (one packet every 2 ms) while the wake-up never comes.
+        for seq in 0..500u16 {
+            let at = start + Duration::from_millis(2 * u64::from(seq));
+            pacer.handle_write(rtp(at, 1, seq)).unwrap();
+        }
+        assert_eq!(500, pacer.queued(), "nothing was released");
+        assert!(
+            pacer.pacer().target_bitrate() >= 11_000_000.0,
+            "{}",
+            pacer.pacer().target_bitrate()
+        );
+
+        pacer
+            .handle_timeout(start + Duration::from_millis(999))
+            .unwrap();
+        assert!(
+            pacer.pacer().target_bitrate() >= 11_000_000.0,
+            "{}",
+            pacer.pacer().target_bitrate()
+        );
+    }
+
+    /// The SFU's shard loop is woken late when many sessions renegotiate at once. Steady video
+    /// must still leave at the rate it arrives, and wait no longer than the wake-ups are apart.
+    #[test]
+    fn a_late_wake_up_does_not_cost_throughput_or_queue_the_video() {
+        let start = Instant::now();
+        let wake_every_ms = 30;
+        let mut pacer = PacerBuilder::new().with_send_rate_multiplier(2.0).build();
+
+        // One 1500-byte packet every 2 ms is 6 Mb/s. The first two seconds let the rate settle;
+        // only the last two are measured.
+        let mut enqueued_at = Vec::new();
+        let mut released_bits = 0.0;
+        let mut max_delay = Duration::ZERO;
+        for ms in 0..4_000u64 {
+            let now = start + Duration::from_millis(ms);
+            if ms % wake_every_ms == 0 {
+                pacer.handle_timeout(now).unwrap();
+                for seq in drain(&mut pacer) {
+                    if ms >= 2_000 {
+                        released_bits += PACKET_BITS;
+                        max_delay = max_delay.max(now - enqueued_at[usize::from(seq)]);
+                    }
+                }
+            }
+            if ms % 2 == 0 {
+                pacer
+                    .handle_write(rtp(now, 1, enqueued_at.len() as u16))
+                    .unwrap();
+                enqueued_at.push(now);
+            }
+        }
+
+        let arrived_bits = 2.0 * 6_000_000.0;
+        assert!(
+            (0.95 * arrived_bits..=1.05 * arrived_bits).contains(&released_bits),
+            "released {released_bits} of {arrived_bits} bits"
+        );
+        assert!(
+            max_delay <= Duration::from_millis(2 * wake_every_ms),
+            "a packet waited {max_delay:?}"
+        );
+    }
+
+    /// A wake-up that comes late with packets queued releases what the elapsed time earned, not
+    /// one burst.
+    #[test]
+    fn a_late_wake_up_releases_what_the_elapsed_time_earned() {
+        let start = Instant::now();
+        // 8 Mb/s: a burst is 40 000 bits, three whole packets.
+        let mut pacer = PacerBuilder::new().with_min_bitrate(8_000_000.0).build();
+        for seq in 0..100 {
+            pacer.handle_write(rtp(start, 1, seq)).unwrap();
+        }
+        pacer.handle_timeout(start).unwrap();
+        assert_eq!(3, drain(&mut pacer).len());
+
+        // 50 ms is 400 000 bits on top of the 4 000 left over: 33 packets.
+        pacer
+            .handle_timeout(start + Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(33, drain(&mut pacer).len());
+    }
+
+    /// However late the wake-up, no more than the catch-up window's worth leaves at once.
+    #[test]
+    fn a_very_late_wake_up_is_capped_at_the_catch_up_window() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new().with_min_bitrate(8_000_000.0).build();
+        for seq in 0..100 {
+            pacer.handle_write(rtp(start, 1, seq)).unwrap();
+        }
+        pacer.handle_timeout(start).unwrap();
+        assert_eq!(3, drain(&mut pacer).len());
+
+        // 100 ms at 8 Mb/s is 800 000 bits: 66 packets.
+        pacer
+            .handle_timeout(start + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(66, drain(&mut pacer).len());
     }
 
     #[test]
@@ -594,6 +720,23 @@ mod tests {
             pacer.handle_write(rtp(start, 1, seq)).unwrap();
         }
         pacer.handle_timeout(start).unwrap();
+        assert_eq!(3, drain(&mut pacer).len());
+    }
+
+    /// An idle pacer does not store up an allowance: after a long silence the first burst is the
+    /// burst, however long the silence was.
+    #[test]
+    fn an_idle_burst_is_still_capped() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new().with_min_bitrate(8_000_000.0).build();
+        pacer.handle_timeout(start).unwrap();
+
+        let later = start + Duration::from_secs(10);
+        for seq in 0..20 {
+            pacer.handle_write(rtp(later, 1, seq)).unwrap();
+        }
+        pacer.handle_timeout(later).unwrap();
+
         assert_eq!(3, drain(&mut pacer).len());
     }
 }

@@ -324,7 +324,10 @@ pub use nack::responder::{
     NackResponderBuilder, NackResponderInterceptor, NackResponderStats, ResponderStreamsFilter,
 };
 pub use noop::NoopInterceptor;
-pub use pacing::pacer::{MIN_BURST_BITS as PACER_MIN_BURST_BITS, Pacer};
+pub use pacing::pacer::{
+    BACKLOG_CATCH_UP_WINDOW as PACER_BACKLOG_CATCH_UP_WINDOW, MIN_BURST_BITS as PACER_MIN_BURST_BITS,
+    Pacer,
+};
 pub use pacing::sender::{
     DEFAULT_BITRATE as PACER_DEFAULT_BITRATE, DEFAULT_QUEUE_LIMIT as PACER_DEFAULT_QUEUE_LIMIT,
     DEFAULT_SEND_RATE_BURST_WINDOW as PACER_DEFAULT_SEND_RATE_BURST_WINDOW,

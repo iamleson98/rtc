@@ -12,6 +12,17 @@ pub const MIN_BURST_BITS: f64 = 8.0 * 1500.0;
 /// Time a derived burst covers unless told otherwise: 100 ms.
 pub const DEFAULT_BURST_WINDOW: Duration = Duration::from_millis(100);
 
+/// The most time at the current rate a pacer with packets waiting credits for a late wake-up:
+/// 100 ms.
+///
+/// The burst bounds what an *idle* sender may put on the wire at once, which is why it is small. A
+/// sender with a queue is in a different position: the packets were already due, and the time the
+/// wake-up was late is time the rate has really earned. Capping that at a few milliseconds of rate
+/// (the send-rate mode's burst) lets a wake-up `T` ms late release only `burst / T` of the rate, so
+/// the queue grows and the delay lands on the receiver as a freeze. The cap keeps even a very late
+/// wake-up from releasing more than this much at once.
+pub const BACKLOG_CATCH_UP_WINDOW: Duration = Duration::from_millis(100);
+
 /// A token bucket in bits, refilled from elapsed time.
 ///
 /// Unlike upstream's `rate.Limiter`, nothing here reads a clock: the budget is a pure function of
@@ -35,6 +46,8 @@ pub struct Pacer {
     budget_bits: f64,
     /// When the budget was last brought up to date.
     last_refill: Option<Instant>,
+    /// Whether packets were waiting at the last refill, which decides how far the budget may grow.
+    backlogged: bool,
 }
 
 impl Pacer {
@@ -49,6 +62,7 @@ impl Pacer {
             burst_window_secs: DEFAULT_BURST_WINDOW.as_secs_f64(),
             budget_bits: 0.0,
             last_refill: None,
+            backlogged: false,
         };
         pacer.budget_bits = pacer.burst_bits();
         pacer
@@ -89,23 +103,54 @@ impl Pacer {
     ///
     /// Synchronous and immediate, because this is what a bandwidth estimator drives: it computes
     /// a new target and the very next release must respect it. Accumulated budget is kept but
-    /// clamped to the new burst, so lowering the rate cannot leave a large budget behind that
-    /// would let a burst out at the old rate.
+    /// clamped to the new cap (see [`Pacer::refill_backlogged`]), so lowering the rate cannot leave
+    /// a large budget behind that would let a burst out at the old rate.
     ///
     /// A burst set through [`Pacer::with_burst_bits`] survives this; only a burst that was derived
     /// from the rate follows the rate.
     pub fn set_target_bitrate(&mut self, bits_per_second: f64) {
         self.bitrate = bits_per_second.max(0.0);
-        self.budget_bits = self.budget_bits.min(self.burst_bits());
+        self.budget_bits = self.budget_bits.min(self.budget_cap());
     }
 
-    /// Bring the budget up to `now`.
+    /// Bring the budget up to `now`, with nothing waiting to be sent.
+    ///
+    /// The budget caps at the burst: an idle sender must not store up an allowance and release it
+    /// all at once when it resumes.
     pub fn refill(&mut self, now: Instant) {
+        self.refill_with(now, false);
+    }
+
+    /// Bring the budget up to `now`, with packets waiting to be sent.
+    ///
+    /// Credits the whole time that has passed, however late `now` is, up to the larger of the burst
+    /// and [`BACKLOG_CATCH_UP_WINDOW`] at the current rate. A waiting packet is already due, so the
+    /// time it waited past its slot was earned by the rate and is not an idle allowance; capping it
+    /// at the burst would make every late wake-up permanently lose throughput. A configured burst
+    /// still decides how much an idle sender releases at once; it only stops being the limit on
+    /// catching up.
+    pub fn refill_backlogged(&mut self, now: Instant) {
+        self.refill_with(now, true);
+    }
+
+    fn refill_with(&mut self, now: Instant, backlogged: bool) {
+        self.backlogged = backlogged;
         if let Some(last) = self.last_refill {
             let elapsed = now.saturating_duration_since(last).as_secs_f64();
-            self.budget_bits = (self.budget_bits + elapsed * self.bitrate).min(self.burst_bits());
+            self.budget_bits = (self.budget_bits + elapsed * self.bitrate).min(self.budget_cap());
         }
         self.last_refill = Some(now);
+    }
+
+    /// The most the budget may hold now: the burst, or with packets waiting the catch-up window's
+    /// worth of the rate when that is more.
+    fn budget_cap(&self) -> f64 {
+        let burst_bits = self.burst_bits();
+        if self.backlogged {
+            burst_bits.max(self.bitrate * BACKLOG_CATCH_UP_WINDOW.as_secs_f64())
+        } else {
+            burst_bits
+        }
     }
 
     /// Whether `bits` can be sent now.
@@ -173,10 +218,11 @@ impl Pacer {
         self.affordable_at(bits.min(self.burst_bits()))
     }
 
-    /// The maximum the budget can accumulate to, in bits.
+    /// The maximum the budget can accumulate to while idle, in bits.
     ///
-    /// Anything larger than this can never be afforded by waiting, however long the wait — the
-    /// budget caps here — which is why release is asked for through [`Pacer::can_release`] rather
+    /// Anything larger than this can never be afforded by waiting for an idle bucket to fill — the
+    /// budget caps here, and a backlogged one catches up only to [`BACKLOG_CATCH_UP_WINDOW`] — which
+    /// is why release is asked for through [`Pacer::can_release`] rather
     /// than [`Pacer::can_afford`].
     pub fn burst_bits(&self) -> f64 {
         self.configured_burst_bits
@@ -254,6 +300,64 @@ mod tests {
         pacer.refill(now + Duration::from_secs(60));
 
         assert_eq!(MIN_BURST_BITS, pacer.budget_bits());
+    }
+
+    /// A wake-up that comes late with packets waiting is credited the time it was late, instead of
+    /// being limited to one burst: the rate earned it.
+    #[test]
+    fn a_backlogged_refill_credits_a_late_wake_up_beyond_the_burst() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(8_000_000.0).with_burst_window(Duration::from_millis(5));
+        pacer.refill_backlogged(now);
+        pacer.consume(pacer.budget_bits());
+        assert_eq!(40_000.0, pacer.burst_bits());
+
+        // 50 ms late at 8 Mb/s is 400 000 bits, ten bursts.
+        pacer.refill_backlogged(now + Duration::from_millis(50));
+
+        assert!(
+            (pacer.budget_bits() - 400_000.0).abs() < 1.0,
+            "{}",
+            pacer.budget_bits()
+        );
+    }
+
+    /// Even a very late wake-up releases at most the catch-up window's worth at once.
+    #[test]
+    fn a_backlogged_refill_is_capped_at_the_catch_up_window() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(8_000_000.0).with_burst_window(Duration::from_millis(5));
+        pacer.refill_backlogged(now);
+
+        pacer.refill_backlogged(now + Duration::from_secs(10));
+
+        assert_eq!(800_000.0, pacer.budget_bits());
+    }
+
+    /// An idle sender keeps the burst cap, so it cannot store up an allowance.
+    #[test]
+    fn an_idle_refill_stays_capped_at_the_burst_at_any_rate() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(8_000_000.0).with_burst_window(Duration::from_millis(5));
+        pacer.refill(now);
+
+        pacer.refill(now + Duration::from_secs(10));
+
+        assert_eq!(40_000.0, pacer.budget_bits());
+    }
+
+    /// A rate cut during a backlog must not leave the credit built at the old rate behind.
+    #[test]
+    fn lowering_the_rate_clamps_a_backlog_credit_to_the_new_cap() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(8_000_000.0).with_burst_window(Duration::from_millis(5));
+        pacer.refill_backlogged(now);
+        pacer.refill_backlogged(now + Duration::from_secs(10));
+        assert_eq!(800_000.0, pacer.budget_bits());
+
+        pacer.set_target_bitrate(1_000_000.0);
+
+        assert_eq!(100_000.0, pacer.budget_bits(), "100 ms at the new rate");
     }
 
     #[test]
