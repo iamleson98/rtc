@@ -603,6 +603,25 @@ class Attacks(Fixture):
         self.assertEqual((m["cpu_sat"], m["fds_slope"]), (100.0, 0.0))
 
 
+class FreezeCountNeedsFreezeTime(unittest.TestCase):
+    """A freeze-count breach stands only when the freeze time breaches its own limit."""
+
+    def test_more_freezes_of_about_the_same_frozen_time_is_ok(self):
+        rules = dict(report.DEFAULTS)
+        # Both frozen nearly all minute; the subject 0.6 % more frozen, but it shows frames, so it freezes more often.
+        s, b = {"freeze_ms": 48857}, {"freeze_ms": 48561}
+        self.assertEqual(report.freezes_only_if_frozen("freeze_rate", "BREACH", s, b, rules), "ok")
+
+    def test_more_freezes_and_breaching_freeze_time_stays_a_breach(self):
+        rules = dict(report.DEFAULTS)
+        s, b = {"freeze_ms": 9000}, {"freeze_ms": 3000}
+        self.assertEqual(report.freezes_only_if_frozen("freeze_rate", "BREACH", s, b, rules), "BREACH")
+
+    def test_other_metrics_are_untouched(self):
+        self.assertEqual(report.freezes_only_if_frozen("freeze_ms", "BREACH", {"freeze_ms": 1}, {"freeze_ms": 2},
+                                                       dict(report.DEFAULTS)), "BREACH")
+
+
 if __name__ == "__main__":
     unittest.main()
 
