@@ -397,7 +397,7 @@ concealed audio % (concealed samples over the samples played at 48 kHz) and FEC 
 `sfu_restart` the recovery table: for each track that was receiving before the restart, the seconds until the
 first interval that began after it carries packets (p50, p95, max; `never` when none within
 `recover_window_s`). The closes, signaling drops, ICE disconnects and process errors within 60 s after a
-logged `sfu_restart` are not counted; outside that span they are. `report.html` charts subject against baseline over the run, with the phases shaded.
+logged `sfu_restart` are not counted, and its intervals leave the phase rows (freezes, audio gap, loss ...) and the stall count the way an outage span does; the restart table counts its stalls, freeze ms and audio gap ms instead. Outside that span everything counts. `report.html` charts subject against baseline over the run, with the phases shaded.
 
 With `attack` rows, per architecture and per attack class (scope `attack`, the class in the phase
 column) the metrics of the innocent receivers: every receiver of the `clean` group, and those of

@@ -389,9 +389,16 @@ def server_span(ents):
     return max(last) if last else max(e.t1 for e in ents)
 
 
+def restart_spans(run):
+    """(start, end) of what each `sfu_restart` the harness logged excuses: from one sample interval
+    before it (the clocks) to RESTART_GRACE_S after. What happens in it is the restart's, booked in the
+    restart recovery table, the way an outage's is booked apart from the phase rows."""
+    return [(r - SAMPLE_S, r + RESTART_GRACE_S) for r, _ in run.restarts]
+
+
 def after_restart(run, t):
-    """Whether t falls in the span an SFU restart the harness logged excuses."""
-    return any(r - SAMPLE_S <= t <= r + RESTART_GRACE_S for r, _ in run.restarts)
+    """Whether t falls in a span an SFU restart excuses."""
+    return any(a <= t <= b for a, b in restart_spans(run))
 
 
 def mean(xs):
@@ -454,6 +461,8 @@ def stalls(s):
     outages = [t for t, name in s.run.phases(s.group) if name == "outage"]
 
     def excused(t):
+        if after_restart(s.run, t):
+            return True
         if s.group not in s.run.timeline:
             return False
         if s.run.phase_at(s.group, t)[0] == "outage" or s.run.phase_at(s.group, t - SAMPLE_S)[0] == "outage":
@@ -473,6 +482,17 @@ def stalls(s):
     if ep is not None and not ep[2]:
         out.append((ep[0], ep[1] - ep[0] + SAMPLE_S))
     return out
+
+
+def stall_starts(s):
+    """The times at which a stall episode of a series began, whatever excuses it."""
+    starts, prev = [], False
+    for r in s.s:
+        stalled = bool(r.get("stalled"))
+        if stalled and not prev:
+            starts.append(r["t"])
+        prev = stalled
+    return starts
 
 
 def departures(ent):
@@ -546,10 +566,18 @@ def restart_table(ents, rules):
     for e in sorted(ents, key=lambda e: (e.run.stem, e.impl)):
         for detail, t, secs in restart_recovery(e, rules):
             if secs:
+                span = (t - SAMPLE_S, t + RESTART_GRACE_S)
+                sers = e.recv_series()
                 body.append([e.run.stem, e.impl, e.arch, detail, "%.1f" % (t / 60.0), str(len(secs)),
-                             fmt(quantile(secs, 0.5), 1), fmt(quantile(secs, 0.95), 1), fmt(max(secs), 1)])
-    return ("SFU restart recovery (seconds until a track receives again)",
-            ["File", "Impl", "Arch", "Restart", "At min", "Tracks", "p50 s", "p95 s", "max s"], body) if body else None
+                             fmt(quantile(secs, 0.5), 1), fmt(quantile(secs, 0.95), 1), fmt(max(secs), 1),
+                             str(sum(1 for s in sers for st in stall_starts(s) if span[0] <= st <= span[1])),
+                             "%.0f" % sum(i["freeze_ms"] for s in sers if s.media == "video"
+                                          for i in s.ivs if in_span(i, [span])),
+                             "%.0f" % sum(i["audio_gap_ms"] for s in sers if s.media == "audio"
+                                          for i in s.ivs if in_span(i, [span]))])
+    return ("SFU restart recovery (seconds until a track receives again; stalls, freeze and audio gap in the excused span)",
+            ["File", "Impl", "Arch", "Restart", "At min", "Tracks", "p50 s", "p95 s", "max s", "Stalls", "Freeze ms",
+             "Audio gap ms"], body) if body else None
 
 
 def slope_mb_per_h(s, t_from, field="rss_mb"):
@@ -660,6 +688,10 @@ def scope_metrics(ents, group, phase, rules, drop=None):
         keep = lambda i: id(i) not in dropped
         base = pred
         pred = lambda i: base(i) and keep(i)
+    restarted = {id(i) for s in sers if s.run.restarts for i in s.ivs if in_span(i, restart_spans(s.run))}
+    if restarted:
+        base_pred = pred
+        pred = lambda i: base_pred(i) and id(i) not in restarted
     ivs = [i for s in sers for i in s.ivs if pred(i)]
     packets = sum(i["packets"] for i in ivs)
     dup = sum(i["duplicates"] for i in ivs)

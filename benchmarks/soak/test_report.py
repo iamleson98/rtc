@@ -854,6 +854,32 @@ class SfuRestart(unittest.TestCase):
         self.assertEqual(report.sfu_metrics(entities(("x", restart_run("rtcd-rs", extra=late))), dict(report.DEFAULTS))["sfu_errors"], 1)
 
 
+class RestartIsBookedApart(unittest.TestCase):
+    def rows(self, restart):
+        rows = restart_run("rtcd-rs", down=(105, 125))
+        if not restart:
+            rows = [r for r in rows if r.get("what") != "sfu_restart"]
+        for r in rows:
+            if r.get("id") == "s01/video:teacher" and 105 <= (r["ts"] - T0) / 1000 < 125:
+                r["stalled"] = True
+                r["freezes"], r["freeze_ms"] = 1, 4000
+            elif r.get("id") == "s01/video:teacher" and (r["ts"] - T0) / 1000 >= 125:
+                r["freezes"], r["freeze_ms"] = 1, 4000
+        return rows
+
+    def test_stalls_and_freezes_in_the_span_are_not_in_the_phase_rows_but_in_the_table(self):
+        rules = dict(report.DEFAULTS)
+        plain = report.scope_metrics(entities(("x", self.rows(False))), "impaired", None, rules)
+        self.assertEqual(plain["stalls"], 1)
+        self.assertGreater(plain["freeze_ms"], 0)
+        booked = report.scope_metrics(entities(("x", self.rows(True))), "impaired", None, rules)
+        self.assertEqual(booked["stalls"], 0)
+        self.assertEqual(booked["freeze_ms"], 0)
+        _, md, _, _ = run_report(self.rows(True), self.rows(True))
+        row = next(l for l in md.splitlines() if l.startswith("| rtcd-rs-x86_64 | rtcd-rs | x86_64 | 1 | 1.7 |"))
+        self.assertTrue(row.endswith("| 1 | 4000 | 0 |"), row)
+
+
 def client_proc(name, cpu, cores, end=100):
     return [{"ts": ts(t), "impl": "rtcd-rs", "arch": "x86_64", "kind": "proc", "id": "client:" + name, "cpu_pct": cpu(t),
              "cores": cores} for t in range(0, end, STEP)]
