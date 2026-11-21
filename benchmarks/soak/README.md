@@ -76,8 +76,10 @@ impairs the path; no peer CPU-saturated and the host load average within its CPU
 and 10 % of the samples); and the files are one run (one `run` record each, the same seed, profile and
 length, started within 24 h). Two more apply when the rows exist: no `client:*` container (a client's
 `proc` row, `cpu_pct` of one core, `cores` its CPU limit) above `valid_client_cpu_pct` (90) % of its cores in
-more than 5 % of its samples, and no more than 1 % of the audio `delay_p50_ms` / `delay_p95_ms` values outside
+more than 5 % of its samples, and no more than 1 % of the `clean` group's audio `delay_p50_ms` / `delay_p95_ms` values (the impaired group's delay is real, abuse scenes add seconds of it) outside
 0 to `valid_delay_max_ms` (2000) ms, which would mean the sender-to-receiver clock mapping is broken.
+
+A failed check of a file that is only ever a pair's baseline (such as an overloaded baseline SFU) does not void the run: the table marks it `baseline INVALID`, that pair's comparison reads "baseline invalid (reason)" with no verdict rows, and the subject is still judged on its absolute rules, drift and targets. A failed check of a subject's file, or a shared one, still makes the run INVALID.
 
 Runs of a few minutes are smoke tests of the harness: the windows are too short to judge drift, so
 the drift rules report `n/a` (see `min_clean_window_min`).

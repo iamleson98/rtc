@@ -1056,9 +1056,10 @@ def freezes_only_if_frozen(key, verdict, s_m, b_m):
     return verdict
 
 
-def compare(ents, rules):
+def compare(ents, rules, bad_baselines=None):
     """All comparisons: {"rows": [...], "checks": [...]} where a check is a gated pass/fail."""
     rows, checks = [], []
+    bad_baselines = bad_baselines or {}
 
     def add(gated, rule, value, limit, ok, miss=False):
         status = "n/a" if ok is None else ("PASS" if ok else ("MISS" if miss else ("FAIL" if gated else "breach")))
@@ -1075,6 +1076,8 @@ def compare(ents, rules):
             s_ents = [e for e in subj if e.arch == arch]
             b_ents = [e for e in base if e.arch == arch]
             where = "%s [%s]" % (name, arch)
+            first_row = len(rows)
+            bad_base = [bad_baselines[e.run.stem] for e in b_ents if e.run.stem in bad_baselines]
             if not s_ents or not b_ents:
                 missing = "baseline" if not b_ents else "subject"
                 add(gated, where, "no %s data on %s" % (missing, arch), "both sides need data", False)
@@ -1177,6 +1180,12 @@ def compare(ents, rules):
                 rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": "(no network attack)",
                              "key": "quiet_stalls", "subject": sq, "baseline": bq, "verdict": verdict, "limit": lim,
                              "gated": gated, "where": where})
+            if bad_base:
+                # The baseline's own run was not valid: nothing is held against it, the subject is still
+                # judged on its absolute rules below.
+                del rows[first_row:]
+                add(gated, where + ": comparison with the baseline", "baseline invalid (%s)" % bad_base[0],
+                    "needs a valid baseline", None)
             # The clean group is never impaired: whatever it shows is the server's, except while an
             # attack that loads the whole server (`global_load`) runs.
             drop = global_drop(rules)
@@ -1321,7 +1330,8 @@ def tables(rows, extra, runs, ents=None, rules=None, val=None):
     out.append(("Inputs", ["File", "Implementations", "Architectures", "Minutes", "Receiver samples"], infos))
     if val:
         out.append(("Run validity", ["Scope", "Check", "Value", "Result"],
-                    [[sc, rule, value, "ok" if ok else "INVALID"] for sc, rule, value, ok in val]))
+                    [[sc, rule, value, "ok" if ok else ("baseline INVALID" if baseline else "INVALID")]
+                     for sc, rule, value, ok, baseline in val]))
     tx = tx_table(ents) if ents else None
     if tx:
         out.append(tx)
@@ -1604,7 +1614,7 @@ def validity(runs, ents, rules):
                     pct = 100.0 * over / len(rows)
                     add(run.stem, "%s CPU within %g %% of its cores" % (s.id, rules["valid_client_cpu_pct"]),
                         "%.1f %% of samples above it" % pct, pct <= rules["valid_client_cpu_samples_pct_max"])
-        delays = [v for s in recv if s.media == "audio" for r in s.s for v in (r.get("delay_p50_ms"), r.get("delay_p95_ms")) if v is not None]
+        delays = [v for s in recv if s.media == "audio" and s.group == "clean" for r in s.s for v in (r.get("delay_p50_ms"), r.get("delay_p95_ms")) if v is not None]
         if delays:
             pct = 100.0 * sum(1 for v in delays if not 0 <= v <= rules["valid_delay_max_ms"]) / len(delays)
             add(run.stem, "delay samples within 0-%g ms" % rules["valid_delay_max_ms"],
@@ -1616,17 +1626,36 @@ def validity(runs, ents, rules):
             ", ".join("%s %d" % kv for kv in sorted(totals.items())), ratio), ratio <= rules["valid_total_ratio"])
     elif len(totals) >= 2:
         add("all files", "total delivered packets, between files", "a file delivered nothing", False)
-    return out
+    # A file that is only ever the baseline of a pair is not the subject's: its failed check voids that
+    # comparison (see `compare`), not the run.
+    only_baseline = set()
+    for run in runs:
+        es = [e for e in ents if e.run is run]
+        as_subject = any(e in pick(ents, spec, "subject") for spec in rules["compare"] for e in es)
+        as_baseline = any(e in pick(ents, spec, "baseline") for spec in rules["compare"] for e in es)
+        if as_baseline and not as_subject:
+            only_baseline.add(run.stem)
+    return [(sc, rule, value, ok, sc in only_baseline) for sc, rule, value, ok in out]
 
 
 def invalid_reason(val):
-    bad = [v for v in val if not v[3]]
+    """The first failed check that voids the run: one of the subject's own or a shared one."""
+    bad = [v for v in val if not v[3] and not v[4]]
     return "%s: %s (%s)" % (bad[0][0], bad[0][1], bad[0][2]) if bad else None
 
 
-def analyse(runs, rules):
+def invalid_baselines(val):
+    """{file: reason} of the files whose own checks failed though they are only baselines."""
+    out = {}
+    for sc, rule, value, ok, baseline in val:
+        if not ok and baseline and sc not in out:
+            out[sc] = "%s (%s)" % (rule, value)
+    return out
+
+
+def analyse(runs, rules, bad_baselines=None):
     ents = build_entities(runs)
-    rows, checks = compare(ents, rules)
+    rows, checks = compare(ents, rules, bad_baselines or {})
     return ents, rows, checks
 
 
@@ -1653,7 +1682,7 @@ def main(argv=None):
     if invalid:
         ents, rows, checks = build_entities(runs), [], []
     else:
-        ents, rows, checks = analyse(runs, rules)
+        ents, rows, checks = analyse(runs, rules, invalid_baselines(val))
     if not ents or not any(e.series for e in ents):
         print("report.py: no recv/proc/dc samples in the input", file=sys.stderr)
         return 2

@@ -957,6 +957,12 @@ class MeetValidity(unittest.TestCase):
         self.assertEqual(failed_checks(val), [])
         bad = [r for r in rows if r.get("id") == "s01/audio:teacher"]
         for r in bad[::10]:
+            r["delay_p95_ms"] = 5000.0  # an impaired group's multi-second delay (abuse scenes) is real
+        val, _, _ = validate(("x", rows))
+        self.assertEqual(failed_checks(val), [])
+        for r in bad:
+            r["group"] = "clean"
+        for r in bad[::10]:
             r["delay_p95_ms"] = 5000.0
         val, _, _ = validate(("x", rows))
         self.assertEqual(failed_checks(val), ["delay samples within 0-2000 ms"])
@@ -965,6 +971,38 @@ class MeetValidity(unittest.TestCase):
             r["delay_p50_ms"] = -5.0 if r["ts"] == bad[3]["ts"] else r["delay_p50_ms"]
         val, _, _ = validate(("x", rows))
         self.assertEqual(failed_checks(val), [])
+
+
+class BaselineValidity(unittest.TestCase):
+    def test_a_saturated_baseline_voids_its_pair_not_the_run(self):
+        rules = dict(RULES, require_groups=[])
+        status, md, _, _ = run_report(side("rtcd-rs"), side("rtcd-go", cpu=250.0), rules)
+        self.assertEqual(status, 0)
+        self.assertTrue(md.startswith("# Soak report\n"), md[:80])
+        self.assertIn("| sfu CPU not saturated | 100.0 % of samples at or above 190 % | baseline INVALID |", md)
+        self.assertIn("comparison with the baseline | baseline invalid (sfu CPU not saturated", md)
+        self.assertNotIn("| Freezes / min (video) |", md)
+        self.assertIn("subject SFU process errors (gone, crashed) must be zero | 0 | 0 | PASS |", md)
+
+    def test_a_saturated_subject_still_voids_the_run(self):
+        status, md, _, _ = run_report(side("rtcd-rs", cpu=250.0), side("rtcd-go"), dict(RULES, require_groups=[]))
+        self.assertEqual(status, 1)
+        self.assertTrue(md.startswith("# Soak report: INVALID RUN, no verdict (rtcd-rs-x86_64: sfu CPU"), md[:120])
+
+    def test_an_invalid_baseline_does_not_hide_a_subject_that_breaks_its_target(self):
+        rules = dict(RULES, require_groups=[], targets=[{"name": "t", "metric": "freeze_rate", "max": -1}])
+        status, md, _, _ = run_report(side("rtcd-rs"), side("rtcd-go", cpu=250.0), rules)
+        self.assertEqual(status, 1)
+        self.assertIn("t | 0.00 | <= -1.00 | FAIL |", md)
+
+
+class SlackOverride(Fixture):
+    def test_slack_by_metric_key_tolerates_a_few_ice_disconnects(self):
+        extra = [event("rtcd-rs", 30, "s17", "ice_state", "ice:disconnected")]
+        s, b = self.rows(extra=extra)
+        self.assertEqual(run_report(s, b)[0], 1)
+        s, b = self.rows(extra=extra)
+        self.assertEqual(run_report(s, b, dict(RULES, slack={"ice_disc": 2}))[0], 0)
 
 
 class TargetRules(unittest.TestCase):
