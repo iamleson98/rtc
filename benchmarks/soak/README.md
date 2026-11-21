@@ -74,7 +74,10 @@ within 3:1 of each other, and the files within 2:1 of each other in total packet
 retransmissions and the per-class send counters (`tx`) are non-zero on both peers wherever the profile
 impairs the path; no peer CPU-saturated and the host load average within its CPU count (more than 5 %
 and 10 % of the samples); and the files are one run (one `run` record each, the same seed, profile and
-length, started within 24 h).
+length, started within 24 h). Two more apply when the rows exist: no `client:*` container (a client's
+`proc` row, `cpu_pct` of one core, `cores` its CPU limit) above `valid_client_cpu_pct` (90) % of its cores in
+more than 5 % of its samples, and no more than 1 % of the `delay_p50_ms` / `delay_p95_ms` values outside
+0 to `valid_delay_max_ms` (2000) ms, which would mean the sender-to-receiver clock mapping is broken.
 
 Runs of a few minutes are smoke tests of the harness: the windows are too short to judge drift, so
 the drift rules report `n/a` (see `min_clean_window_min`).
@@ -162,6 +165,12 @@ names the group the `phase` lines are for. Qdiscs are removed on exit. Egress is
 ingress too through an `ifb` device, except on `lo`, where a packet crosses egress and ingress both and
 egress shaping already covers each direction once (`NETEM_INGRESS=0|1|auto` overrides). To impair
 another network namespace, run the script inside it (`nsenter -t <pid> -n netem.sh ...`).
+
+### The loss-sweep profile
+
+`NETEM_PROFILE=loss-sweep` replaces the cycle with five equal slots of the cycle length: `clean`, `loss10`,
+`loss20`, `loss30` (random loss of 10, 20 and 30 % in each direction, no added delay) and `recover`, repeated
+until the run ends.
 
 ### The abuse profile
 
@@ -343,7 +352,13 @@ down`, `the call did not connect in time`); `ice_state` `ice:disconnected` and `
 `rejoin` carries `downtime_ms` and `attempts`. A participant that takes its seat back after a loss
 records the downtime, and one that never does costs the time to the end of the run.
 
-`phase`: `name` is `clean`, `loss`, `burst`, `bw`, `outage` or `recover`; the phase lasts until the
+`recv` rows of a meet-style run may also carry `delay_p50_ms` and `delay_p95_ms` (one-way delay over the
+interval, null when none), and Chrome audio rows `concealed_samples`, `concealment_events` and
+`fec_packets` (cumulative). `proc` rows with an id `client:<container>` are client containers: they are
+not the SFU's and never enter its metrics. The `event` `sfu_restart` (`detail` the restart's number) marks the
+moment the harness restarted the SFU; `sdp_codecs` carries a page's audio `rtpmap` lines.
+
+`phase`: `name` is `clean`, `loss`, `loss10`, `loss20`, `loss30`, `burst`, `bw`, `outage` or `recover`; the phase lasts until the
 next `phase` line of the same `group` (default `impaired`; `up` and `down` hold the netem arguments).
 Samples are assigned to phases by `ts`, each by its own group: samples of a group without `phase`
 lines (`clean`) are in `clean` throughout. A series id `name#N` is the N-th rejoin of `name`.
@@ -376,7 +391,13 @@ sessions, signaling closes, lost seats, rejoins and their total downtime, ICE di
 and the Mbit/s each participant received (all its tracks together; in the bw phase this is what shows
 the cap per participant). The SFU process: CPU mean, RSS peak and slope, threads, fds, UDP buffer
 errors, process errors (gone or crashed), per phase for the CPU. Then the absolute and drift rules and
-the breaches. `report.html` charts subject against baseline over the run, with the phases shaded.
+the breaches. Where the rows exist: per phase the one-way delay (p50 is the median of the intervals' p50, p95 the
+95th percentile of their p95; audio is held to the baseline like the rates, video is reported only), Chrome's
+concealed audio % (concealed samples over the samples played at 48 kHz) and FEC packets; and per
+`sfu_restart` the recovery table: for each track that was receiving before the restart, the seconds until the
+first interval that began after it carries packets (p50, p95, max; `never` when none within
+`recover_window_s`). The closes, signaling drops, ICE disconnects and process errors within 60 s after a
+logged `sfu_restart` are not counted; outside that span they are. `report.html` charts subject against baseline over the run, with the phases shaded.
 
 With `attack` rows, per architecture and per attack class (scope `attack`, the class in the phase
 column) the metrics of the innocent receivers: every receiver of the `clean` group, and those of
@@ -407,6 +428,10 @@ freeze ms keeps the sample's time).
 side to the input file with that name (`rtc-rtc`, `pion-pion`), and `"gate": false` reports the pair
 without failing on it. For each architecture the subject is held to the baseline:
 
+* `targets` (absolute, on the subject; the key is a metric of the tables): `{"name", "metric", "max"` or
+  `"min"`, `"scope"` (group, default `impaired`), `"phase"` (default all), `"subject"` (default every pair),
+  `"gated"` (default true)`}`. A target with `"gated": false` shows PASS or MISS (not gated) in the rules table
+  and never fails the run;
 * rates (freezes, loss, gaps, recovery times, CPU, RSS, downtime ...): subject <= baseline x `ratio`
   (1.25) + a slack in the metric's unit (`slack` overrides it per metric key, `ratios` the ratio);
 * counts (stalls, closes, ICE disconnects, rejoins ...): subject <= baseline + slack (0). An ICE
