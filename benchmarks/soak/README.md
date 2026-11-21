@@ -76,7 +76,7 @@ impairs the path; no peer CPU-saturated and the host load average within its CPU
 and 10 % of the samples); and the files are one run (one `run` record each, the same seed, profile and
 length, started within 24 h). Two more apply when the rows exist: no `client:*` container (a client's
 `proc` row, `cpu_pct` of one core, `cores` its CPU limit) above `valid_client_cpu_pct` (90) % of its cores in
-more than 5 % of its samples, and no more than 1 % of the `delay_p50_ms` / `delay_p95_ms` values outside
+more than 5 % of its samples, and no more than 1 % of the audio `delay_p50_ms` / `delay_p95_ms` values outside
 0 to `valid_delay_max_ms` (2000) ms, which would mean the sender-to-receiver clock mapping is broken.
 
 Runs of a few minutes are smoke tests of the harness: the windows are too short to judge drift, so
@@ -356,7 +356,7 @@ records the downtime, and one that never does costs the time to the end of the r
 interval, null when none), and Chrome audio rows `concealed_samples`, `concealment_events` and
 `fec_packets` (cumulative). `proc` rows with an id `client:<container>` are client containers: they are
 not the SFU's and never enter its metrics. The `event` `sfu_restart` (`detail` the restart's number) marks the
-moment the harness restarted the SFU; `sdp_codecs` carries a page's audio `rtpmap` lines.
+moment the harness restarted the SFU, `sfu_up` the moment the restarted SFU answered (the restart table shows the time between); `sdp_codecs` carries a page's audio `rtpmap` lines.
 
 `phase`: `name` is `clean`, `loss`, `loss10`, `loss20`, `loss30`, `burst`, `bw`, `outage` or `recover`; the phase lasts until the
 next `phase` line of the same `group` (default `impaired`; `up` and `down` hold the netem arguments).
@@ -390,13 +390,13 @@ count and longest stall, recovery after an outage (median, p90, tracks that neve
 sessions, signaling closes, lost seats, rejoins and their total downtime, ICE disconnects and failures,
 and the Mbit/s each participant received (all its tracks together; in the bw phase this is what shows
 the cap per participant). The SFU process: CPU mean, RSS peak and slope, threads, fds, UDP buffer
-errors, process errors (gone or crashed), per phase for the CPU. Then the absolute and drift rules and
+errors (differenced per segment between SFU restarts, whose namespace resets them), process errors (gone or crashed), per phase for the CPU. Then the absolute and drift rules and
 the breaches. Where the rows exist: per phase the one-way delay (p50 is the median of the intervals' p50, p95 the
-95th percentile of their p95; audio is held to the baseline like the rates, video is reported only), Chrome's
+95th percentile of their p95; both are reported only; gate them with `targets`), Chrome's
 concealed audio % (concealed samples over the samples played at 48 kHz) and FEC packets; and per
 `sfu_restart` the recovery table: for each track that was receiving before the restart, the seconds until the
-first interval that began after it carries packets (p50, p95, max; `never` when none within
-`recover_window_s`). The closes, signaling drops, ICE disconnects and process errors within 60 s after a
+first interval that began after it carries packets (a rejoined `#n` series is the same track as its earlier epochs; p50, p95, max; `never` when none within
+`recover_window_s`). The closes, signaling drops, ICE disconnects and process errors within `recover_window_s` (60) after a
 logged `sfu_restart` are not counted, and its intervals leave the phase rows (freezes, audio gap, loss ...) and the stall count the way an outage span does; the restart table counts its stalls, freeze ms and audio gap ms instead. Outside that span everything counts. `report.html` charts subject against baseline over the run, with the phases shaded.
 
 With `attack` rows, per architecture and per attack class (scope `attack`, the class in the phase

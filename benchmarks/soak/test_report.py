@@ -787,9 +787,12 @@ class LossSweepAndDelay(unittest.TestCase):
         self.assertEqual((m["delay_audio_p50"], m["delay_audio_p95"]), (60.0, 100.0))
         self.assertEqual((m["delay_video_p50"], m["delay_video_p95"]), (60.0, 120.0))
 
-    def test_audio_delay_is_judged_and_video_delay_is_report_only(self):
-        _, md, _, _ = run_report(meet_side("rtcd-rs", delay=200.0, video_delay=900.0), meet_side("rtcd-go"))
-        self.assertIn("| impaired | loss10 | Audio delay p50 ms | 210.0 | 50.0 | BREACH |", md)
+    def test_delay_rows_are_report_only_and_gated_only_through_targets(self):
+        status, md, _, _ = run_report(meet_side("rtcd-rs", delay=200.0, video_delay=900.0), meet_side("rtcd-go"),
+                                      dict(RULES, require_groups=[]))
+        self.assertEqual(status, 0)
+        self.assertTrue(any(l.startswith("| impaired | loss10 | Audio delay p50 ms (report only) | 210.0 | 50.0 |  |")
+                            for l in md.splitlines()))
         line = next(l for l in md.splitlines() if l.startswith("| impaired | loss10 | Video delay p50 ms"))
         self.assertTrue(line.endswith("| 900.0 | 60.0 |  |"), line)
 
@@ -839,6 +842,40 @@ class SfuRestart(unittest.TestCase):
             RULES, require_groups=[], targets=[{"name": "recover", "metric": "restart_recover_max", "max": 30}]))
         self.assertIn("recover | never | <= 30.0 | FAIL |", md)
 
+    def test_a_rejoined_track_counts_across_its_epochs(self):
+        rows = restart_run("rtcd-rs")
+        old = [r for r in rows if r.get("id") == "s02/video:teacher"]
+        rows = [r for r in rows if r not in old]
+        rows += [r for r in old if (r["ts"] - T0) / 1000 <= 100]
+        new = track("rtcd-rs", "s02/video:teacher#2", "impaired", END, start=130)
+        rows += new
+        ents = entities(("x", rows))
+        (_, _, secs), = report.restart_recovery(ents[0], dict(report.DEFAULTS))
+        # The new epoch's first interval starts at 130 and ends at 135: 33 s after the restart.
+        self.assertEqual(sorted(secs), [23.0, 33.0, 43.0])
+        gone = [r for r in rows if r.get("id") != "s02/video:teacher#2"]
+        (_, _, secs), = report.restart_recovery(entities(("x", gone))[0], dict(report.DEFAULTS))
+        self.assertEqual(len(secs), 2)  # the old series alone ended before the window: left out
+
+    def test_the_grace_follows_recover_window_s(self):
+        late = [event("rtcd-rs", 200, "sfu", "error", "the SFU exited")]
+        for window, status in ((60, 1), (120, 0)):
+            rules = dict(RULES, recover_window_s=window, require_groups=[])
+            self.assertEqual(run_report(restart_run("rtcd-rs", extra=late), restart_run("rtcd-go"), rules)[0], status, window)
+
+    def test_udp_counters_are_differenced_per_restart_segment(self):
+        rows = restart_run("rtcd-rs")
+        for r in rows:
+            if r["kind"] == "proc":
+                r["udp_rcvbuf_err"] = 7 + (r["ts"] - T0) // 5000 if r["ts"] - T0 < 102_000 else (r["ts"] - T0 - 102_000) // 5000
+        ents = entities(("x", rows))
+        self.assertEqual(report.sfu_metrics(ents, dict(report.DEFAULTS))["udp_err"], 20 + 27)
+
+    def test_downtime_is_the_time_to_sfu_up(self):
+        rows = restart_run("rtcd-rs") + [event("rtcd-rs", 109, "run.sh", "sfu_up", "1")]
+        _, md, _, _ = run_report(rows, restart_run("rtcd-go"))
+        self.assertIn("| 3 | 23.0 | 43.0 | 43.0 | 7.0 |", md)
+
     def test_the_table_has_p50_p95_max(self):
         _, md, _, _ = run_report(restart_run("rtcd-rs"), restart_run("rtcd-go"))
         self.assertIn("## SFU restart recovery", md)
@@ -861,7 +898,7 @@ class SfuRestart(unittest.TestCase):
         self.assertEqual(report.sfu_metrics(without, rules)["sfu_errors"], 1)
 
     def test_an_error_long_after_the_restart_still_counts(self):
-        late = [event("rtcd-rs", 102 + report.RESTART_GRACE_S + 30, "sfu", "error", "the SFU exited")]
+        late = [event("rtcd-rs", 102 + report.DEFAULTS["recover_window_s"] + 30, "sfu", "error", "the SFU exited")]
         self.assertEqual(report.sfu_metrics(entities(("x", restart_run("rtcd-rs", extra=late))), dict(report.DEFAULTS))["sfu_errors"], 1)
 
 
@@ -911,6 +948,11 @@ class MeetValidity(unittest.TestCase):
 
     def test_delay_samples_outside_the_sane_range_are_invalid(self):
         rows = meet_side("rtcd-rs")
+        val, _, _ = validate(("x", rows))
+        self.assertEqual(failed_checks(val), [])
+        for r in rows:
+            if r.get("id") == "s01/video:teacher":
+                r["delay_p95_ms"] = 9000.0  # a video timestamp rewritten on a layer switch: not judged
         val, _, _ = validate(("x", rows))
         self.assertEqual(failed_checks(val), [])
         bad = [r for r in rows if r.get("id") == "s01/audio:teacher"]

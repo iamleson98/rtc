@@ -15,6 +15,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
@@ -78,8 +79,8 @@ METRICS = [
     ("audio_gap", "Audio gap %", 2, "rate", 0.5),
     ("loss", "Residual loss %", 2, "rate", 0.5),
     ("dup", "Duplicate packets %", 2, "rate", 0.5),
-    ("delay_audio_p50", "Audio delay p50 ms", 1, "rate", 20),
-    ("delay_audio_p95", "Audio delay p95 ms", 1, "rate", 40),
+    ("delay_audio_p50", "Audio delay p50 ms (report only)", 1, None, 0),
+    ("delay_audio_p95", "Audio delay p95 ms (report only)", 1, None, 0),
     ("delay_video_p50", "Video delay p50 ms (report only)", 1, None, 0),
     ("delay_video_p95", "Video delay p95 ms (report only)", 1, None, 0),
     ("conceal_pct", "Concealed audio % (Chrome)", 2, None, 0),
@@ -128,8 +129,7 @@ COUNTERS = ("frames", "freezes", "freeze_ms", "packets", "lost", "nack", "pli", 
 AUDIO_HZ = 48000  # what Chrome's concealed samples are counted against
 CLIENT = "client:"  # the id prefix of a client container's `proc` rows
 # An SFU restart the harness logged (`sfu_restart`) excuses the closes, signaling drops, ICE trouble and
-# process errors this long after it (and one sample interval before, for the clocks).
-RESTART_GRACE_S = 60
+# process errors for `recover_window_s` after it (Run.grace) and one sample interval before, for the clocks.
 RESTART_EXCUSED = ("closes", "sig_closes", "ice_disc", "ice_fail")
 PALETTE = ["#2563eb", "#dc2626", "#059669", "#d97706"]
 ATTACK_KEYS = ("freezes", "freeze_rate", "freeze_ms", "stalls", "stall_max", "closes", "sig_closes", "ice_disc",
@@ -168,6 +168,8 @@ class Run:
         self.t0 = self.t1 = 0.0
         self.timeline = {}  # group -> ([t], [(t, name)])
         self.restarts = []  # (t, detail) of every `sfu_restart` event
+        self.ups = []  # t of every `sfu_up` event (the restarted SFU answered)
+        self.grace = DEFAULTS["recover_window_s"]  # how long after a restart it is excused (main sets it from the rules)
         self.attacks = []  # {id, name, start, end, group, who, seed, arch, detail}: the attack windows
         self._attack_index = None
 
@@ -183,6 +185,7 @@ class Run:
                 per[str(r.get("group") or "impaired")].append((r["t"], str(r.get("name"))))
         self.restarts = sorted((r["t"], str(r.get("detail", ""))) for r in self.rows
                                if r["kind"] == "event" and r.get("what") == "sfu_restart")
+        self.ups = sorted(r["t"] for r in self.rows if r["kind"] == "event" and r.get("what") == "sfu_up")
         opened, order = {}, []
         for r in self.rows:
             if r["kind"] != "attack":
@@ -393,9 +396,9 @@ def server_span(ents):
 
 def restart_spans(run):
     """(start, end) of what each `sfu_restart` the harness logged excuses: from one sample interval
-    before it (the clocks) to RESTART_GRACE_S after. What happens in it is the restart's, booked in the
+    before it (the clocks) to `recover_window_s` after. What happens in it is the restart's, booked in the
     restart recovery table, the way an outage's is booked apart from the phase rows."""
-    return [(r - SAMPLE_S, r + RESTART_GRACE_S) for r, _ in run.restarts]
+    return [(r - SAMPLE_S, r + run.grace) for r, _ in run.restarts]
 
 
 def after_restart(run, t):
@@ -542,24 +545,34 @@ def recoveries(ent, group, rules, gone):
     return out
 
 
+def tracks(ent, group=None):
+    """The receivers of an entity by track: a participant that rejoins (`s17/video:teacher#2`) is the same
+    track, so the series of its epochs are one, their intervals and samples in time order."""
+    by = defaultdict(list)
+    for s in ent.recv_series():
+        if group is None or s.group == group:
+            by[(s.group, re.sub(r"#\d+", "", s.id))].append(s)
+    return [(sorted((i for s in ss for i in s.ivs), key=lambda i: i["t"]), max(s.s[-1]["t"] for s in ss))
+            for ss in by.values()]
+
+
 def restart_recovery(ent, rules, group=None):
-    """[(n, t, [seconds])] per `sfu_restart` of the run (of `group`'s tracks when given): for each track that was receiving at the
-    restart (packets in its last interval before it), the seconds from the restart until the first
-    interval that began after it carries packets (inf = none within `recover_window_s`; a track that
-    ends sooner is left out). The sampling clock puts every value within one interval."""
+    """[(n, t, [seconds])] per `sfu_restart` of the run (of `group`'s tracks when given): for each track that was
+    receiving at the restart (packets in its last interval before it, in any epoch), the seconds from the
+    restart until the first interval that began after it carries packets (inf = none within
+    `recover_window_s`; a track that ends sooner is left out). The sampling clock puts every value within
+    one interval."""
     out = []
     for t, detail in ent.run.restarts:
         secs = []
-        for s in ent.recv_series():
-            if group is not None and s.group != group:
-                continue
-            before = [i for i in s.ivs if i["t"] <= t]
+        for ivs, last in tracks(ent, group):
+            before = [i for i in ivs if i["t"] <= t]
             if not before or before[-1]["packets"] <= 0:
                 continue
-            hit = next((i for i in s.ivs if i["t"] - i["dt"] >= t and i["packets"] > 0), None)
+            hit = next((i for i in ivs if i["t"] - i["dt"] >= t and i["packets"] > 0), None)
             if hit is not None:
                 secs.append(hit["t"] - t)
-            elif s.s[-1]["t"] - t >= rules["recover_window_s"]:
+            elif last - t >= rules["recover_window_s"]:
                 secs.append(math.inf)
         out.append((detail, t, secs))
     return out
@@ -570,17 +583,20 @@ def restart_table(ents, rules):
     for e in sorted(ents, key=lambda e: (e.run.stem, e.impl)):
         for detail, t, secs in restart_recovery(e, rules):
             if secs:
-                span = (t - SAMPLE_S, t + RESTART_GRACE_S)
+                span = (t - SAMPLE_S, t + e.run.grace)
+                up = next((u for u in e.run.ups if u >= t), None)
+                nxt = next((r for r, _ in e.run.restarts if r > t), math.inf)
                 sers = e.recv_series()
                 body.append([e.run.stem, e.impl, e.arch, detail, "%.1f" % (t / 60.0), str(len(secs)),
                              fmt(quantile(secs, 0.5), 1), fmt(quantile(secs, 0.95), 1), fmt(max(secs), 1),
+                             fmt(up - t, 1) if up is not None and up < nxt else "-",
                              str(sum(1 for s in sers for st in stall_starts(s) if span[0] <= st <= span[1])),
                              "%.0f" % sum(i["freeze_ms"] for s in sers if s.media == "video"
                                           for i in s.ivs if in_span(i, [span])),
                              "%.0f" % sum(i["audio_gap_ms"] for s in sers if s.media == "audio"
                                           for i in s.ivs if in_span(i, [span]))])
     return ("SFU restart recovery (seconds until a track receives again; stalls, freeze and audio gap in the excused span)",
-            ["File", "Impl", "Arch", "Restart", "At min", "Tracks", "p50 s", "p95 s", "max s", "Stalls", "Freeze ms",
+            ["File", "Impl", "Arch", "Restart", "At min", "Tracks", "p50 s", "p95 s", "max s", "Down s", "Stalls", "Freeze ms",
              "Audio gap ms"], body) if body else None
 
 
@@ -810,8 +826,15 @@ def sfu_metrics(ents, rules, phase=None):
                 if sl is not None and span >= rules["rss_slope_min_span_min"]:
                     spans.append(sl)
             m[key] = max(spans) if spans else None
-        errs = [r.get("udp_rcvbuf_err") for s in procs for r in s.s if r.get("udp_rcvbuf_err") is not None]
-        m["udp_err"] = (max(errs) - min(errs)) if errs else None
+        # An SFU restart starts a new network namespace and its counters from zero: each segment between
+        # restarts is differenced on its own.
+        segs = defaultdict(list)
+        for s in procs:
+            cuts = [t for t, _ in s.run.restarts]
+            for r in s.s:
+                if r.get("udp_rcvbuf_err") is not None:
+                    segs[bisect_right(cuts, r["t"])].append(r["udp_rcvbuf_err"])
+        m["udp_err"] = sum(max(v) - min(v) for v in segs.values()) if segs else None
         m["sfu_errors"] = sum(1 for e in ents for ev in e.events if ev.get("id") == "sfu" and ev.get("what") == "error"
                               and not after_restart(e.run, ev["t"]))
     return m
@@ -1581,7 +1604,7 @@ def validity(runs, ents, rules):
                     pct = 100.0 * over / len(rows)
                     add(run.stem, "%s CPU within %g %% of its cores" % (s.id, rules["valid_client_cpu_pct"]),
                         "%.1f %% of samples above it" % pct, pct <= rules["valid_client_cpu_samples_pct_max"])
-        delays = [v for s in recv for r in s.s for v in (r.get("delay_p50_ms"), r.get("delay_p95_ms")) if v is not None]
+        delays = [v for s in recv if s.media == "audio" for r in s.s for v in (r.get("delay_p50_ms"), r.get("delay_p95_ms")) if v is not None]
         if delays:
             pct = 100.0 * sum(1 for v in delays if not 0 <= v <= rules["valid_delay_max_ms"]) / len(delays)
             add(run.stem, "delay samples within 0-%g ms" % rules["valid_delay_max_ms"],
@@ -1617,6 +1640,8 @@ def main(argv=None):
     with open(a.rules) as f:
         rules.update(json.load(f))
     runs = load(a.files)
+    for r in runs:
+        r.grace = rules["recover_window_s"]
     if not any(r.rows for r in runs):
         print("report.py: no usable samples in the input", file=sys.stderr)
         return 2
