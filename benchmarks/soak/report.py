@@ -1048,10 +1048,11 @@ def cycle_s(ents):
     return min(gaps, default=DEFAULT_CYCLE_S)
 
 
-def freezes_only_if_frozen(key, verdict, s_m, b_m):
-    """More freezes of less frozen time is a stream that plays, not one that breaks: freezes per
-    minute breach only when the freeze ms per minute is worse too."""
-    if key == "freeze_rate" and verdict == "BREACH" and not (s_m["freeze_ms"] or 0) > (b_m["freeze_ms"] or 0):
+def freezes_only_if_frozen(key, verdict, s_m, b_m, rules):
+    """More freezes of no more frozen time is a stream that plays, not one that breaks: freezes per
+    minute breach only when the freeze ms per minute breaches its own limit too (both streams frozen
+    nearly all the time differ by noise, and the one that still shows frames counts more freezes)."""
+    if key == "freeze_rate" and verdict == "BREACH" and judge("freeze_ms", s_m["freeze_ms"] or 0, b_m["freeze_ms"] or 0, rules)[0] != "BREACH":
         return "ok"
     return verdict
 
@@ -1127,7 +1128,7 @@ def compare(ents, rules, bad_baselines=None):
                         if s_v is None and b_v is None:
                             continue
                         verdict, lim = judge(key, s_v, b_v, rules) if kind else ("", None)
-                        verdict = freezes_only_if_frozen(key, verdict, sm, bm)
+                        verdict = freezes_only_if_frozen(key, verdict, sm, bm, rules)
                         if ph == "outage" and key in OUTAGE_INFO_KEYS:
                             verdict, lim = "", None
                         if few and verdict == "BREACH" and key not in HARD_KEYS:
@@ -1166,7 +1167,7 @@ def compare(ents, rules, bad_baselines=None):
                         continue
                     kind = "count" if key == "freezes" else KIND.get(key)
                     verdict, lim = judge(key, s_v, b_v, rules, kind)
-                    verdict = freezes_only_if_frozen(key, verdict, sm, bm)
+                    verdict = freezes_only_if_frozen(key, verdict, sm, bm, rules)
                     if brief and verdict == "BREACH" and key not in HARD_KEYS:
                         verdict = "too few to judge"
                     rows.append({"arch": arch, "pair": name, "scope": "attack", "phase": cls, "key": key,
