@@ -37,6 +37,9 @@
 # and, rarely, an outage of 30, 60 or 120 s. Each scene logs an `attack` start and end line (see
 # README.md); NETEM_NAMES (space separated) names the participant of flow k, the k-th name.
 #
+# NETEM_PROFILE=loss-sweep replaces the cycle with five equal slots: clean, loss10, loss20, loss30
+# (random loss of 10, 20 and 30 % each way, no delay change) and recover.
+#
 # NETEM_PROFILE=trace (NETEM_SEED, NETEM_NAMES, NETEM_GROUP as above) replays recorded cellular links
 # instead (traces.sh fetches them into NETEM_TRACE_DIR; tracereplay.py does the replay): every flow gets an
 # uplink and a downlink trace and an offset into each, chosen from the seed and the flow's number,
@@ -368,6 +371,28 @@ run_trace() {
 
 if [ "$profile" = trace ]; then
   run_trace
+  exit 0
+fi
+
+# --- loss-sweep profile -------------------------------------------------------------------------
+
+run_loss_sweep() {
+  local sweep=$((cycle / 5)) name pct
+  while [ "$(date +%s)" -lt "$end" ]; do
+    for name in clean loss10 loss20 loss30 recover; do
+      pct=${name#loss}
+      if [ "$pct" = "$name" ]; then
+        phase "$name" "$(left "$sweep")" "" ""
+      else
+        phase "$name" "$(left "$sweep")" "loss $pct%" "loss $pct%"
+      fi
+      [ "$(date +%s)" -ge "$end" ] && break
+    done
+  done
+}
+
+if [ "$profile" = loss-sweep ]; then
+  run_loss_sweep
   exit 0
 fi
 

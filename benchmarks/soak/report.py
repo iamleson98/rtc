@@ -54,6 +54,16 @@ DEFAULTS = {
     "valid_total_ratio": 2.0,
     "valid_cpu_sat_pct_max": 5.0,
     "valid_load_pct_max": 10.0,
+    # A client container (a `client:*` proc row) above this % of its cores in more than the given % of
+    # its samples starved its own media path; more than the given % of delay samples outside 0-max ms
+    # means the sender-to-receiver clock mapping is broken.
+    "valid_client_cpu_pct": 90.0,
+    "valid_client_cpu_samples_pct_max": 5.0,
+    "valid_delay_max_ms": 2000.0,
+    "valid_delay_out_pct_max": 1.0,
+    # Absolute targets on the subject (see `compare`): {"name", "metric", "max" or "min", "scope" (group,
+    # default impaired), "phase" (default all), "subject" (default every pair), "gated" (default true)}.
+    "targets": [],
     # The input files may start at most this many hours apart (one run, its pairs run one after the other).
     "valid_start_span_h": 24.0,
 }
@@ -68,6 +78,12 @@ METRICS = [
     ("audio_gap", "Audio gap %", 2, "rate", 0.5),
     ("loss", "Residual loss %", 2, "rate", 0.5),
     ("dup", "Duplicate packets %", 2, "rate", 0.5),
+    ("delay_audio_p50", "Audio delay p50 ms", 1, "rate", 20),
+    ("delay_audio_p95", "Audio delay p95 ms", 1, "rate", 40),
+    ("delay_video_p50", "Video delay p50 ms (report only)", 1, None, 0),
+    ("delay_video_p95", "Video delay p95 ms (report only)", 1, None, 0),
+    ("conceal_pct", "Concealed audio % (Chrome)", 2, None, 0),
+    ("fec_packets", "FEC packets (Chrome audio)", 0, None, 0),
     ("stalls", "Stalls outside outage", 0, "count", 0),
     ("quiet_stalls", "Stalls with no network attack active", 0, "count", 0),
     ("stall_max", "Longest stall s", 1, "rate", 2),
@@ -102,11 +118,17 @@ TITLE = {k: t for k, t, *_ in METRICS + SFU_METRICS}
 DEC = {k: d for k, _, d, *_ in METRICS + SFU_METRICS}
 KIND = {k: kind for k, _, _, kind, _ in METRICS + SFU_METRICS}
 SLACK = {k: s for k, _, _, _, s in METRICS + SFU_METRICS}
-PHASES = ["clean", "loss", "burst", "bw", "outage", "recover"]
+PHASES = ["clean", "loss", "loss10", "loss20", "loss30", "burst", "bw", "outage", "recover"]
 SAMPLE_S = 5
 RECOVER_SETTLE_S = 15  # the start of `recover` is the outage's own aftermath, not steady state
 COUNTERS = ("frames", "freezes", "freeze_ms", "packets", "lost", "nack", "pli", "audio_gap_ms", "bytes",
-            "duplicates")
+            "duplicates", "concealed_samples", "concealment_events", "fec_packets")
+AUDIO_HZ = 48000  # what Chrome's concealed samples are counted against
+CLIENT = "client:"  # the id prefix of a client container's `proc` rows
+# An SFU restart the harness logged (`sfu_restart`) excuses the closes, signaling drops, ICE trouble and
+# process errors this long after it (and one sample interval before, for the clocks).
+RESTART_GRACE_S = 60
+RESTART_EXCUSED = ("closes", "sig_closes", "ice_disc", "ice_fail")
 PALETTE = ["#2563eb", "#dc2626", "#059669", "#d97706"]
 ATTACK_KEYS = ("freezes", "freeze_rate", "freeze_ms", "stalls", "stall_max", "closes", "sig_closes", "ice_disc",
                "recover_s",
@@ -126,6 +148,7 @@ HARD_KEYS = ("closes", "sig_closes", "lost_seats")
 OUTAGE_INFO_KEYS = ("audio_gap", "loss")
 WINDOW_LIST_MAX = 200  # the per-window table lists every window up to this many, then only those with an impact
 PHASE_FILL = {"loss": "#facc15", "burst": "#fb923c", "bw": "#60a5fa", "outage": "#ef4444"}
+SWEEP_FILL = {"loss10": "#fde047", "loss20": "#fbbf24", "loss30": "#f59e0b"}  # the loss-sweep profile's phases
 CLOSES = ("the SFU closed the session",)
 SIG = ("the signaling connection closed",)
 
@@ -142,6 +165,7 @@ class Run:
         self.bad = 0
         self.t0 = self.t1 = 0.0
         self.timeline = {}  # group -> ([t], [(t, name)])
+        self.restarts = []  # (t, detail) of every `sfu_restart` event
         self.attacks = []  # {id, name, start, end, group, who, seed, arch, detail}: the attack windows
         self._attack_index = None
 
@@ -155,6 +179,8 @@ class Run:
             r["t"] = r["ts"] / 1000.0 - self.t0
             if r["kind"] == "phase":
                 per[str(r.get("group") or "impaired")].append((r["t"], str(r.get("name"))))
+        self.restarts = sorted((r["t"], str(r.get("detail", ""))) for r in self.rows
+                               if r["kind"] == "event" and r.get("what") == "sfu_restart")
         opened, order = {}, []
         for r in self.rows:
             if r["kind"] != "attack":
@@ -239,6 +265,8 @@ class Series:
                         self.regress += 1
                     d = 0
                 iv[k] = d
+            iv["delay_p50"], iv["delay_p95"] = b.get("delay_p50_ms"), b.get("delay_p95_ms")
+            iv["conc"] = "concealed_samples" in b
             iv["phase"] = self.run.phase_at(self.group, b["t"])[0]
             iv["clean"] = self.run.cleanish(self.group, a["t"]) and self.run.cleanish(self.group, b["t"])
             self.ivs.append(iv)
@@ -256,8 +284,12 @@ class Ent:
     def recv(self, group):
         return [s for s in self.series.values() if s.kind == "recv" and s.group == group]
 
+    def recv_series(self):
+        return [s for s in self.series.values() if s.kind == "recv"]
+
     def proc(self):
-        return [s for s in self.series.values() if s.kind == "proc"]
+        """The SFU's own process samples."""
+        return [s for s in self.series.values() if s.kind == "proc" and not s.id.startswith(CLIENT)]
 
 
 def load(paths):
@@ -357,6 +389,18 @@ def server_span(ents):
     return max(last) if last else max(e.t1 for e in ents)
 
 
+def restart_spans(run):
+    """(start, end) of what each `sfu_restart` the harness logged excuses: from one sample interval
+    before it (the clocks) to RESTART_GRACE_S after. What happens in it is the restart's, booked in the
+    restart recovery table, the way an outage's is booked apart from the phase rows."""
+    return [(r - SAMPLE_S, r + RESTART_GRACE_S) for r, _ in run.restarts]
+
+
+def after_restart(run, t):
+    """Whether t falls in a span an SFU restart excuses."""
+    return any(a <= t <= b for a, b in restart_spans(run))
+
+
 def mean(xs):
     xs = [x for x in xs if x is not None]
     return sum(xs) / len(xs) if xs else None
@@ -417,6 +461,8 @@ def stalls(s):
     outages = [t for t, name in s.run.phases(s.group) if name == "outage"]
 
     def excused(t):
+        if after_restart(s.run, t):
+            return True
         if s.group not in s.run.timeline:
             return False
         if s.run.phase_at(s.group, t)[0] == "outage" or s.run.phase_at(s.group, t - SAMPLE_S)[0] == "outage":
@@ -436,6 +482,17 @@ def stalls(s):
     if ep is not None and not ep[2]:
         out.append((ep[0], ep[1] - ep[0] + SAMPLE_S))
     return out
+
+
+def stall_starts(s):
+    """The times at which a stall episode of a series began, whatever excuses it."""
+    starts, prev = [], False
+    for r in s.s:
+        stalled = bool(r.get("stalled"))
+        if stalled and not prev:
+            starts.append(r["t"])
+        prev = stalled
+    return starts
 
 
 def departures(ent):
@@ -481,6 +538,46 @@ def recoveries(ent, group, rules, gone):
             elif s.s[-1]["t"] - end >= window:
                 out.append(math.inf)
     return out
+
+
+def restart_recovery(ent, rules):
+    """[(n, t, [seconds])] per `sfu_restart` of the run: for each track that was receiving at the
+    restart (packets in its last interval before it), the seconds from the restart until the first
+    interval that began after it carries packets (inf = none within `recover_window_s`; a track that
+    ends sooner is left out). The sampling clock puts every value within one interval."""
+    out = []
+    for t, detail in ent.run.restarts:
+        secs = []
+        for s in ent.recv_series():
+            before = [i for i in s.ivs if i["t"] <= t]
+            if not before or before[-1]["packets"] <= 0:
+                continue
+            hit = next((i for i in s.ivs if i["t"] - i["dt"] >= t and i["packets"] > 0), None)
+            if hit is not None:
+                secs.append(hit["t"] - t)
+            elif s.s[-1]["t"] - t >= rules["recover_window_s"]:
+                secs.append(math.inf)
+        out.append((detail, t, secs))
+    return out
+
+
+def restart_table(ents, rules):
+    body = []
+    for e in sorted(ents, key=lambda e: (e.run.stem, e.impl)):
+        for detail, t, secs in restart_recovery(e, rules):
+            if secs:
+                span = (t - SAMPLE_S, t + RESTART_GRACE_S)
+                sers = e.recv_series()
+                body.append([e.run.stem, e.impl, e.arch, detail, "%.1f" % (t / 60.0), str(len(secs)),
+                             fmt(quantile(secs, 0.5), 1), fmt(quantile(secs, 0.95), 1), fmt(max(secs), 1),
+                             str(sum(1 for s in sers for st in stall_starts(s) if span[0] <= st <= span[1])),
+                             "%.0f" % sum(i["freeze_ms"] for s in sers if s.media == "video"
+                                          for i in s.ivs if in_span(i, [span])),
+                             "%.0f" % sum(i["audio_gap_ms"] for s in sers if s.media == "audio"
+                                          for i in s.ivs if in_span(i, [span]))])
+    return ("SFU restart recovery (seconds until a track receives again; stalls, freeze and audio gap in the excused span)",
+            ["File", "Impl", "Arch", "Restart", "At min", "Tracks", "p50 s", "p95 s", "max s", "Stalls", "Freeze ms",
+             "Audio gap ms"], body) if body else None
 
 
 def slope_mb_per_h(s, t_from, field="rss_mb"):
@@ -548,7 +645,8 @@ def downtimes(ent):
             if kind == "rejoins":
                 out.append((e["t"], group, (e.get("downtime_ms") or 0) / 1000.0))
                 pending = None
-            elif kind in ("closes", "sig_closes", "lost_seats") and pending is None:
+            elif kind in ("closes", "sig_closes", "lost_seats") and pending is None and not (
+                    kind in RESTART_EXCUSED and after_restart(ent.run, e["t"])):
                 pending = e["t"]
             elif e.get("what") == "leave":
                 pending = None
@@ -590,6 +688,10 @@ def scope_metrics(ents, group, phase, rules, drop=None):
         keep = lambda i: id(i) not in dropped
         base = pred
         pred = lambda i: base(i) and keep(i)
+    restarted = {id(i) for s in sers if s.run.restarts for i in s.ivs if in_span(i, restart_spans(s.run))}
+    if restarted:
+        base_pred = pred
+        pred = lambda i: base_pred(i) and id(i) not in restarted
     ivs = [i for s in sers for i in s.ivs if pred(i)]
     packets = sum(i["packets"] for i in ivs)
     dup = sum(i["duplicates"] for i in ivs)
@@ -605,6 +707,7 @@ def scope_metrics(ents, group, phase, rules, drop=None):
         "dup": 100.0 * dup / packets if packets else None,
         "freezes": sum(i["freezes"] for i in ivs) if ivs else None,
     }
+    m.update(delay_metrics(sers, pred))
     if phase == "outage":
         # An outage is a few samples long, so a rate per minute would be decided by where the sampling
         # clock falls: score the freeze per episode instead.
@@ -642,6 +745,8 @@ def scope_metrics(ents, group, phase, rules, drop=None):
             if kind and ev.get("id") != "sfu" and str(ev.get("group") or "impaired") == group:
                 if drop is not None and drop(e.run, ev["t"], ev["t"]):
                     continue
+                if kind in RESTART_EXCUSED and after_restart(e.run, ev["t"]):
+                    continue
                 if kind == "ice_disc" and outage_disconnect(e.run, group, ev["t"]):
                     continue
                 if kind == "ice_fail" and own_outage(e.run, group, str(ev.get("id")), ev["t"]):
@@ -654,6 +759,22 @@ def scope_metrics(ents, group, phase, rules, drop=None):
     for k in ("closes", "sig_closes", "lost_seats", "rejoins", "ice_disc", "ice_fail"):
         m[k] = counts[k]
     m["downtime"] = down
+    return m
+
+
+def delay_metrics(sers, pred):
+    """Delay (median of the intervals' p50, 95th percentile of their p95) per media, and what Chrome's
+    audio counted: concealed samples as a share of the samples played (AUDIO_HZ over the interval) and
+    the FEC packets. A key is None when no interval of the phase carries the field."""
+    m = {}
+    for media in ("audio", "video"):
+        ivs = [i for s in sers if s.media == media for i in s.ivs if pred(i)]
+        m["delay_%s_p50" % media] = quantile([i["delay_p50"] for i in ivs if i["delay_p50"] is not None], 0.5)
+        m["delay_%s_p95" % media] = quantile([i["delay_p95"] for i in ivs if i["delay_p95"] is not None], 0.95)
+    conc = [i for s in sers if s.media == "audio" for i in s.ivs if pred(i) and i["conc"]]
+    secs = sum(i["dt"] for i in conc)
+    m["conceal_pct"] = 100.0 * sum(i["concealed_samples"] for i in conc) / (secs * AUDIO_HZ) if secs > 0 else None
+    m["fec_packets"] = sum(i["fec_packets"] for i in conc) if conc else None
     return m
 
 
@@ -685,7 +806,8 @@ def sfu_metrics(ents, rules, phase=None):
             m[key] = max(spans) if spans else None
         errs = [r.get("udp_rcvbuf_err") for s in procs for r in s.s if r.get("udp_rcvbuf_err") is not None]
         m["udp_err"] = (max(errs) - min(errs)) if errs else None
-        m["sfu_errors"] = sum(1 for e in ents for ev in e.events if ev.get("id") == "sfu" and ev.get("what") == "error")
+        m["sfu_errors"] = sum(1 for e in ents for ev in e.events if ev.get("id") == "sfu" and ev.get("what") == "error"
+                              and not after_restart(e.run, ev["t"]))
     return m
 
 
@@ -782,7 +904,7 @@ def window_metrics(ent, win, rules, clean_only=False):
 # ICE, recovery); a stall during one of them with no shaping on is reported by `quiet_stalls`.
 NETWORK_ATTACKS = frozenset(("reorder", "duplicate", "jitter", "asym-loss", "bw-flap", "nat-rebind", "mtu",
                              "trace-stall", "trace-low"))
-SHAPED_PHASES = frozenset(("loss", "burst", "bw", "outage"))
+SHAPED_PHASES = frozenset(("loss", "loss10", "loss20", "loss30", "burst", "bw", "outage"))
 
 
 def network_attack(name):
@@ -909,8 +1031,8 @@ def compare(ents, rules):
     """All comparisons: {"rows": [...], "checks": [...]} where a check is a gated pass/fail."""
     rows, checks = [], []
 
-    def add(gated, rule, value, limit, ok):
-        status = "n/a" if ok is None else ("PASS" if ok else ("FAIL" if gated else "breach"))
+    def add(gated, rule, value, limit, ok, miss=False):
+        status = "n/a" if ok is None else ("PASS" if ok else ("MISS" if miss else ("FAIL" if gated else "breach")))
         checks.append({"rule": rule, "value": value, "limit": limit, "status": status, "gated": gated})
 
     for spec in rules["compare"]:
@@ -1043,6 +1165,16 @@ def compare(ents, rules):
                     add(g_, "%s: %s SFU process errors (gone, crashed) must be zero" % (where, side),
                         fmt(sm["sfu_errors"], 0), "0", sm["sfu_errors"] == 0)
             drift_checks(full_ents, rules, where, gated, add)
+            for tgt in rules["targets"]:
+                if tgt.get("subject", spec["subject"]) != spec["subject"]:
+                    continue
+                m = scope_metrics(full_ents, tgt.get("scope", "impaired"), tgt.get("phase"), rules)
+                v = m.get(tgt["metric"]) if m else None
+                bound = tgt["max"] if "max" in tgt else tgt["min"]
+                limit = "%s %s" % ("<=" if "max" in tgt else ">=", fmt(bound, DEC.get(tgt["metric"], 2)))
+                ok = None if v is None else (v <= bound if "max" in tgt else v >= bound)
+                own = tgt.get("gated", True)
+                add(gated and own, "%s: %s" % (where, tgt["name"]), fmt(v, DEC.get(tgt["metric"], 2)), limit, ok, not own)
     return rows, checks
 
 
@@ -1164,6 +1296,9 @@ def tables(rows, extra, runs, ents=None, rules=None, val=None):
     tx = tx_table(ents) if ents else None
     if tx:
         out.append(tx)
+    rt = restart_table(ents, rules) if ents and rules else None
+    if rt:
+        out.append(rt)
     groups = defaultdict(list)
     for r in rows:
         groups[(r["arch"], r["pair"])].append(r)
@@ -1262,11 +1397,11 @@ def svg_chart(title, data, colors, phases, span_min, attacks=()):
     o = ['<svg viewBox="0 0 %d %d" role="img" aria-label="%s">' % (W, H, html.escape(title)),
          '<text x="%d" y="14" class="t">%s</text>' % (L, html.escape(title))]
     for i, (t, name) in enumerate(phases):
-        if name in PHASE_FILL:
+        if name in PHASE_FILL or name in SWEEP_FILL:
             end = phases[i + 1][0] if i + 1 < len(phases) else span_min * 60
             x0, x1 = xs(t / 60.0), xs(end / 60.0)
             o.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="%s" opacity="0.22"/>' % (
-                x0, T, max(x1 - x0, 1.0), H - T - B, PHASE_FILL[name]))
+                x0, T, max(x1 - x0, 1.0), H - T - B, {**PHASE_FILL, **SWEEP_FILL}[name]))
     for a, b in attacks:
         x0, x1 = xs(a / 60.0), xs(b / 60.0)
         o.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="%s" opacity="0.16"/>' % (
@@ -1303,6 +1438,7 @@ def html_report(rows, checks, runs, ents, rules, failed, val=None):
     if reason:
         parts.append("<p class=f>INVALID RUN, no verdict: %s</p>" % html.escape(reason))
     legend = dict(PHASE_FILL)
+    legend.update((n, c) for n, c in SWEEP_FILL.items() if n in phase_names(ents))
     if any(r.attacks for r in runs):
         legend["attack"] = ATTACK_FILL
     parts.append("<p>" + "".join('<span class=sw style="background:%s"></span>%s' % (c, n) for n, c in legend.items()) + "</p>")
@@ -1419,7 +1555,7 @@ def validity(runs, ents, rules):
                     a, b = vals["offerer"][k], vals["answerer"][k]
                     add(run.stem, "%s counted on both sides" % k, "offerer %d, answerer %d" % (a, b), a > 0 and b > 0)
         for s in sers:
-            if s.kind != "proc":
+            if s.kind != "proc" or s.id.startswith(CLIENT):
                 continue
             cpus = [r["cpu_pct"] for r in s.s if r.get("cpu_pct") is not None]
             if cpus:
@@ -1431,6 +1567,19 @@ def validity(runs, ents, rules):
                 pct = 100.0 * sum(1 for ld, n in loads if ld > n) / len(loads)
                 add(run.stem, "%s host load average within the CPU count" % s.id,
                     "%.1f %% of samples above it" % pct, pct <= rules["valid_load_pct_max"])
+        for s in sers:
+            if s.kind == "proc" and s.id.startswith(CLIENT):
+                rows = [r for r in s.s if r.get("cpu_pct") is not None]
+                if rows:
+                    over = sum(1 for r in rows if r["cpu_pct"] > rules["valid_client_cpu_pct"] * (r.get("cores") or 1))
+                    pct = 100.0 * over / len(rows)
+                    add(run.stem, "%s CPU within %g %% of its cores" % (s.id, rules["valid_client_cpu_pct"]),
+                        "%.1f %% of samples above it" % pct, pct <= rules["valid_client_cpu_samples_pct_max"])
+        delays = [v for s in recv for r in s.s for v in (r.get("delay_p50_ms"), r.get("delay_p95_ms")) if v is not None]
+        if delays:
+            pct = 100.0 * sum(1 for v in delays if not 0 <= v <= rules["valid_delay_max_ms"]) / len(delays)
+            add(run.stem, "delay samples within 0-%g ms" % rules["valid_delay_max_ms"],
+                "%.1f %% of %d outside" % (pct, len(delays)), pct <= rules["valid_delay_out_pct_max"])
     # (a) the peer pairs of one report deliver comparable amounts (an SFU soak has no pairs).
     if len(totals) >= 2 and min(totals.values()) > 0:
         ratio = max(totals.values()) / min(totals.values())

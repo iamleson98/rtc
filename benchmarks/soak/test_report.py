@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Self-test of report.py on small generated runs: python3 -m unittest -v benchmarks/soak/test_report.py"""
 import json
+import math
 import os
 import sys
 import tempfile
@@ -741,3 +742,201 @@ class NetworkAttribution(unittest.TestCase):
         self.assertEqual(report.quiet_stalls(e(with_junk), rules), 1)
         shaped = peer_pair("rtc", timeline=[phase(0, "clean"), phase(25, "loss"), phase(60, "clean")], stalled=(30, 35))
         self.assertEqual(report.quiet_stalls(e(shaped), rules), 0)
+
+
+def with_fields(rows, **fn):
+    """The rows with extra fields: each value is a function of the row's time in seconds."""
+    for r in rows:
+        t = (r["ts"] - T0) / 1000.0
+        for k, f in fn.items():
+            r[k] = f(t)
+    return rows
+
+
+def entities(*files):
+    """{name: Ent} of the files' single entity each (the file name is the entity's run)."""
+    _, runs, _ = validate(*files)
+    return report.build_entities(runs)
+
+
+def meet_side(impl, delay=40.0, video_delay=60.0, concealed=0, fec=0):
+    """A loss-sweep run of one impl: an impaired audio and video receiver with delay, and Chrome's audio
+    counters (`concealed` samples and `fec` packets every 5 s)."""
+    sweep = [phase(0, "clean"), phase(60, "loss10"), phase(120, "loss20"), phase(180, "loss30"), phase(240, "recover")]
+    rows = list(sweep) + proc(impl, 300)
+    aud = track(impl, "s01/audio:teacher", "impaired", 300, media="audio")
+    with_fields(aud, delay_p50_ms=lambda t: delay + (t // 60) * 10, delay_p95_ms=lambda t: delay * 2 + (t // 60) * 10,
+                concealed_samples=lambda t: int(concealed * (t // STEP)), concealment_events=lambda t: int(t // STEP),
+                fec_packets=lambda t: int(fec * (t // STEP)))
+    vid = track(impl, "s01/video:teacher", "impaired", 300)
+    with_fields(vid, delay_p50_ms=lambda t: video_delay, delay_p95_ms=lambda t: video_delay * 2)
+    return rows + aud + vid
+
+
+class LossSweepAndDelay(unittest.TestCase):
+    def metrics(self, rows, phase_name):
+        ents = [e for e in entities(("x", rows))]
+        return report.scope_metrics(ents, "impaired", phase_name, dict(report.DEFAULTS))
+
+    def test_the_loss_sweep_phases_are_known_and_ordered(self):
+        ents = entities(("x", meet_side("rtcd-rs")))
+        self.assertEqual(report.phase_names(ents), ["clean", "loss10", "loss20", "loss30", "recover"])
+
+    def test_delay_per_phase_audio_and_video(self):
+        m = self.metrics(meet_side("rtcd-rs"), "loss20")  # minutes 2 to 3: audio p50 40 + 20 = 60, p95 80 + 20 = 100
+        self.assertEqual((m["delay_audio_p50"], m["delay_audio_p95"]), (60.0, 100.0))
+        self.assertEqual((m["delay_video_p50"], m["delay_video_p95"]), (60.0, 120.0))
+
+    def test_audio_delay_is_judged_and_video_delay_is_report_only(self):
+        _, md, _, _ = run_report(meet_side("rtcd-rs", delay=200.0, video_delay=900.0), meet_side("rtcd-go"))
+        self.assertIn("| impaired | loss10 | Audio delay p50 ms | 210.0 | 50.0 | BREACH |", md)
+        line = next(l for l in md.splitlines() if l.startswith("| impaired | loss10 | Video delay p50 ms"))
+        self.assertTrue(line.endswith("| 900.0 | 60.0 |  |"), line)
+
+    def test_concealment_percent_and_fec_packets(self):
+        # 2400 samples per 5 s of 240000 played: 1 %.
+        m = self.metrics(meet_side("rtcd-rs", concealed=2400, fec=3), "loss10")
+        self.assertAlmostEqual(m["conceal_pct"], 1.0, places=6)
+        self.assertEqual(m["fec_packets"], 36)  # 12 intervals in the minute
+
+    def test_old_rows_have_none_of_the_new_metrics(self):
+        s, _ = Fixture().rows()
+        m = self.metrics(s, "bw")
+        self.assertEqual([m[k] for k in ("delay_audio_p50", "delay_video_p95", "conceal_pct", "fec_packets")], [None] * 4)
+
+
+def restart_run(impl, restart_at=102, down=(105, 125), extra=()):
+    rows = [phase(0, "clean")] + proc(impl, END) + list(extra)
+    rows.append(event(impl, restart_at, "run.sh", "sfu_restart", "1"))
+    rows += track(impl, "s01/video:teacher", "impaired", END, flowing=lambda t: not (down[0] <= t < down[1]))
+    rows += track(impl, "s02/video:teacher", "impaired", END)
+    rows += track(impl, "s03/audio:teacher", "impaired", END, media="audio", flowing=lambda t: not (down[0] <= t < down[1] + 20))
+    return rows
+
+
+class SfuRestart(unittest.TestCase):
+    def test_recovery_per_track(self):
+        ents = entities(("x", restart_run("rtcd-rs")))
+        (detail, t, secs), = report.restart_recovery(ents[0], dict(report.DEFAULTS))
+        # The interrupted video resumes in the interval that starts at 120, ends at 125: 23 s after 102; the
+        # untouched one in the interval 105-110 (the first that starts after the restart): 8 s; the audio 20 s later.
+        self.assertEqual((detail, t, sorted(secs)), ("1", 102.0, [8.0, 23.0, 43.0]))
+
+    def test_a_track_that_never_comes_back_is_never(self):
+        rows = restart_run("rtcd-rs", down=(105, 500))
+        ents = entities(("x", rows))
+        (_, _, secs), = report.restart_recovery(ents[0], dict(report.DEFAULTS))
+        self.assertEqual(sorted(secs), [8.0, math.inf, math.inf])
+
+    def test_the_table_has_p50_p95_max(self):
+        _, md, _, _ = run_report(restart_run("rtcd-rs"), restart_run("rtcd-go"))
+        self.assertIn("## SFU restart recovery", md)
+        self.assertIn("| rtcd-rs-x86_64 | rtcd-rs | x86_64 | 1 | 1.7 | 3 | 23.0 | 43.0 | 43.0 |", md)
+
+    def test_a_restart_in_its_event_is_not_a_crash_close_or_process_error(self):
+        errs = [event("rtcd-rs", 104, "sfu", "error", "the SFU exited"),
+                event("rtcd-rs", 106, "s01", "error", "the SFU closed the session"),
+                event("rtcd-rs", 107, "s01", "error", "the signaling connection closed"),
+                event("rtcd-rs", 108, "s01", "ice_state", "ice:disconnected")]
+        rules = dict(report.DEFAULTS)
+        with_restart = entities(("x", restart_run("rtcd-rs", extra=errs)))
+        m = report.scope_metrics(with_restart, "impaired", None, rules)
+        self.assertEqual([m[k] for k in ("closes", "sig_closes", "ice_disc", "downtime")], [0, 0, 0, 0.0])
+        self.assertEqual(report.sfu_metrics(with_restart, rules)["sfu_errors"], 0)
+        rows = [r for r in restart_run("rtcd-rs", extra=errs) if r.get("what") != "sfu_restart"]
+        without = entities(("x", rows))
+        m = report.scope_metrics(without, "impaired", None, rules)
+        self.assertEqual([m[k] for k in ("closes", "sig_closes", "ice_disc")], [1, 1, 1])
+        self.assertEqual(report.sfu_metrics(without, rules)["sfu_errors"], 1)
+
+    def test_an_error_long_after_the_restart_still_counts(self):
+        late = [event("rtcd-rs", 102 + report.RESTART_GRACE_S + 30, "sfu", "error", "the SFU exited")]
+        self.assertEqual(report.sfu_metrics(entities(("x", restart_run("rtcd-rs", extra=late))), dict(report.DEFAULTS))["sfu_errors"], 1)
+
+
+class RestartIsBookedApart(unittest.TestCase):
+    def rows(self, restart):
+        rows = restart_run("rtcd-rs", down=(105, 125))
+        if not restart:
+            rows = [r for r in rows if r.get("what") != "sfu_restart"]
+        for r in rows:
+            if r.get("id") == "s01/video:teacher" and 105 <= (r["ts"] - T0) / 1000 < 125:
+                r["stalled"] = True
+                r["freezes"], r["freeze_ms"] = 1, 4000
+            elif r.get("id") == "s01/video:teacher" and (r["ts"] - T0) / 1000 >= 125:
+                r["freezes"], r["freeze_ms"] = 1, 4000
+        return rows
+
+    def test_stalls_and_freezes_in_the_span_are_not_in_the_phase_rows_but_in_the_table(self):
+        rules = dict(report.DEFAULTS)
+        plain = report.scope_metrics(entities(("x", self.rows(False))), "impaired", None, rules)
+        self.assertEqual(plain["stalls"], 1)
+        self.assertGreater(plain["freeze_ms"], 0)
+        booked = report.scope_metrics(entities(("x", self.rows(True))), "impaired", None, rules)
+        self.assertEqual(booked["stalls"], 0)
+        self.assertEqual(booked["freeze_ms"], 0)
+        _, md, _, _ = run_report(self.rows(True), self.rows(True))
+        row = next(l for l in md.splitlines() if l.startswith("| rtcd-rs-x86_64 | rtcd-rs | x86_64 | 1 | 1.7 |"))
+        self.assertTrue(row.endswith("| 1 | 4000 | 0 |"), row)
+
+
+def client_proc(name, cpu, cores, end=100):
+    return [{"ts": ts(t), "impl": "rtcd-rs", "arch": "x86_64", "kind": "proc", "id": "client:" + name, "cpu_pct": cpu(t),
+             "cores": cores} for t in range(0, end, STEP)]
+
+
+class MeetValidity(unittest.TestCase):
+    def test_client_containers_leave_the_sfu_metrics_alone(self):
+        ents = entities(("x", meet_side("rtcd-rs") + client_proc("c1", lambda t: 400.0, 2)))
+        self.assertEqual(report.sfu_metrics(ents, dict(report.DEFAULTS))["cpu"], 50.0)
+
+    def test_a_client_above_ninety_percent_of_its_cores_is_invalid(self):
+        busy = lambda t: 190.0 if t < 20 else 50.0  # 4 of 20 samples above 90 % of 2 cores: 20 %
+        val, _, _ = validate(("x", meet_side("rtcd-rs") + client_proc("c1", busy, 2)))
+        self.assertEqual(failed_checks(val), ["client:c1 CPU within 90 % of its cores"])
+        calm = lambda t: 150.0 if t < 5 else 50.0  # one of 20 samples: 5 %
+        val, _, _ = validate(("x", meet_side("rtcd-rs") + client_proc("c1", calm, 2)))
+        self.assertEqual(failed_checks(val), [])
+
+    def test_delay_samples_outside_the_sane_range_are_invalid(self):
+        rows = meet_side("rtcd-rs")
+        val, _, _ = validate(("x", rows))
+        self.assertEqual(failed_checks(val), [])
+        bad = [r for r in rows if r.get("id") == "s01/audio:teacher"]
+        for r in bad[::10]:
+            r["delay_p95_ms"] = 5000.0
+        val, _, _ = validate(("x", rows))
+        self.assertEqual(failed_checks(val), ["delay samples within 0-2000 ms"])
+        for r in bad:
+            r["delay_p95_ms"] = None if r["delay_p95_ms"] == 5000.0 else r["delay_p95_ms"]
+            r["delay_p50_ms"] = -5.0 if r["ts"] == bad[3]["ts"] else r["delay_p50_ms"]
+        val, _, _ = validate(("x", rows))
+        self.assertEqual(failed_checks(val), [])
+
+
+class TargetRules(unittest.TestCase):
+    def run_targets(self, targets, **kw):
+        rules = dict(RULES, targets=targets, require_groups=[])
+        status, md, _, _ = run_report(meet_side("rtcd-rs", **kw), meet_side("rtcd-go"), rules)
+        return status, md
+
+    def test_an_ungated_target_shows_pass_or_miss_and_never_fails(self):
+        status, md = self.run_targets([
+            {"name": "Meet audio delay p95 (loss10)", "metric": "delay_audio_p95", "phase": "loss10", "max": 100, "gated": False},
+            {"name": "Meet audio delay p95 (loss30)", "metric": "delay_audio_p95", "phase": "loss30", "max": 100, "gated": False}])
+        self.assertEqual(status, 0)
+        self.assertIn("Meet audio delay p95 (loss10) | 90.0 | <= 100.0 | PASS (not gated) |", md)
+        self.assertIn("Meet audio delay p95 (loss30) | 110.0 | <= 100.0 | MISS (not gated) |", md)
+        self.assertNotIn("- MISS", md)
+
+    def test_a_gated_target_fails_the_run(self):
+        status, md = self.run_targets([{"name": "audio loss", "metric": "delay_audio_p50", "phase": "loss30", "max": 10}])
+        self.assertEqual(status, 1)
+        self.assertIn("audio loss | 70.0 | <= 10.0 | FAIL |", md)
+
+    def test_a_target_without_data_is_not_applicable(self):
+        status, md = self.run_targets([{"name": "concealed", "metric": "conceal_pct", "max": 1.0, "gated": False}])
+        self.assertEqual(status, 0)
+        self.assertIn("concealed | 0.00 | <= 1.00 | PASS (not gated) |", md)
+        _, md2 = self.run_targets([{"name": "fec", "metric": "fec_packets", "min": 1, "scope": "nobody"}])
+        self.assertIn("fec | - | >= 1 | n/a |", md2)
