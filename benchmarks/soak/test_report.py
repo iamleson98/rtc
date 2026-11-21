@@ -828,6 +828,17 @@ class SfuRestart(unittest.TestCase):
         (_, _, secs), = report.restart_recovery(ents[0], dict(report.DEFAULTS))
         self.assertEqual(sorted(secs), [8.0, math.inf, math.inf])
 
+    def test_restart_recovery_is_a_target_metric(self):
+        rules = dict(report.DEFAULTS)
+        m = report.scope_metrics(entities(("x", restart_run("rtcd-rs"))), "impaired", None, rules)
+        self.assertEqual((m["restart_recover_p95"], m["restart_recover_max"]), (43.0, 43.0))
+        never = report.scope_metrics(entities(("x", restart_run("rtcd-rs", down=(105, 500)))), "impaired", None, rules)
+        self.assertEqual(never["restart_recover_max"], math.inf)
+        self.assertIsNone(report.scope_metrics(entities(("x", restart_run("rtcd-rs"))), "impaired", "clean", rules)["restart_recover_max"])
+        _, md, _, _ = run_report(restart_run("rtcd-rs", down=(105, 500)), restart_run("rtcd-go"), dict(
+            RULES, require_groups=[], targets=[{"name": "recover", "metric": "restart_recover_max", "max": 30}]))
+        self.assertIn("recover | never | <= 30.0 | FAIL |", md)
+
     def test_the_table_has_p50_p95_max(self):
         _, md, _, _ = run_report(restart_run("rtcd-rs"), restart_run("rtcd-go"))
         self.assertIn("## SFU restart recovery", md)

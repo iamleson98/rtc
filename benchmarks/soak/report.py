@@ -84,6 +84,8 @@ METRICS = [
     ("delay_video_p95", "Video delay p95 ms (report only)", 1, None, 0),
     ("conceal_pct", "Concealed audio % (Chrome)", 2, None, 0),
     ("fec_packets", "FEC packets (Chrome audio)", 0, None, 0),
+    ("restart_recover_p95", "SFU restart recovery p95 s", 1, None, 0),
+    ("restart_recover_max", "SFU restart recovery max s", 1, None, 0),
     ("stalls", "Stalls outside outage", 0, "count", 0),
     ("quiet_stalls", "Stalls with no network attack active", 0, "count", 0),
     ("stall_max", "Longest stall s", 1, "rate", 2),
@@ -540,8 +542,8 @@ def recoveries(ent, group, rules, gone):
     return out
 
 
-def restart_recovery(ent, rules):
-    """[(n, t, [seconds])] per `sfu_restart` of the run: for each track that was receiving at the
+def restart_recovery(ent, rules, group=None):
+    """[(n, t, [seconds])] per `sfu_restart` of the run (of `group`'s tracks when given): for each track that was receiving at the
     restart (packets in its last interval before it), the seconds from the restart until the first
     interval that began after it carries packets (inf = none within `recover_window_s`; a track that
     ends sooner is left out). The sampling clock puts every value within one interval."""
@@ -549,6 +551,8 @@ def restart_recovery(ent, rules):
     for t, detail in ent.run.restarts:
         secs = []
         for s in ent.recv_series():
+            if group is not None and s.group != group:
+                continue
             before = [i for i in s.ivs if i["t"] <= t]
             if not before or before[-1]["packets"] <= 0:
                 continue
@@ -708,6 +712,8 @@ def scope_metrics(ents, group, phase, rules, drop=None):
         "freezes": sum(i["freezes"] for i in ivs) if ivs else None,
     }
     m.update(delay_metrics(sers, pred))
+    secs = [x for e in ents for _, _, v in restart_recovery(e, rules, group) for x in v] if phase is None else []
+    m["restart_recover_p95"], m["restart_recover_max"] = (quantile(secs, 0.95), max(secs)) if secs else (None, None)
     if phase == "outage":
         # An outage is a few samples long, so a rate per minute would be decided by where the sampling
         # clock falls: score the freeze per episode instead.

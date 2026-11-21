@@ -428,7 +428,7 @@ freeze ms keeps the sample's time).
 side to the input file with that name (`rtc-rtc`, `pion-pion`), and `"gate": false` reports the pair
 without failing on it. For each architecture the subject is held to the baseline:
 
-* `targets` (absolute, on the subject; the key is a metric of the tables): `{"name", "metric", "max"` or
+* `targets` (absolute, on the subject; the key is a metric of the tables, including `restart_recover_p95` and `restart_recover_max`, the worst recovery seconds over all restarts and receivers, `never` counting as infinite): `{"name", "metric", "max"` or
   `"min"`, `"scope"` (group, default `impaired`), `"phase"` (default all), `"subject"` (default every pair),
   `"gated"` (default true)`}`. A target with `"gated": false` shows PASS or MISS (not gated) in the rules table
   and never fails the run;
