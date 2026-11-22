@@ -243,9 +243,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every receiver. With packets queued, `Pacer::refill_backlogged` now credits the whole time since
   the last refill, up to 100 ms of the rate (`PACER_BACKLOG_CATCH_UP_WINDOW`), instead of one burst
   (5 ms in the send-rate mode): a wake-up `T` ms late could release only `5 / T` of the rate. An
-  idle pacer keeps the burst cap, and a rate cut clamps the budget to the new cap. In the send-rate
-  mode the rate is now twice the bits that *arrived* over the last second rather than the bits
-  released, so a backlog no longer lowers the rate it has to be drained at.
+  idle pacer keeps the burst cap, and a rate cut clamps the budget to the new cap.
 - `rtc-interceptor`, `rtc`: NACK and RTX. A packet repaired over RTX now counts as received: the
   generator credits an RTX packet to the stream it repairs under its original sequence number
   (RFC 4588), where before it stayed "missing" and was asked for until it left the receive log.
