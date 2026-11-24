@@ -49,8 +49,28 @@ impl SsrcOwners {
             return Some(id);
         }
         let id = transceivers.iter().position(|t| owns(t, ssrc))?;
+        // A hint outlives the SSRC it names when a simulcast layer moves to another SSRC, and the
+        // peer chooses how often that happens. Sweeping the dead ones as the table fills keeps it
+        // to what is live plus `PRUNE_AT`; a sweep costs one pass, and only a new SSRC pays it.
+        if self.0.len() >= Self::PRUNE_AT {
+            self.0
+                .retain(|&s, &mut id| transceivers.get(id).is_some_and(|t| owns(t, s)));
+        }
         self.0.insert(ssrc, id);
         Some(id)
+    }
+
+    /// Hints held before the dead ones are swept out of the table.
+    const PRUNE_AT: usize = 64;
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Forgets the hint for an SSRC that no longer belongs to any receiver.
+    pub(crate) fn forget(&mut self, ssrc: SSRC) {
+        self.0.remove(&ssrc);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -911,5 +931,33 @@ mod tests {
             assert_eq!(None, owners.cached(ssrc, &transceivers, |_, _| true));
         }
         assert!(owners.0.is_empty());
+    }
+
+    /// Hints for SSRCs a receiver stopped owning (a simulcast layer that moved) do not pile up
+    /// however many times the peer moves it.
+    #[test]
+    fn hints_for_ssrcs_nobody_owns_any_more_are_swept() {
+        use crate::rtp_transceiver::rtp_sender::RtpCodecKind;
+        use crate::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static CURRENT: AtomicU32 = AtomicU32::new(0);
+        let transceivers = [RTCRtpTransceiverInternal::new(
+            RtpCodecKind::Video,
+            None,
+            RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                streams: vec![],
+                send_encodings: vec![],
+            },
+        )];
+        let mut owners = SsrcOwners::default();
+        for ssrc in 0..10_000u32 {
+            CURRENT.store(ssrc, Ordering::Relaxed);
+            let owns: fn(&RTCRtpTransceiverInternal, SSRC) -> bool =
+                |_, s| s == CURRENT.load(Ordering::Relaxed);
+            assert_eq!(Some(0), owners.find(ssrc, &transceivers, owns));
+        }
+        assert!(owners.0.len() <= SsrcOwners::PRUNE_AT);
     }
 }

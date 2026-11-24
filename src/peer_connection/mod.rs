@@ -1454,8 +1454,7 @@ impl RTCPeerConnection {
 
         self.pipeline_context
             .interceptor_handler_context
-            .ssrc_owners
-            .clear();
+            .reset_for_remote_description();
         self.pipeline_context
             .endpoint_handler_context
             .ssrc_owners

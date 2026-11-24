@@ -455,6 +455,25 @@ impl RTCStatsAccumulator {
             })
     }
 
+    /// Drops the accumulator of an inbound stream that was replaced, with its repair-flow
+    /// lookups. Used when a simulcast layer moves to a new SSRC, so the old one stops counting
+    /// against this connection.
+    pub(crate) fn remove_inbound_rtp_stream(&mut self, ssrc: SSRC) {
+        let Some(stream) = self.inbound_rtp_streams.remove(&ssrc) else {
+            return;
+        };
+        if let Some(rtx) = stream.rtx_ssrc
+            && self.rtx_ssrc_to_primary.get(&rtx) == Some(&ssrc)
+        {
+            self.rtx_ssrc_to_primary.remove(&rtx);
+        }
+        if let Some(fec) = stream.fec_ssrc
+            && self.fec_ssrc_to_primary.get(&fec) == Some(&ssrc)
+        {
+            self.fec_ssrc_to_primary.remove(&fec);
+        }
+    }
+
     /// Gets or creates an outbound stream accumulator for the given SSRC.
     ///
     /// # Parameters

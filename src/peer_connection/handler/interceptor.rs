@@ -28,17 +28,71 @@ use rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use shared::error::{Error, Result};
 use shared::marshal::MarshalSize;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unicase::UniCase;
+
+/// How often one simulcast layer may move to another SSRC, which any publisher can do on every
+/// packet. A browser moves a layer when its encoder restarts or its track is replaced, a few times
+/// at most in a call and not in quick succession, so this is generous for it. A move takes the
+/// layer's old stream out of the connection first, so the state never grows with the number of
+/// moves; the budget bounds the work a publisher can cause (an interceptor bind and unbind and an
+/// `OnOpen` per move), and the application, which sees that event, can rely on it being rare.
+const MAX_LAYER_REBINDS: u8 = 4;
+const LAYER_REBIND_WINDOW: Duration = Duration::from_secs(60);
+
+/// The SSRC moves one simulcast layer has made in its current window.
+struct LayerRebinds {
+    receiver: usize,
+    rid: String,
+    window_start: Instant,
+    used: u8,
+}
 
 #[derive(Default)]
 pub(crate) struct InterceptorHandlerContext {
     is_dtls_handshake_complete: bool,
     pub(crate) ssrc_owners: SsrcOwners,
+    // One entry per (receiver, rid) the peer has moved, so it holds at most as many as the
+    // negotiated description has layers; a new description starts the count again.
+    layer_rebinds: Vec<LayerRebinds>,
 
     pub(crate) read_outs: VecDeque<TaggedRTCMessageInternal>,
     pub(crate) write_outs: VecDeque<TaggedRTCMessageInternal>,
     pub(crate) event_outs: VecDeque<TaggedRTCEventInternal>,
+}
+
+impl InterceptorHandlerContext {
+    /// Forgets what was learned from the previous remote description.
+    pub(crate) fn reset_for_remote_description(&mut self) {
+        self.ssrc_owners.clear();
+        self.layer_rebinds.clear();
+    }
+
+    /// Spends one SSRC move of the layer `rid` of `receiver`, if its window has any left.
+    fn allow_layer_rebind(&mut self, now: Instant, receiver: usize, rid: &str) -> bool {
+        let Some(layer) = self
+            .layer_rebinds
+            .iter_mut()
+            .find(|layer| layer.receiver == receiver && layer.rid == rid)
+        else {
+            self.layer_rebinds.push(LayerRebinds {
+                receiver,
+                rid: rid.to_owned(),
+                window_start: now,
+                used: 1,
+            });
+            return true;
+        };
+        if now.saturating_duration_since(layer.window_start) >= LAYER_REBIND_WINDOW {
+            layer.window_start = now;
+            layer.used = 0;
+        }
+        if layer.used >= MAX_LAYER_REBINDS {
+            return false;
+        }
+        layer.used += 1;
+        true
+    }
 }
 
 fn receiver_declares_ssrc(transceiver: &RTCRtpTransceiverInternal, ssrc: SSRC) -> bool {
@@ -690,11 +744,29 @@ impl<'a> InterceptorHandler<'a> {
         }
 
         // Validate rid against SDP. If invalid then drop it.
-        match receiver.get_coding_parameter_mut_by_rid(rid.as_str()) {
-            None => return false,
-            Some(coding) if coding.ssrc == Some(ssrc) => return true,
-            Some(coding) => coding.ssrc = Some(ssrc),
+        let Some(coding) = receiver.get_coding_parameter_mut_by_rid(rid.as_str()) else {
+            return false;
+        };
+        let previous = coding.ssrc;
+        if previous == Some(ssrc) {
+            return true;
         }
+        // The layer is moving off an SSRC it already had. Over budget, the packet is accounted for
+        // (so no other path binds it) and goes on unbound, where nothing owns it.
+        if previous.is_some() && !self.ctx.allow_layer_rebind(now, id, &rid) {
+            trace!("simulcast layer {rid} moved to SSRC {ssrc} too often, ignored");
+            return true;
+        }
+        // The repair flows belong to the stream that is going: the new one brings its own, learned
+        // from its `rrid` packets, which a stale pairing would refuse.
+        let replaced = previous.map(|old| {
+            (
+                old,
+                coding.rtx.take().map(|rtx| rtx.ssrc),
+                coding.fec.take().map(|fec| fec.ssrc),
+            )
+        });
+        coding.ssrc = Some(ssrc);
 
         // Get RTX and FEC SSRCs from coding parameters.
         //
@@ -714,6 +786,42 @@ impl<'a> InterceptorHandler<'a> {
             .unwrap_or((None, None));
 
         let parameters = receiver.get_parameters(self.media_engine);
+
+        // Take the replaced stream out everywhere it was put in, the way `stop` does, before the
+        // new one goes in. Its accumulator and owner hint go too; the track's coding already
+        // names the new SSRC.
+        if let Some((old_ssrc, old_rtx, old_fec)) = replaced {
+            let old_rtx = old_rtx.zip(find_rtx_payload_type(
+                codec.payload_type,
+                &parameters.rtp_parameters.codecs,
+            ));
+            let old_fec = old_fec.zip(find_fec_payload_type(&parameters.rtp_parameters.codecs));
+            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+                self.interceptor,
+                false,
+                old_ssrc,
+                old_rtx.map(|(ssrc_rtx, _)| ssrc_rtx),
+                old_fec.map(|(ssrc_fec, _)| ssrc_fec),
+                codec.payload_type,
+                old_rtx.map(|(_, payload_type_rtx)| payload_type_rtx),
+                old_fec.map(|(_, payload_type_fec)| payload_type_fec),
+                &codec.rtp_codec,
+                &parameters.rtp_parameters.header_extensions,
+            );
+            for (repair_ssrc, repair_payload_type) in old_rtx.into_iter().chain(old_fec) {
+                RTCRtpReceiverInternal::interceptor_remote_repair_stream_op(
+                    self.interceptor,
+                    false,
+                    repair_ssrc,
+                    repair_payload_type,
+                    &codec.rtp_codec,
+                    &parameters.rtp_parameters.header_extensions,
+                );
+            }
+            self.stats.remove_inbound_rtp_stream(old_ssrc);
+            self.ctx.ssrc_owners.forget(old_ssrc);
+        }
+
         // Both halves or neither, per repair flow — see `interceptor_remote_streams_op`. RTX and
         // FEC are handled identically: both repair this stream from a separate SSRC.
         let rtx = rtx_ssrc.zip(find_rtx_payload_type(
@@ -1584,9 +1692,21 @@ mod stream_binding_tests {
     #[derive(Clone, Default)]
     struct Recorder {
         bound: Arc<Mutex<Vec<StreamInfo>>>,
+        unbound: Arc<Mutex<Vec<u32>>>,
     }
 
     impl Recorder {
+        /// The SSRCs bound and not unbound since.
+        fn live_ssrcs(&self) -> Vec<u32> {
+            let mut live = self.bound_ssrcs();
+            for ssrc in self.unbound.lock().unwrap().iter() {
+                if let Some(at) = live.iter().position(|bound| bound == ssrc) {
+                    live.remove(at);
+                }
+            }
+            live
+        }
+
         fn bound_ssrcs(&self) -> Vec<u32> {
             self.bound
                 .lock()
@@ -1630,7 +1750,9 @@ mod stream_binding_tests {
         fn bind_remote_stream(&mut self, info: &StreamInfo) {
             self.bound.lock().unwrap().push(info.clone());
         }
-        fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+        fn unbind_remote_stream(&mut self, info: &StreamInfo) {
+            self.unbound.lock().unwrap().push(info.ssrc);
+        }
     }
 
     /// A receiver for a remote track whose SSRC was declared in the SDP but whose codec is not yet
@@ -2049,7 +2171,7 @@ mod stream_binding_tests {
         (media_engine, vec![transceiver])
     }
 
-    /// Feeds one packet with the given extensions through the handler.
+    /// Feeds one packet with the given extensions through the handler, on a connection of its own.
     fn feed_with_extensions(
         media_engine: &MediaEngine,
         transceivers: &mut Vec<RTCRtpTransceiverInternal>,
@@ -2058,11 +2180,49 @@ mod stream_binding_tests {
         payload_type: u8,
         extensions: &[(u8, &'static [u8])],
     ) {
-        let mut stats = RTCStatsAccumulator::new();
-        let mut ctx = InterceptorHandlerContext {
-            is_dtls_handshake_complete: true,
-            ..Default::default()
-        };
+        feed_on(
+            &mut Connection::new(),
+            Instant::now(),
+            media_engine,
+            transceivers,
+            interceptor,
+            ssrc,
+            payload_type,
+            extensions,
+        );
+    }
+
+    /// What outlives one packet on a connection.
+    struct Connection {
+        ctx: InterceptorHandlerContext,
+        stats: RTCStatsAccumulator,
+    }
+
+    impl Connection {
+        fn new() -> Self {
+            Connection {
+                ctx: InterceptorHandlerContext {
+                    is_dtls_handshake_complete: true,
+                    ..Default::default()
+                },
+                stats: RTCStatsAccumulator::new(),
+            }
+        }
+    }
+
+    /// Feeds one packet with the given extensions through the handler of a long-lived connection.
+    #[allow(clippy::too_many_arguments)]
+    fn feed_on(
+        connection: &mut Connection,
+        now: Instant,
+        media_engine: &MediaEngine,
+        transceivers: &mut Vec<RTCRtpTransceiverInternal>,
+        interceptor: &mut Recorder,
+        ssrc: u32,
+        payload_type: u8,
+        extensions: &[(u8, &'static [u8])],
+    ) {
+        let Connection { ctx, stats } = connection;
         let mut header = rtp::Header {
             extension: true,
             extension_profile: 0xBEDE,
@@ -2077,16 +2237,11 @@ mod stream_binding_tests {
                 .set_extension(*id, Bytes::from_static(value))
                 .expect("extension");
         }
-        let mut handler = InterceptorHandler::new(
-            &mut ctx,
-            transceivers,
-            media_engine,
-            interceptor,
-            &mut stats,
-        );
+        let mut handler =
+            InterceptorHandler::new(ctx, transceivers, media_engine, interceptor, stats);
         handler
             .handle_read(TaggedRTCMessageInternal {
-                now: Instant::now(),
+                now,
                 transport: TransportContext::default(),
                 message: RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(rtp::Packet {
                     header,
@@ -2231,5 +2386,171 @@ mod stream_binding_tests {
             &[(1, b"0"), (2, b"h")],
         );
         assert_eq!(vec![1000], recorder.bound_ssrcs());
+    }
+
+    /// The layer's packets name it with mid and rid, as the first packets of a stream do.
+    const LAYER_H: [(u8, &[u8]); 2] = [(1, b"0"), (2, b"h")];
+
+    /// A publisher can move its layer to a new SSRC as often as it likes, as a browser does when
+    /// its encoder restarts. Each move replaces the layer's stream: the interceptors, the stats,
+    /// the owner hints and the layer's repair flow all hold the current SSRC and nothing older,
+    /// however many moves there are.
+    #[test]
+    fn a_layer_that_keeps_moving_to_new_ssrcs_holds_one_stream() {
+        let (media_engine, mut transceivers) = rid_fixture();
+        let recorder = Recorder::default();
+        let mut interceptor = recorder.clone();
+        let mut connection = Connection::new();
+        let start = Instant::now();
+        // Spaced so that every move is within the budget: it is the replacing that is under test.
+        let spacing = LAYER_REBIND_WINDOW / u32::from(MAX_LAYER_REBINDS - 1);
+
+        let moves = 10_000u32;
+        for n in 0..moves {
+            let now = start + spacing * n;
+            // Twice: the second packet is what puts the SSRC in the owner hints.
+            for _ in 0..2 {
+                feed_on(
+                    &mut connection,
+                    now,
+                    &media_engine,
+                    &mut transceivers,
+                    &mut interceptor,
+                    1000 + n,
+                    96,
+                    &LAYER_H,
+                );
+            }
+        }
+
+        let current = 1000 + moves - 1;
+        assert_eq!(layer(&mut transceivers).ssrc, Some(current));
+        let layers = 1;
+        assert_eq!(vec![current], recorder.live_ssrcs());
+        assert!(recorder.live_ssrcs().len() <= layers * 3);
+        assert_eq!(connection.stats.inbound_rtp_streams.len(), 1);
+        assert!(connection.stats.inbound_rtp_streams.contains_key(&current));
+        assert_eq!(connection.ctx.ssrc_owners.len(), 1);
+        assert_eq!(connection.ctx.event_outs.len() as u32, moves);
+    }
+
+    /// A burst of new SSRCs on one layer binds a few of them and ignores the rest: the layer keeps
+    /// the last one it was allowed, and its media still reaches the chain.
+    #[test]
+    fn a_burst_of_new_ssrcs_on_a_layer_is_cut_off() {
+        let (media_engine, mut transceivers) = rid_fixture();
+        let recorder = Recorder::default();
+        let mut interceptor = recorder.clone();
+        let mut connection = Connection::new();
+        let now = Instant::now();
+
+        for n in 0..10_000u32 {
+            feed_on(
+                &mut connection,
+                now,
+                &media_engine,
+                &mut transceivers,
+                &mut interceptor,
+                1000 + n,
+                96,
+                &LAYER_H,
+            );
+        }
+
+        // The first bind is not a move; the four that follow are.
+        let current = 1000 + u32::from(MAX_LAYER_REBINDS);
+        assert_eq!(layer(&mut transceivers).ssrc, Some(current));
+        assert_eq!(vec![current], recorder.live_ssrcs());
+        assert_eq!(
+            recorder.bound_ssrcs().len(),
+            usize::from(MAX_LAYER_REBINDS) + 1
+        );
+        assert_eq!(connection.stats.inbound_rtp_streams.len(), 1);
+        assert_eq!(
+            connection.ctx.event_outs.len(),
+            usize::from(MAX_LAYER_REBINDS) + 1
+        );
+
+        // Media on the stream the layer kept goes on, unbound and unchanged.
+        feed_on(
+            &mut connection,
+            now,
+            &media_engine,
+            &mut transceivers,
+            &mut interceptor,
+            current,
+            96,
+            &[],
+        );
+        assert_eq!(vec![current], recorder.live_ssrcs());
+        assert_eq!(layer(&mut transceivers).ssrc, Some(current));
+        assert_eq!(connection.ctx.layer_rebinds.len(), 1);
+    }
+
+    /// The budget refills: a browser that restarts its encoder now and then is never refused.
+    #[test]
+    fn a_layer_may_move_again_once_its_window_has_passed() {
+        let (media_engine, mut transceivers) = rid_fixture();
+        let recorder = Recorder::default();
+        let mut interceptor = recorder.clone();
+        let mut connection = Connection::new();
+        let start = Instant::now();
+        let mut feed = |connection: &mut Connection, now, ssrc| {
+            feed_on(
+                connection,
+                now,
+                &media_engine,
+                &mut transceivers,
+                &mut interceptor,
+                ssrc,
+                96,
+                &LAYER_H,
+            );
+        };
+
+        for n in 0..=u32::from(MAX_LAYER_REBINDS) + 3 {
+            feed(&mut connection, start, 1000 + n);
+        }
+        let spent = 1000 + u32::from(MAX_LAYER_REBINDS);
+        assert_eq!(vec![spent], recorder.live_ssrcs());
+
+        feed(&mut connection, start + LAYER_REBIND_WINDOW, 5000);
+        assert_eq!(vec![5000], recorder.live_ssrcs());
+    }
+
+    /// A move takes the repair flow of the old stream with it, and the new stream's own repair
+    /// flow is learned afresh instead of being refused for the old pairing.
+    #[test]
+    fn moving_a_layer_replaces_its_repair_flow() {
+        let (media_engine, mut transceivers) = rid_fixture();
+        let recorder = Recorder::default();
+        let mut interceptor = recorder.clone();
+        let mut connection = Connection::new();
+        let now = Instant::now();
+        let mut feed = |ssrc, payload_type, extensions: &[(u8, &'static [u8])]| {
+            feed_on(
+                &mut connection,
+                now,
+                &media_engine,
+                &mut transceivers,
+                &mut interceptor,
+                ssrc,
+                payload_type,
+                extensions,
+            );
+        };
+
+        feed(1000, 96, &LAYER_H);
+        feed(2000, 97, &[(1, b"0"), (3, b"h")]);
+        assert_eq!(vec![1000, 2000], recorder.live_ssrcs());
+
+        feed(1001, 96, &LAYER_H);
+        assert_eq!(vec![1001], recorder.live_ssrcs());
+        feed(2001, 97, &[(1, b"0"), (3, b"h")]);
+        assert_eq!(vec![1001, 2001], recorder.live_ssrcs());
+
+        let layer = layer(&mut transceivers);
+        assert_eq!(layer.ssrc, Some(1001));
+        assert_eq!(layer.rtx.as_ref().map(|rtx| rtx.ssrc), Some(2001));
     }
 }
