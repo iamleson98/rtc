@@ -174,7 +174,7 @@ rustc-hash.workspace = true
 sansio.workspace = true
 socket2.workspace = true
 shared.workspace = true
-ice.workspace = true
+ice = { workspace = true, features = ["test-util"] }
 signal.workspace = true
 
 tokio.workspace = true

@@ -3700,6 +3700,51 @@ fn test_selected_pair_generation_moves_with_the_selection() -> Result<()> {
         "deleting the candidates"
     );
 
+    // A signaled candidate takes the place of the peer-reflexive one the selected pair is
+    // using: the pair stays, what it is called changes, and a cached route has to be looked at
+    // again.
+    a.delete_all_candidates(false);
+    a.add_local_candidate(host("192.168.0.2", 777)?)?;
+    a.add_remote_candidate(
+        CandidatePeerReflexiveConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: "172.17.0.3".to_owned(),
+                port: 999,
+                component: 1,
+                ..Default::default()
+            },
+            rel_addr: "172.17.0.3".to_owned(),
+            rel_port: 999,
+        }
+        .new_candidate_peer_reflexive()?,
+    )?;
+    a.set_selected_pair(Some(Instant::now()), Some(0));
+    let on_peer_reflexive = a.selected_pair_generation();
+    a.add_remote_candidate(host("172.17.0.3", 999)?)?;
+    assert_ne!(
+        a.selected_pair_generation(),
+        on_peer_reflexive,
+        "a signaled candidate replacing the selected pair's remote"
+    );
+    a.add_remote_candidate(host("172.17.0.5", 997)?)?;
+    let unrelated = a.selected_pair_generation();
+    a.add_remote_candidate(host("172.17.0.5", 997)?)?;
+    assert_eq!(
+        a.selected_pair_generation(),
+        unrelated,
+        "a candidate that replaces nothing leaves the selection alone"
+    );
+
+    let before_restart = a.selected_pair_generation();
+    a.apply_restart(Instant::now(), true)?;
+    assert_ne!(
+        a.selected_pair_generation(),
+        before_restart,
+        "restarting the agent"
+    );
+    assert!(a.get_selected_candidate_pair().is_none());
+
     a.close()?;
     Ok(())
 }

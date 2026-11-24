@@ -818,6 +818,22 @@ impl Agent {
         self.selected_pair_generation
     }
 
+    /// Selects the pair of the local and remote candidates at these addresses, as a nomination
+    /// would, so a test of a caller can move the selection without running connectivity checks.
+    /// Panics when no such pair exists.
+    #[cfg(feature = "test-util")]
+    pub fn select_pair_for_test(&mut self, now: Instant, local: SocketAddr, remote: SocketAddr) {
+        let pair = self
+            .candidate_pairs
+            .iter()
+            .position(|pair| {
+                self.local_candidates[pair.local_index].addr() == local
+                    && self.remote_candidates[pair.remote_index].addr() == remote
+            })
+            .expect("a pair of these addresses");
+        self.set_selected_pair(Some(now), Some(pair));
+    }
+
     /// Returns the selected pair (local_candidate, remote_candidate) or none
     pub fn get_selected_candidate_pair(&self) -> Option<(&Candidate, &Candidate)> {
         if let Some(pair_index) = self.get_selected_pair() {

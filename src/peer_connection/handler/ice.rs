@@ -77,7 +77,7 @@ impl<'a> IceHandler<'a> {
 }
 
 /// Where the ICE agent has the selected candidate pair send from and to.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Route {
     local_addr: std::net::SocketAddr,
     peer_addr: std::net::SocketAddr,
@@ -116,10 +116,20 @@ impl IceHandler<'_> {
         if let Some((cached, route)) = self.ctx.route
             && cached == generation
         {
+            debug_assert_eq!(
+                route,
+                self.derive_route(),
+                "the selected pair changed without its generation moving"
+            );
             return route;
         }
-        let route = self
-            .ctx
+        let route = self.derive_route();
+        self.ctx.route = Some((generation, route));
+        route
+    }
+
+    fn derive_route(&self) -> Option<Route> {
+        self.ctx
             .ice_transport
             .agent
             .get_selected_candidate_pair()
@@ -130,9 +140,7 @@ impl IceHandler<'_> {
                 local_addr: local.base_addr(),
                 peer_addr: remote.addr(),
                 transport_protocol: local.network_type().to_protocol(),
-            });
-        self.ctx.route = Some((generation, route));
-        route
+            })
     }
 
     /// Addresses `msg` with the selected candidate pair and counts it.
@@ -338,6 +346,7 @@ mod tests {
     use crate::peer_connection::transport::{RTCTransportId, TransportKind};
     use crate::statistics::accumulator::ice_candidate_pair::IceCandidatePairAccumulator;
     use ::ice::AgentConfig;
+    use sansio::Protocol as _;
     use std::time::Duration;
 
     fn context() -> IceHandlerContext {
@@ -438,5 +447,115 @@ mod tests {
         assert!(handler.selected_route().is_none());
         let generation = handler.ctx.ice_transport.agent.selected_pair_generation();
         assert!(matches!(handler.ctx.route, Some((g, None)) if g == generation));
+    }
+
+    fn host(address: &str, port: u16) -> ::ice::candidate::Candidate {
+        ::ice::candidate::candidate_host::CandidateHostConfig {
+            base_config: ::ice::candidate::CandidateConfig {
+                network: "udp".to_owned(),
+                address: address.to_owned(),
+                port,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()
+        .expect("host candidate")
+    }
+
+    fn peer_reflexive(address: &str, port: u16) -> ::ice::candidate::Candidate {
+        ::ice::candidate::candidate_peer_reflexive::CandidatePeerReflexiveConfig {
+            base_config: ::ice::candidate::CandidateConfig {
+                network: "udp".to_owned(),
+                address: address.to_owned(),
+                port,
+                component: 1,
+                ..Default::default()
+            },
+            rel_addr: address.to_owned(),
+            rel_port: port,
+        }
+        .new_candidate_peer_reflexive()
+        .expect("peer reflexive candidate")
+    }
+
+    fn write(handler: &mut IceHandler<'_>) -> Option<TaggedRTCMessageInternal> {
+        handler
+            .handle_write(TaggedRTCMessageInternal {
+                now: Instant::now(),
+                transport: shared::TransportContext::default(),
+                message: RTCMessageInternal::Raw(bytes::BytesMut::from(&[1u8][..])),
+            })
+            .expect("handle_write");
+        handler.ctx.write_outs.pop_front()
+    }
+
+    /// Whatever moves the selected pair, the packet after it carries the pair's addresses: the
+    /// cached route follows a renomination, a signaled candidate replacing a peer-reflexive one,
+    /// and an ICE restart, after which nothing goes out until a pair is selected again.
+    #[test]
+    fn the_route_follows_the_selected_pair_through_every_way_it_changes() {
+        let mut ctx = context();
+        let mut stats = RTCStatsAccumulator::new();
+        let local: std::net::SocketAddr = "192.168.0.2:777".parse().unwrap();
+        let a: std::net::SocketAddr = "172.17.0.3:999".parse().unwrap();
+        let b: std::net::SocketAddr = "172.17.0.4:998".parse().unwrap();
+        let agent = &mut ctx.ice_transport.agent;
+        agent.add_local_candidate(host("192.168.0.2", 777)).unwrap();
+        agent
+            .add_remote_candidate(peer_reflexive("172.17.0.3", 999))
+            .unwrap();
+        agent.add_remote_candidate(host("172.17.0.4", 998)).unwrap();
+        let mut handler = IceHandler {
+            ctx: &mut ctx,
+            stats: &mut stats,
+        };
+        let peer_of = |msg: Option<TaggedRTCMessageInternal>| msg.map(|m| m.transport.peer_addr);
+
+        handler
+            .ctx
+            .ice_transport
+            .agent
+            .select_pair_for_test(Instant::now(), local, a);
+        assert_eq!(peer_of(write(&mut handler)), Some(a));
+        // Stamped again from the cache.
+        assert_eq!(peer_of(write(&mut handler)), Some(a));
+
+        handler
+            .ctx
+            .ice_transport
+            .agent
+            .select_pair_for_test(Instant::now(), local, b);
+        let sent = write(&mut handler).expect("sent on the renominated pair");
+        assert_eq!(sent.transport.peer_addr, b);
+        assert_eq!(sent.transport.local_addr, local);
+
+        // The peer-reflexive remote of the selected pair is replaced by the signaled candidate
+        // for the same address: the route is derived again and is the same.
+        handler
+            .ctx
+            .ice_transport
+            .agent
+            .select_pair_for_test(Instant::now(), local, a);
+        assert_eq!(peer_of(write(&mut handler)), Some(a));
+        let before = handler.ctx.route.map(|(generation, _)| generation);
+        handler
+            .ctx
+            .ice_transport
+            .agent
+            .add_remote_candidate(host("172.17.0.3", 999))
+            .unwrap();
+        assert_eq!(peer_of(write(&mut handler)), Some(a));
+        assert_ne!(handler.ctx.route.map(|(generation, _)| generation), before);
+
+        handler
+            .ctx
+            .ice_transport
+            .agent
+            .apply_restart(Instant::now(), false)
+            .expect("restart");
+        assert!(write(&mut handler).is_none(), "dropped after the restart");
+        assert!(matches!(handler.ctx.route, Some((_, None))));
     }
 }
