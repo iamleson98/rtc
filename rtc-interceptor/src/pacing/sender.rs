@@ -6,8 +6,9 @@ use crate::StreamInfo;
 use crate::{Attribute, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
+use shared::hash::FastSet;
 use shared::marshal::MarshalSize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Rate used when none is configured: 1 Mb/s.
@@ -231,7 +232,7 @@ pub struct PacerInterceptor {
     /// Paced bits sent recently; feeds the send-rate mode.
     sent: SendRate,
     /// SSRCs of local audio streams, which skip the queue.
-    audio_ssrcs: HashSet<u32>,
+    audio_ssrcs: FastSet<u32>,
     /// Packets refused because the queue was full.
     dropped: u64,
     /// Packets the budget has released, waiting to join the belt.
@@ -248,7 +249,7 @@ impl PacerInterceptor {
         Self {
             mode,
             sent: SendRate::default(),
-            audio_ssrcs: HashSet::new(),
+            audio_ssrcs: FastSet::default(),
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
             released: VecDeque::new(),

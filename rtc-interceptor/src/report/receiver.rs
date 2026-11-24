@@ -7,7 +7,8 @@ use crate::{AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use shared::hash::FastMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Builder for the ReceiverReportInterceptor.
@@ -108,7 +109,7 @@ pub struct ReceiverReportInterceptor {
     interval: Duration,
     next_timeout: Option<Instant>,
 
-    streams: HashMap<u32, ReceiverStream>,
+    streams: FastMap<u32, ReceiverStream>,
 
     read_queue: VecDeque<TaggedPacket>,
     write_queue: VecDeque<TaggedPacket>,
@@ -121,7 +122,7 @@ impl ReceiverReportInterceptor {
             interval,
             next_timeout: None,
 
-            streams: HashMap::new(),
+            streams: FastMap::default(),
 
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),

@@ -8,8 +8,8 @@ use rtcp::transport_feedbacks::cc_feedback_report::Ecn;
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
+use shared::hash::FastSet;
 use shared::time::SystemInstant;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,7 @@ pub struct Rfc8888Interceptor {
     sender_ssrc: u32,
     recorder: CcFeedbackRecorder,
     /// Remote streams being reported on.
-    streams: HashSet<u32>,
+    streams: FastSet<u32>,
     next_timeout: Option<Instant>,
     /// Wall-clock reference, captured from the first instant handed over, so a monotonic `Instant`
     /// can be turned into the NTP timestamp a report carries.
@@ -119,7 +119,7 @@ impl Rfc8888Interceptor {
             max_report_size,
             sender_ssrc,
             recorder: CcFeedbackRecorder::new(),
-            streams: HashSet::new(),
+            streams: FastSet::default(),
             next_timeout: None,
             epoch: None,
             write_queue: VecDeque::new(),

@@ -2,7 +2,7 @@
 
 use super::acknowledgement::{Acknowledgement, PacketReport};
 use rtcp::transport_feedbacks::cc_feedback_report::Ecn;
-use std::collections::HashMap;
+use shared::hash::FastMap;
 use std::time::{Duration, Instant};
 
 /// Records outgoing packets and matches incoming feedback against them.
@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 pub struct History {
     /// Monotonic id, so reports come out in send order however sequence numbers wrap.
     next_id: u64,
-    packets: HashMap<u64, PacketReport>,
-    twcc_index: HashMap<u16, u64>,
-    ssrc_sequence_index: HashMap<(u32, u16), u64>,
+    packets: FastMap<u64, PacketReport>,
+    twcc_index: FastMap<u16, u64>,
+    ssrc_sequence_index: FastMap<(u32, u16), u64>,
     /// Highest id acknowledged so far.
     highest_acknowledged: Option<u64>,
     /// Lowest id not yet reported to the consumer.

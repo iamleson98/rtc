@@ -36,6 +36,7 @@ use crate::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
 use ice::CandidatePairStats;
 use rustc_hash::FxHashMap;
 use sctp::StreamId;
+use shared::hash::FastMap;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -82,10 +83,10 @@ pub(crate) struct RTCStatsAccumulator {
     pub(crate) data_channels: FxHashMap<RTCDataChannelId, DataChannelStatsAccumulator>,
 
     /// Inbound RTP stream accumulators keyed by SSRC.
-    pub(crate) inbound_rtp_streams: FxHashMap<SSRC, InboundRtpStreamAccumulator>,
+    pub(crate) inbound_rtp_streams: FastMap<SSRC, InboundRtpStreamAccumulator>,
 
     /// Outbound RTP stream accumulators keyed by SSRC.
-    pub(crate) outbound_rtp_streams: FxHashMap<SSRC, OutboundRtpStreamAccumulator>,
+    pub(crate) outbound_rtp_streams: FastMap<SSRC, OutboundRtpStreamAccumulator>,
 
     /// Media source stats keyed by track ID.
     pub(crate) media_sources: HashMap<String, MediaSourceStatsAccumulator>,
@@ -95,10 +96,10 @@ pub(crate) struct RTCStatsAccumulator {
 
     // Reverse lookup maps for O(1) RTX/FEC SSRC detection
     /// Maps RTX SSRC to primary SSRC for O(1) lookup.
-    rtx_ssrc_to_primary: FxHashMap<SSRC, SSRC>,
+    rtx_ssrc_to_primary: FastMap<SSRC, SSRC>,
 
     /// Maps FEC SSRC to primary SSRC for O(1) lookup.
-    fec_ssrc_to_primary: FxHashMap<SSRC, SSRC>,
+    fec_ssrc_to_primary: FastMap<SSRC, SSRC>,
 }
 
 /// Asserts a stats record was stamped with `expected`, ignoring the wall-clock half.

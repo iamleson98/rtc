@@ -7,11 +7,12 @@ mod srtcp_test;
 #[cfg(test)]
 mod srtp_test;
 
-use std::collections::HashMap;
+use shared::hash::FastMap;
 
-/// Keyed by SSRC, which the remote chooses, and read for every packet: a randomly seeded fast
-/// hash resists crafted collisions without SipHash's cost on the packet path.
-type SsrcMap<T> = HashMap<u32, T, foldhash::fast::RandomState>;
+/// Keyed by SSRC, which the remote chooses, and read for every packet: a hash with a random
+/// per-process multiplier resists crafted collisions without SipHash's cost on the packet path.
+/// The number of SSRCs a peer can make us keep is bounded by [`MAX_REMOTE_SSRCS`].
+type SsrcMap<T> = FastMap<u32, T>;
 
 use crypto::RTCCrypto;
 use shared::replay_detector::*;

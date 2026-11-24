@@ -16,9 +16,9 @@ use crate::rtp_transceiver::{PayloadType, SSRC, internal::RTCRtpTransceiverInter
 use crate::statistics::accumulator::RTCStatsAccumulator;
 use interceptor::Packet;
 use log::{debug, trace, warn};
-use rustc_hash::FxHashMap;
 use shared::TransportContext;
 use shared::error::{Error, Result};
+use shared::hash::FastMap;
 use shared::marshal::MarshalSize;
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -26,7 +26,7 @@ use std::time::Instant;
 /// Which transceiver owns an inbound SSRC, so a packet doesn't walk every transceiver to find out.
 /// An entry is only a hint: it is re-checked on use, so a stale one costs a scan, never a wrong hit.
 #[derive(Default)]
-pub(crate) struct SsrcOwners(FxHashMap<SSRC, usize>);
+pub(crate) struct SsrcOwners(FastMap<SSRC, usize>);
 
 impl SsrcOwners {
     pub(crate) fn cached(
@@ -893,5 +893,23 @@ mod rtx_test {
             ctx.read_outs.is_empty(),
             "an RTX probe packet with no OSN should be dropped, not dispatched"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer can send any SSRC. Only one a transceiver owns is remembered, so the table cannot
+    /// grow beyond what the negotiated description declares.
+    #[test]
+    fn an_unknown_ssrc_inserts_nothing() {
+        let mut owners = SsrcOwners::default();
+        let transceivers: [RTCRtpTransceiverInternal; 0] = [];
+        for ssrc in 0..10_000u32 {
+            assert_eq!(None, owners.find(ssrc, &transceivers, |_, _| true));
+            assert_eq!(None, owners.cached(ssrc, &transceivers, |_, _| true));
+        }
+        assert!(owners.0.is_empty());
     }
 }

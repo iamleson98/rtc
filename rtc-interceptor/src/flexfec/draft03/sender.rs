@@ -6,7 +6,8 @@ use crate::stream_info::StreamInfo;
 use crate::{AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use shared::hash::FastMap;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Media packets gathered before a repair block is produced.
@@ -86,7 +87,7 @@ pub struct FlexFec03SendInterceptor {
     num_media_packets: u32,
     num_fec_packets: u32,
     /// Keyed by the **media** SSRC being protected.
-    streams: HashMap<u32, ProtectedStream>,
+    streams: FastMap<u32, ProtectedStream>,
     /// Repair packets the encoder produced, waiting to join the belt.
     /// Inbound packets ready for the next interceptor.
     read_queue: VecDeque<TaggedPacket>,
@@ -102,7 +103,7 @@ impl FlexFec03SendInterceptor {
             write_queue: VecDeque::new(),
             num_media_packets: num_media_packets.max(1),
             num_fec_packets,
-            streams: HashMap::new(),
+            streams: FastMap::default(),
         }
     }
 

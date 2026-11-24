@@ -24,7 +24,6 @@ rtcp.workspace = true
 crypto.workspace = true
 
 byteorder.workspace = true
-foldhash.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]

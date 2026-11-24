@@ -6,8 +6,8 @@ use crate::stream_info::StreamInfo;
 use crate::{Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
+use shared::hash::FastMap;
 use shared::marshal::Marshal;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -74,7 +74,7 @@ struct LocalStream {
 pub struct TwccSenderInterceptor {
     /// Transport-wide sequence number counter, shared across all streams.
     next_sequence_number: u16,
-    streams: HashMap<u32, LocalStream>,
+    streams: FastMap<u32, LocalStream>,
     /// Inbound packets ready for the next interceptor.
     read_queue: VecDeque<TaggedPacket>,
     /// Outbound packets ready for the next interceptor: what passed through, plus

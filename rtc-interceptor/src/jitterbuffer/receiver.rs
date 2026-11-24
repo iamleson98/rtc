@@ -26,7 +26,8 @@ use crate::stream_info::StreamInfo;
 use crate::{Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use shared::hash::FastMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Default playout depth: enough to absorb ordinary network jitter without adding audible delay.
@@ -132,7 +133,7 @@ struct Stream {
     clock_rate: u32,
     anchor: Option<Anchor>,
     /// Playout instant per held packet, keyed by extended sequence number.
-    deadlines: HashMap<u64, Instant>,
+    deadlines: FastMap<u64, Instant>,
 }
 
 impl Stream {
@@ -144,7 +145,7 @@ impl Stream {
             // unnegotiated rate as the RTP video default rather than refusing to buffer.
             clock_rate: if clock_rate == 0 { 90_000 } else { clock_rate },
             anchor: None,
-            deadlines: HashMap::new(),
+            deadlines: FastMap::default(),
         }
     }
 
@@ -174,7 +175,7 @@ impl Stream {
 pub struct JitterBufferInterceptor {
     depth: Duration,
     capacity: usize,
-    streams: HashMap<u32, Stream>,
+    streams: FastMap<u32, Stream>,
     /// Packets whose playout instant has come, waiting to join the belt.
     due: VecDeque<TaggedPacket>,
     /// Inbound packets ready for the next interceptor.
@@ -192,7 +193,7 @@ impl JitterBufferInterceptor {
             due: VecDeque::new(),
             depth,
             capacity,
-            streams: HashMap::new(),
+            streams: FastMap::default(),
         }
     }
 
