@@ -8,7 +8,8 @@ use crate::{Attribute, AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
-use std::collections::{HashMap, HashSet, VecDeque};
+use shared::hash::{FastMap, FastSet};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Decides which remote streams this generator tracks, on top of the NACK feedback check.
@@ -184,14 +185,14 @@ pub struct NackGeneratorInterceptor {
     sender_ssrc: u32,
 
     /// Receive logs per remote stream SSRC
-    receive_logs: HashMap<u32, ReceiveLog>,
+    receive_logs: FastMap<u32, ReceiveLog>,
 
     /// For each tracked stream's RTX SSRC, the stream it repairs. A repair arrives on the RTX
     /// SSRC but fills a hole in the primary's sequence-number space.
-    rtx_to_primary: HashMap<u32, u32>,
+    rtx_to_primary: FastMap<u32, u32>,
 
     /// When and how often each still-missing (SSRC, sequence number) was last asked for
-    nack_states: HashMap<u32, HashMap<u16, NackState>>,
+    nack_states: FastMap<u32, FastMap<u16, NackState>>,
 
     /// Queue for outgoing NACK packets
     write_queue: VecDeque<TaggedPacket>,
@@ -227,9 +228,9 @@ impl NackGeneratorInterceptor {
             streams_filter,
             next_timeout: None,
             sender_ssrc: rand::random(),
-            receive_logs: HashMap::new(),
-            rtx_to_primary: HashMap::new(),
-            nack_states: HashMap::new(),
+            receive_logs: FastMap::default(),
+            rtx_to_primary: FastMap::default(),
+            nack_states: FastMap::default(),
             write_queue: VecDeque::new(),
         }
     }
@@ -260,7 +261,7 @@ impl NackGeneratorInterceptor {
             // packet asked for less than one round trip ago has its repair still in flight, and
             // one asked for `max_nacks_per_packet` times is given up on.
             let state = self.nack_states.entry(ssrc).or_default();
-            let still_missing: HashSet<u16> = missing.iter().copied().collect();
+            let still_missing: FastSet<u16> = missing.iter().copied().collect();
             state.retain(|seq, _| still_missing.contains(seq));
 
             let filtered: Vec<u16> = missing

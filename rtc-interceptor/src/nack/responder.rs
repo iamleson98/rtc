@@ -9,8 +9,9 @@ use crate::{Attribute, AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
+use shared::hash::FastMap;
 use shared::marshal::MarshalSize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Decides which local streams this responder buffers, on top of the NACK feedback check.
@@ -191,7 +192,7 @@ struct LocalStream {
     rtx_sequence_number: u16,
     /// When each buffered packet was last retransmitted, so a repeat request within one round
     /// trip can be ignored.
-    last_retransmit: HashMap<u16, Instant>,
+    last_retransmit: FastMap<u16, Instant>,
     /// The last few sender reports written on this stream, by the middle 32 bits of their NTP
     /// time (what a report block echoes back as its LSR) and when they went out.
     sent_reports: VecDeque<(u32, Instant)>,
@@ -244,7 +245,7 @@ pub struct NackResponderInterceptor {
     stats: NackResponderStats,
 
     /// Send buffers per local stream SSRC
-    streams: HashMap<u32, LocalStream>,
+    streams: FastMap<u32, LocalStream>,
 
     /// Queue for retransmitted packets
     write_queue: VecDeque<TaggedPacket>,
@@ -270,7 +271,7 @@ impl NackResponderInterceptor {
             size,
             rtt,
             streams_filter,
-            streams: HashMap::new(),
+            streams: FastMap::default(),
             write_queue: VecDeque::new(),
         }
     }
@@ -638,7 +639,7 @@ impl Interceptor for NackResponderInterceptor {
                     ssrc_rtx: info.ssrc_rtx,
                     payload_type_rtx: info.payload_type_rtx,
                     rtx_sequence_number: 0,
-                    last_retransmit: HashMap::new(),
+                    last_retransmit: FastMap::default(),
                     sent_reports: VecDeque::new(),
                     rtt: None,
                     media: RateWindow::new(MEDIA_RATE_WINDOW),

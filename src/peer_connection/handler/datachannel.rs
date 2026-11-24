@@ -10,7 +10,9 @@ use crate::peer_connection::event::{
 use crate::peer_connection::message::internal::{
     ApplicationMessage, DTLSMessage, DataChannelEvent, RTCMessageInternal, TaggedRTCMessageInternal,
 };
+use crate::peer_connection::transport::dtls::DtlsTransport;
 use crate::peer_connection::transport::dtls::role::RTCDtlsRole;
+use crate::peer_connection::transport::sctp::SctpTransport;
 use crate::statistics::accumulator::RTCStatsAccumulator;
 use log::{debug, warn};
 use sctp::PayloadProtocolIdentifier;
@@ -57,13 +59,46 @@ pub(crate) struct DataChannelHandler<'a> {
     stats: &'a mut RTCStatsAccumulator,
     /// Configured DCEP handshake timeout for in-band channels. `None` disables it.
     dcep_handshake_timeout: Option<Duration>,
-    /// The DTLS role this endpoint negotiated, which RFC 8832 §6 turns into the parity of the
-    /// stream ids assigned at `SCTPHandshakeComplete`. Resolved by the time an association
-    /// exists, so the handler never has to guess it.
-    dtls_role: RTCDtlsRole,
-    /// Negotiated stream limit, bounding stream-id assignment. `None` until the association
-    /// reports one.
-    max_channels: Option<u16>,
+    /// Where the stream-id inputs come from; read only at `SCTPHandshakeComplete`.
+    stream_ids: StreamIdInputs<'a>,
+}
+
+/// What stream-id assignment needs: the DTLS role this endpoint negotiated, which RFC 8832 §6
+/// turns into the parity of the stream ids, and the negotiated stream limit that bounds them
+/// (`None` until the association reports one). Both are settled by the time the association
+/// exists, which is the only moment they are read, so the handler is given the transports to
+/// ask then rather than values computed on every handler pass.
+pub(crate) enum StreamIdInputs<'a> {
+    Transports {
+        dtls: &'a DtlsTransport,
+        sctp: &'a SctpTransport,
+    },
+    #[cfg(test)]
+    Fixed {
+        dtls_role: RTCDtlsRole,
+        max_channels: Option<u16>,
+    },
+}
+
+impl StreamIdInputs<'_> {
+    fn resolve(&self) -> (RTCDtlsRole, Option<u16>) {
+        match self {
+            Self::Transports { dtls, sctp } => (dtls.role(), sctp.max_channels()),
+            #[cfg(test)]
+            Self::Fixed {
+                dtls_role,
+                max_channels,
+            } => (*dtls_role, *max_channels),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(dtls_role: RTCDtlsRole, max_channels: Option<u16>) -> Self {
+        Self::Fixed {
+            dtls_role,
+            max_channels,
+        }
+    }
 }
 
 impl super::WriteBypass for DataChannelHandler<'_> {
@@ -101,16 +136,14 @@ impl<'a> DataChannelHandler<'a> {
         data_channels: &'a mut DataChannelRegistry,
         stats: &'a mut RTCStatsAccumulator,
         dcep_handshake_timeout: Option<Duration>,
-        dtls_role: RTCDtlsRole,
-        max_channels: Option<u16>,
+        stream_ids: StreamIdInputs<'a>,
     ) -> Self {
         DataChannelHandler {
             ctx,
             data_channels,
             stats,
             dcep_handshake_timeout,
-            dtls_role,
-            max_channels,
+            stream_ids,
         }
     }
 
@@ -433,8 +466,9 @@ impl<'a>
                 // the DTLS role is resolved and the negotiated stream count is known. This is
                 // the first moment a stream id can be chosen correctly, and therefore the
                 // moment it is chosen at all (RFC 8832 §6).
+                let (dtls_role, max_channels) = self.stream_ids.resolve();
                 self.data_channels
-                    .assign_stream_ids(self.dtls_role, self.max_channels)?;
+                    .assign_stream_ids(dtls_role, max_channels)?;
 
                 // Out-of-band negotiated channels have no DCEP handshake, so they are
                 // open immediately and fire the open event here. In-band channels stay
@@ -719,8 +753,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -755,8 +788,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_read(TaggedRTCMessageInternal {
@@ -811,8 +843,7 @@ mod tests {
             &mut data_channels,
             &mut stats,
             None,
-            RTCDtlsRole::Server,
-            None,
+            StreamIdInputs::fixed(RTCDtlsRole::Server, None),
         );
         handler
             .handle_event(TaggedRTCEventInternal {
@@ -868,8 +899,7 @@ mod tests {
             &mut data_channels,
             &mut stats,
             None,
-            RTCDtlsRole::Server,
-            None,
+            StreamIdInputs::fixed(RTCDtlsRole::Server, None),
         );
         let err = handler
             .emit_data_channel_opened(now, TransportContext::default(), 99)
@@ -895,8 +925,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -919,8 +948,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -953,8 +981,7 @@ mod tests {
             &mut data_channels,
             &mut stats,
             None,
-            RTCDtlsRole::Server,
-            None,
+            StreamIdInputs::fixed(RTCDtlsRole::Server, None),
         );
         handler
             .handle_read(TaggedRTCMessageInternal {
@@ -995,8 +1022,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -1013,8 +1039,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             let deadline = handler
                 .poll_timeout()
@@ -1030,8 +1055,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler.handle_timeout(later).unwrap();
         }
@@ -1077,8 +1101,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             assert!(
                 handler.poll_timeout().is_none(),
@@ -1104,8 +1127,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -1122,8 +1144,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_read(TaggedRTCMessageInternal {
@@ -1152,8 +1173,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_read(TaggedRTCMessageInternal {
@@ -1192,8 +1212,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_event(TaggedRTCEventInternal {
@@ -1210,8 +1229,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler
                 .handle_read(TaggedRTCMessageInternal {
@@ -1232,8 +1250,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 Some(timeout),
-                RTCDtlsRole::Server,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Server, None),
             );
             handler.handle_timeout(later).unwrap();
         }

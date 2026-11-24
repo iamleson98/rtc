@@ -570,6 +570,36 @@ async fn test_transport_statistics_collection() -> Result<()> {
         "Should have received packets during connection"
     );
 
+    // The selected pair's packet counts are kept as plain counters on the data path; reading
+    // stats must hand them over, and a second read must not lose or double them.
+    let pair = offer_stats
+        .candidate_pairs()
+        .find(|pair| pair.nominated)
+        .expect("a nominated candidate pair");
+    assert!(
+        pair.packets_sent > 0 && pair.bytes_sent > 0,
+        "the selected pair carried the DTLS handshake out"
+    );
+    assert!(
+        pair.packets_received > 0 && pair.bytes_received > 0,
+        "the selected pair carried the DTLS handshake in"
+    );
+    let again = runner
+        .offer_pc
+        .get_stats(Instant::now(), StatsSelector::None);
+    let pair_again = again
+        .candidate_pairs()
+        .find(|pair| pair.nominated)
+        .expect("a nominated candidate pair");
+    assert_eq!(
+        (pair.packets_sent, pair.bytes_sent),
+        (pair_again.packets_sent, pair_again.bytes_sent)
+    );
+    assert_eq!(
+        (pair.packets_received, pair.bytes_received),
+        (pair_again.packets_received, pair_again.bytes_received)
+    );
+
     // Clean up
     runner.offer_pc.close()?;
     runner.answer_pc.close()?;

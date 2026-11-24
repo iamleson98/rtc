@@ -9,7 +9,7 @@ mod certificate;
 mod codec;
 mod data_channel;
 mod ice_candidate;
-mod ice_candidate_pair;
+pub(crate) mod ice_candidate_pair;
 mod media;
 mod peer_connection;
 mod rtp_stream;
@@ -36,6 +36,7 @@ use crate::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
 use ice::CandidatePairStats;
 use rustc_hash::FxHashMap;
 use sctp::StreamId;
+use shared::hash::FastMap;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -82,10 +83,10 @@ pub(crate) struct RTCStatsAccumulator {
     pub(crate) data_channels: FxHashMap<RTCDataChannelId, DataChannelStatsAccumulator>,
 
     /// Inbound RTP stream accumulators keyed by SSRC.
-    pub(crate) inbound_rtp_streams: FxHashMap<SSRC, InboundRtpStreamAccumulator>,
+    pub(crate) inbound_rtp_streams: FastMap<SSRC, InboundRtpStreamAccumulator>,
 
     /// Outbound RTP stream accumulators keyed by SSRC.
-    pub(crate) outbound_rtp_streams: FxHashMap<SSRC, OutboundRtpStreamAccumulator>,
+    pub(crate) outbound_rtp_streams: FastMap<SSRC, OutboundRtpStreamAccumulator>,
 
     /// Media source stats keyed by track ID.
     pub(crate) media_sources: HashMap<String, MediaSourceStatsAccumulator>,
@@ -95,10 +96,10 @@ pub(crate) struct RTCStatsAccumulator {
 
     // Reverse lookup maps for O(1) RTX/FEC SSRC detection
     /// Maps RTX SSRC to primary SSRC for O(1) lookup.
-    rtx_ssrc_to_primary: FxHashMap<SSRC, SSRC>,
+    rtx_ssrc_to_primary: FastMap<SSRC, SSRC>,
 
     /// Maps FEC SSRC to primary SSRC for O(1) lookup.
-    fec_ssrc_to_primary: FxHashMap<SSRC, SSRC>,
+    fec_ssrc_to_primary: FastMap<SSRC, SSRC>,
 }
 
 /// Asserts a stats record was stamped with `expected`, ignoring the wall-clock half.
@@ -452,6 +453,25 @@ impl RTCStatsAccumulator {
                 transceiver_id,
                 ..Default::default()
             })
+    }
+
+    /// Drops the accumulator of an inbound stream that was replaced, with its repair-flow
+    /// lookups. Used when a simulcast layer moves to a new SSRC, so the old one stops counting
+    /// against this connection.
+    pub(crate) fn remove_inbound_rtp_stream(&mut self, ssrc: SSRC) {
+        let Some(stream) = self.inbound_rtp_streams.remove(&ssrc) else {
+            return;
+        };
+        if let Some(rtx) = stream.rtx_ssrc
+            && self.rtx_ssrc_to_primary.get(&rtx) == Some(&ssrc)
+        {
+            self.rtx_ssrc_to_primary.remove(&rtx);
+        }
+        if let Some(fec) = stream.fec_ssrc
+            && self.fec_ssrc_to_primary.get(&fec) == Some(&ssrc)
+        {
+            self.fec_ssrc_to_primary.remove(&fec);
+        }
     }
 
     /// Gets or creates an outbound stream accumulator for the given SSRC.

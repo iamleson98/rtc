@@ -84,7 +84,6 @@ crc = "3.0.1"
 slab = "0.4.9"
 crc32c = "0.6"
 rustc-hash = "2"
-foldhash = "0.2"
 memchr = "2.1.1"
 smol_str = "0.3"
 socket2 = { version = "0.6", features = ["all"] }
@@ -175,7 +174,7 @@ rustc-hash.workspace = true
 sansio.workspace = true
 socket2.workspace = true
 shared.workspace = true
-ice.workspace = true
+ice = { workspace = true, features = ["test-util"] }
 signal.workspace = true
 
 tokio.workspace = true

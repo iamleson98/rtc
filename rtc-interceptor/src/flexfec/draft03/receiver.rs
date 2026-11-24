@@ -20,7 +20,8 @@ use crate::stream_info::StreamInfo;
 use crate::{Attribute, AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use shared::hash::FastMap;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Builder for [`FlexFec03ReceiveInterceptor`].
@@ -57,9 +58,9 @@ impl FlexFec03ReceiveBuilder {
 /// rebuild, and the jitter buffer should order the recovered packet along with the rest.
 pub struct FlexFec03ReceiveInterceptor {
     /// Decoders keyed by the media SSRC they protect.
-    decoders: HashMap<u32, FlexFec03Decoder>,
+    decoders: FastMap<u32, FlexFec03Decoder>,
     /// Repair SSRC to the media SSRC it repairs, so a repair packet finds its decoder.
-    repair_to_media: HashMap<u32, u32>,
+    repair_to_media: FastMap<u32, u32>,
     /// Inbound packets ready for the next interceptor: what passed through, plus anything the
     /// decoder reconstructed.
     read_queue: VecDeque<TaggedPacket>,
@@ -73,8 +74,8 @@ impl FlexFec03ReceiveInterceptor {
         Self {
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
-            decoders: HashMap::new(),
-            repair_to_media: HashMap::new(),
+            decoders: FastMap::default(),
+            repair_to_media: FastMap::default(),
         }
     }
 

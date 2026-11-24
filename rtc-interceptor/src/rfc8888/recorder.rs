@@ -2,7 +2,7 @@
 
 use super::stream_log::{MAX_REPORTS_PER_BLOCK, StreamLog};
 use rtcp::transport_feedbacks::cc_feedback_report::{CcFeedbackReport, Ecn};
-use std::collections::HashMap;
+use shared::hash::FastMap;
 use std::time::Instant;
 
 /// Header, sender SSRC and report timestamp — the fixed cost of any report.
@@ -17,7 +17,7 @@ const METRIC_BLOCK_SIZE: usize = 2;
 /// Records packet arrivals per stream and builds feedback reports from them.
 #[derive(Debug, Default)]
 pub struct CcFeedbackRecorder {
-    streams: HashMap<u32, StreamLog>,
+    streams: FastMap<u32, StreamLog>,
 }
 
 impl CcFeedbackRecorder {

@@ -79,6 +79,8 @@ pub mod replay_detector;
 
 /// The crate-wide error type shared by every protocol in the stack.
 pub mod error;
+/// A fast hasher for the integer keys (SSRCs, sequence numbers) of per-packet maps.
+pub mod hash;
 pub mod packetio;
 /// `serde` helpers for types that have no natural serialized form, such as [`std::time::Instant`].
 pub mod serde;

@@ -8,8 +8,9 @@ use crate::{AttributedPacket, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
+use shared::hash::FastMap;
 use shared::marshal::Unmarshal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Default interval for sending TWCC feedback.
@@ -81,7 +82,7 @@ pub struct TwccReceiverInterceptor {
     recorder: Option<Recorder>,
 
     /// Remote stream state per SSRC.
-    streams: HashMap<u32, RemoteStream>,
+    streams: FastMap<u32, RemoteStream>,
 
     /// Transport-wide CC header extension ID negotiated on this transport.
     ///
@@ -109,7 +110,7 @@ impl TwccReceiverInterceptor {
             interval,
             start_time: None,
             recorder: None,
-            streams: HashMap::new(),
+            streams: FastMap::default(),
             transport_hdr_ext_id: None,
             write_queue: VecDeque::new(),
             next_timeout: None,

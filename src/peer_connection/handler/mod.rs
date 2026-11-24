@@ -10,7 +10,9 @@ pub(crate) mod srtp;
 use crate::peer_connection::RTCPeerConnection;
 use crate::peer_connection::event::RTCPeerConnectionEvent;
 use crate::peer_connection::event::{RTCEventInternal, TaggedRTCEvent};
-use crate::peer_connection::handler::datachannel::{DataChannelHandler, DataChannelHandlerContext};
+use crate::peer_connection::handler::datachannel::{
+    DataChannelHandler, DataChannelHandlerContext, StreamIdInputs,
+};
 use crate::peer_connection::handler::demuxer::{DemuxerHandler, DemuxerHandlerContext};
 use crate::peer_connection::handler::dtls::{DtlsHandler, DtlsHandlerContext};
 use crate::peer_connection::handler::endpoint::{EndpointHandler, EndpointHandlerContext};
@@ -259,18 +261,18 @@ impl RTCPeerConnection {
     }
 
     pub(crate) fn get_datachannel_handler(&mut self) -> DataChannelHandler<'_> {
-        // Read the Copy values before `&mut self.data_channels` borrows self mutably. The
-        // handler needs the DTLS role to give stream ids the parity RFC 8832 §6 requires, and
-        // the negotiated stream count to bound them.
-        let dtls_role = self.dtls_transport().role();
-        let max_channels = self.sctp_transport().max_channels();
+        // The handler reads the DTLS role (stream id parity, RFC 8832 §6) and the negotiated
+        // stream count only when the association comes up, so it is handed the transports
+        // instead of values computed on every pass.
         DataChannelHandler::new(
             &mut self.pipeline_context.datachannel_handler_context,
             &mut self.data_channels,
             &mut self.pipeline_context.stats,
             self.setting_engine.data_channel.dcep_handshake_timeout,
-            dtls_role,
-            max_channels,
+            StreamIdInputs::Transports {
+                dtls: &self.pipeline_context.dtls_handler_context.dtls_transport,
+                sctp: &self.pipeline_context.sctp_handler_context.sctp_transport,
+            },
         )
     }
 

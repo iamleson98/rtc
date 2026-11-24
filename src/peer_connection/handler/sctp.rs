@@ -1006,7 +1006,7 @@ mod tests {
     use crate::data_channel::registry::DataChannelRegistry;
     use crate::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
     use crate::peer_connection::handler::datachannel::{
-        DataChannelHandler, DataChannelHandlerContext,
+        DataChannelHandler, DataChannelHandlerContext, StreamIdInputs,
     };
     use crate::peer_connection::message::internal::DataChannelEvent;
     use crate::peer_connection::transport::dtls::role::RTCDtlsRole;
@@ -1610,8 +1610,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Client,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Client, None),
             );
             handler
                 .handle_read(inbound)
@@ -2838,8 +2837,7 @@ mod tests {
                 &mut data_channels,
                 &mut stats,
                 None,
-                RTCDtlsRole::Client,
-                None,
+                StreamIdInputs::fixed(RTCDtlsRole::Client, None),
             );
             handler.handle_read(inbound).expect("accept the channel");
             while let Some(msg) = handler.poll_write() {

@@ -167,6 +167,10 @@ pub struct Agent {
     pub(crate) candidate_pairs: Vec<CandidatePair>,
     pub(crate) nominated_pair: Option<usize>,
     pub(crate) selected_pair: Option<usize>,
+    /// Changes whenever the addresses the selected pair resolves to may have changed: a
+    /// pair is selected or dropped, a signaled candidate replaces its remote half, or the
+    /// candidates are deleted. Callers cache the route against it.
+    pub(crate) selected_pair_generation: u64,
 
     // Renomination (draft-thatcher-ice-renomination)
     pub(crate) nomination_value_generator: Option<NominationValueGenerator>,
@@ -332,6 +336,7 @@ impl Agent {
 
             nominated_pair: None,
             selected_pair: None,
+            selected_pair_generation: 0,
             candidate_pairs: vec![],
 
             connection_state: ConnectionState::New,
@@ -651,6 +656,7 @@ impl Agent {
                 && self.candidate_pairs[selected].remote_index == remote_index
             {
                 self.selected_pair_replaced = true;
+                self.selected_pair_generation += 1;
             }
             replaced = true;
         }
@@ -803,6 +809,29 @@ impl Agent {
         update_interval(disconnected_timeout);
         update_interval(failed_timeout);
         interval
+    }
+
+    /// A counter that changes whenever [`Agent::get_selected_candidate_pair`] may return a
+    /// different pair or different addresses, so a caller can cache what it derived from the
+    /// pair and recompute only when this moves.
+    pub fn selected_pair_generation(&self) -> u64 {
+        self.selected_pair_generation
+    }
+
+    /// Selects the pair of the local and remote candidates at these addresses, as a nomination
+    /// would, so a test of a caller can move the selection without running connectivity checks.
+    /// Panics when no such pair exists.
+    #[cfg(feature = "test-util")]
+    pub fn select_pair_for_test(&mut self, now: Instant, local: SocketAddr, remote: SocketAddr) {
+        let pair = self
+            .candidate_pairs
+            .iter()
+            .position(|pair| {
+                self.local_candidates[pair.local_index].addr() == local
+                    && self.remote_candidates[pair.remote_index].addr() == remote
+            })
+            .expect("a pair of these addresses");
+        self.set_selected_pair(Some(now), Some(pair));
     }
 
     /// Returns the selected pair (local_candidate, remote_candidate) or none
@@ -1038,6 +1067,7 @@ impl Agent {
     }
 
     pub(crate) fn set_selected_pair(&mut self, now: Option<Instant>, selected_pair: Option<usize>) {
+        self.selected_pair_generation += 1;
         if let Some(pair_index) = selected_pair {
             trace!(
                 "[{}]: Set selected candidate pair: {:?}",
@@ -1263,6 +1293,7 @@ impl Agent {
         // valid even when the local candidates are kept. See issue #88.
         self.candidate_pairs.clear();
         self.selected_pair = None;
+        self.selected_pair_generation += 1;
         self.nominated_pair = None;
     }
 

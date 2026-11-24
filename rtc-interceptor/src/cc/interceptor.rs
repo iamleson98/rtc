@@ -9,8 +9,9 @@ use crate::twcc::stream_supports_twcc;
 use crate::{Attribute, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
+use shared::hash::FastMap;
 use shared::marshal::{MarshalSize, Unmarshal};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// How long an unacknowledged packet is kept before it is written off.
@@ -80,7 +81,7 @@ impl<E: BandwidthEstimator> CongestionControlBuilder<E> {
             prune_horizon: self.prune_horizon,
             twcc_only: self.twcc_only,
             history: History::new(),
-            streams: HashMap::new(),
+            streams: FastMap::default(),
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
         }
@@ -114,7 +115,7 @@ impl<E: BandwidthEstimator> CongestionControlBuilder<E> {
 pub struct CongestionControlInterceptor<E: BandwidthEstimator> {
     estimator: E,
     history: History,
-    streams: HashMap<u32, LocalStream>,
+    streams: FastMap<u32, LocalStream>,
     prune_horizon: Duration,
     twcc_only: bool,
     /// The last target handed onward, so an unchanged estimate does not re-announce itself.

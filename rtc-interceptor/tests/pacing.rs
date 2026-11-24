@@ -253,9 +253,10 @@ fn a_burst_is_released_at_the_configured_rate() {
     for sequence_number in 0..5 {
         harness.send(ms(0), sequence_number);
     }
-    assert!(
-        harness.released().is_empty(),
-        "enqueueing releases nothing; only the clock does"
+    assert_eq!(
+        vec![(0, ms(0))],
+        harness.schedule(),
+        "the first leaves in the call that wrote it; the rest wait for the clock"
     );
 
     harness.advance_to(ms(100));
@@ -363,6 +364,37 @@ fn a_released_packet_carries_the_release_instant_not_the_enqueue_instant() {
     );
 }
 
+/// A packet the budget covers and nothing waits ahead of reaches the layer below in the call that
+/// wrote it, at the instant it was written, with no timeout in between. A packet behind a backlog
+/// is seen at its release instant, later.
+#[test]
+fn the_send_history_records_the_release_instant() {
+    let mut harness = Harness::new();
+
+    harness.send(ms(50), 0);
+    assert_eq!(
+        vec![(0, ms(50))],
+        harness.schedule(),
+        "seen at once, stamped with the instant it was written"
+    );
+
+    // 1 and 2 arrive together: the budget covers one of them, which leaves at once.
+    harness.send(ms(65), 1);
+    harness.send(ms(65), 2);
+    assert_eq!(
+        vec![(0, ms(50)), (1, ms(65))],
+        harness.schedule(),
+        "the second waits behind the budget"
+    );
+
+    harness.advance_to(ms(100));
+    assert_eq!(
+        vec![(0, ms(50)), (1, ms(65)), (2, ms(75))],
+        harness.schedule(),
+        "and is stamped with the instant it left, not the instant it arrived"
+    );
+}
+
 /// Rule 2. Released packets travel through `inner`, so a downstream layer sees each exactly once.
 #[test]
 fn each_packet_reaches_the_layer_below_exactly_once() {
@@ -398,18 +430,24 @@ fn poll_timeout_is_none_when_the_queue_is_empty() {
     assert_eq!(None, harness.next_timeout(), "nothing queued");
 
     harness.send(ms(0), 0);
+    assert_eq!(
+        None,
+        harness.next_timeout(),
+        "a packet the budget covers leaves at once and leaves nothing to wake for"
+    );
+
     harness.send(ms(0), 1);
     assert_eq!(
-        Some(ms(0)),
+        Some(ms(10)),
         harness.next_timeout(),
-        "the head can go immediately"
+        "the next is due a packet-time later"
     );
 
     harness.tick(ms(0));
     assert_eq!(
         Some(ms(10)),
         harness.next_timeout(),
-        "and the next is due a packet-time later"
+        "and a timeout before then changes nothing"
     );
 
     harness.advance_to(ms(100));
@@ -597,6 +635,7 @@ fn the_queue_is_bounded_and_refuses_new_arrivals_when_full() {
             Slot::Pacer,
             PacerBuilder::new()
                 .with_target_bitrate(BITRATE)
+                .with_burst_bits(PACKET_BITS)
                 .with_queue_limit(3)
                 .build(),
         )
@@ -632,8 +671,8 @@ fn the_queue_is_bounded_and_refuses_new_arrivals_when_full() {
     }
 
     assert_eq!(
-        3, released,
-        "capped at the queue limit; the other seven arrivals were refused"
+        4, released,
+        "one left at once, three fitted in the queue; the other six arrivals were refused"
     );
 }
 

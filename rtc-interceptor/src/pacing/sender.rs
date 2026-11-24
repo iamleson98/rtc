@@ -6,8 +6,9 @@ use crate::StreamInfo;
 use crate::{Attribute, Packet, TaggedPacket};
 use sansio::Protocol;
 use shared::error::Error;
+use shared::hash::FastSet;
 use shared::marshal::MarshalSize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Rate used when none is configured: 1 Mb/s.
@@ -231,7 +232,7 @@ pub struct PacerInterceptor {
     /// Paced bits sent recently; feeds the send-rate mode.
     sent: SendRate,
     /// SSRCs of local audio streams, which skip the queue.
-    audio_ssrcs: HashSet<u32>,
+    audio_ssrcs: FastSet<u32>,
     /// Packets refused because the queue was full.
     dropped: u64,
     /// Packets the budget has released, waiting to join the belt.
@@ -248,7 +249,7 @@ impl PacerInterceptor {
         Self {
             mode,
             sent: SendRate::default(),
-            audio_ssrcs: HashSet::new(),
+            audio_ssrcs: FastSet::default(),
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),
             released: VecDeque::new(),
@@ -367,6 +368,18 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for PacerInterceptor {
         // deadline that is never in the past, even before the first `handle_timeout`.
         self.pacer.refill(msg.now);
         self.update_rate(msg.now);
+
+        // Nothing waits ahead of it and the budget covers it: it leaves in the call that wrote it,
+        // exactly as `handle_timeout(msg.now)` would let it, instead of waiting for a wake-up
+        // that only exists to say so. Behind a backlog it takes its turn in the queue, so the
+        // order within a stream never changes.
+        let bits = Self::bits_of(&msg);
+        if self.queue.is_empty() && self.pacer.can_release(bits) {
+            self.pacer.consume(bits);
+            self.sent.record(msg.now, bits);
+            self.released.push_back(msg);
+            return Ok(());
+        }
 
         if self.queue.len() >= self.queue_limit {
             // Refuse the arrival rather than evicting something already queued: the queued
@@ -493,9 +506,10 @@ mod tests {
         }
         pacer.handle_write(rtp(now, 2, 100)).unwrap();
 
-        assert_eq!(Some(100), pacer.poll_write().map(|p| sequence(&p)));
-        assert!(pacer.poll_write().is_none(), "video is still queued");
-        assert_eq!(5, pacer.queued());
+        // The budget covers the first video packet, which left when it was written; the audio
+        // written after it still goes ahead of it, and the other four wait.
+        assert_eq!(vec![100, 0], drain(&mut pacer));
+        assert_eq!(4, pacer.queued());
     }
 
     #[test]
@@ -506,10 +520,12 @@ mod tests {
         pacer.bind_local_stream(&audio);
         pacer.unbind_local_stream(&audio);
 
+        // The budget covers one packet: the first leaves, the second is held like any video.
         pacer.handle_write(rtp(now, 2, 1)).unwrap();
+        pacer.handle_write(rtp(now, 2, 2)).unwrap();
 
+        assert_eq!(vec![1], drain(&mut pacer));
         assert_eq!(1, pacer.queued(), "paced like anything else again");
-        assert!(pacer.poll_write().is_none());
     }
 
     #[test]
@@ -595,5 +611,216 @@ mod tests {
         }
         pacer.handle_timeout(start).unwrap();
         assert_eq!(3, drain(&mut pacer).len());
+    }
+
+    /// What a write to the pacer is in a replay: a run of packets, or a new target rate.
+    enum Step {
+        Write { ssrc: u32, first: u16, count: u16 },
+        Rate(f64),
+    }
+
+    /// Plays `steps` against a pacer, firing each deadline it asks for before the step that comes
+    /// after it, and returns what left as (sequence number, departure) in order. With `reference`
+    /// the pacer is also woken at the instant of every write, which is what releasing at once is
+    /// meant to be the same as.
+    fn replay(
+        mut pacer: PacerInterceptor,
+        steps: &[(Duration, Step)],
+        reference: bool,
+    ) -> Vec<(u16, Duration)> {
+        let start = Instant::now();
+        let mut left = Vec::new();
+        let collect = |pacer: &mut PacerInterceptor, left: &mut Vec<(u16, Duration)>| {
+            while let Some(p) = pacer.poll_write() {
+                left.push((sequence(&p), p.now.duration_since(start)));
+            }
+        };
+        let fire_until = |pacer: &mut PacerInterceptor,
+                          left: &mut Vec<(u16, Duration)>,
+                          until: Option<Instant>| {
+            for _ in 0..100_000 {
+                let Some(due) = pacer
+                    .poll_timeout()
+                    .filter(|d| until.is_none_or(|u| *d <= u))
+                else {
+                    return;
+                };
+                pacer.handle_timeout(due).unwrap();
+                collect(pacer, left);
+            }
+            panic!("the pacer never went quiet");
+        };
+        for (after, step) in steps {
+            let at = start + *after;
+            fire_until(&mut pacer, &mut left, Some(at));
+            match *step {
+                Step::Write { ssrc, first, count } => {
+                    for n in 0..count {
+                        pacer.handle_write(rtp(at, ssrc, first + n)).unwrap();
+                        if reference {
+                            pacer.handle_timeout(at).unwrap();
+                        }
+                        collect(&mut pacer, &mut left);
+                    }
+                }
+                Step::Rate(bits_per_second) => {
+                    pacer.pacer_mut().set_target_bitrate(bits_per_second);
+                }
+            }
+        }
+        fire_until(&mut pacer, &mut left, None);
+        left
+    }
+
+    /// Frames of one to three packets every 33 ms, a keyframe of 40 packets, audio between, and
+    /// (for a pacer that follows the target) the rate halved and raised again.
+    fn a_stream_of_frames() -> Vec<(Duration, Step)> {
+        let mut steps = Vec::new();
+        let mut video = 0u16;
+        for frame in 0..90u64 {
+            let at = Duration::from_millis(frame * 33 + frame % 3);
+            let count = match frame {
+                15 => 40,
+                _ => 1 + (frame % 3) as u16,
+            };
+            steps.push((
+                at,
+                Step::Write {
+                    ssrc: 1,
+                    first: video,
+                    count,
+                },
+            ));
+            video += count;
+            steps.push((
+                at + Duration::from_millis(7),
+                Step::Write {
+                    ssrc: 2,
+                    first: 1000 + frame as u16,
+                    count: 1,
+                },
+            ));
+            if frame == 40 {
+                steps.push((at + Duration::from_millis(9), Step::Rate(400_000.0)));
+            }
+            if frame == 60 {
+                steps.push((at + Duration::from_millis(9), Step::Rate(6_000_000.0)));
+            }
+        }
+        steps
+    }
+
+    fn bound(mut pacer: PacerInterceptor) -> PacerInterceptor {
+        pacer.bind_local_stream(&stream(1, "video/VP8"));
+        pacer.bind_local_stream(&stream(2, "audio/opus"));
+        pacer
+    }
+
+    #[test]
+    fn immediate_release_matches_the_timeout_schedule() {
+        let send_rate = || {
+            bound(
+                PacerBuilder::new()
+                    .with_send_rate_multiplier(2.0)
+                    .with_min_bitrate(3_000_000.0)
+                    .with_burst_window(Duration::from_millis(5))
+                    .build(),
+            )
+        };
+        let follow = || {
+            bound(
+                PacerBuilder::new()
+                    .with_target_bitrate(1_500_000.0)
+                    .with_burst_window(Duration::from_millis(5))
+                    .build(),
+            )
+        };
+        for (name, pacer) in [("send rate", send_rate as fn() -> _), ("target", follow)] {
+            let steps = a_stream_of_frames();
+            let now = replay(pacer(), &steps, false);
+            let then = replay(pacer(), &steps, true);
+            assert!(
+                now.len() > 150,
+                "{name}: the replay sent {} packets",
+                now.len()
+            );
+            assert_eq!(
+                then, now,
+                "{name}: the same packets leave at the same instants"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_behind_a_backlog_waits_its_turn() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new().with_send_rate_multiplier(2.0).build();
+        for seq in 0..4 {
+            pacer.handle_write(rtp(start, 1, seq)).unwrap();
+        }
+        assert_eq!(vec![0], drain(&mut pacer));
+        assert_eq!(3, pacer.queued());
+
+        // Long enough for the budget to cover a packet again, without a timeout since: the new
+        // packet still goes behind the three that wait, and nothing leaves before the timeout.
+        let later = start + Duration::from_millis(20);
+        pacer.handle_write(rtp(later, 1, 4)).unwrap();
+        assert!(pacer.poll_write().is_none());
+        assert_eq!(4, pacer.queued());
+
+        let mut order = Vec::new();
+        for _ in 0..8 {
+            let Some(due) = pacer.poll_timeout() else {
+                break;
+            };
+            pacer.handle_timeout(due.max(later)).unwrap();
+            order.extend(drain(&mut pacer));
+        }
+        assert_eq!(vec![1, 2, 3, 4], order);
+    }
+
+    #[test]
+    fn audio_written_after_video_is_not_held() {
+        let now = Instant::now();
+        let mut pacer = PacerBuilder::new().with_send_rate_multiplier(2.0).build();
+        pacer.bind_local_stream(&stream(1, "video/VP8"));
+        pacer.bind_local_stream(&stream(2, "audio/opus"));
+
+        // One video packet leaves at once, three more queue, then a voice packet arrives.
+        for seq in 0..4 {
+            pacer.handle_write(rtp(now, 1, seq)).unwrap();
+        }
+        pacer.handle_write(rtp(now, 2, 100)).unwrap();
+
+        assert_eq!(
+            vec![100, 0],
+            drain(&mut pacer),
+            "voice goes first, unmetered"
+        );
+        assert_eq!(3, pacer.queued());
+    }
+
+    #[test]
+    fn the_send_rate_counts_immediate_releases() {
+        let start = Instant::now();
+        let mut pacer = PacerBuilder::new()
+            .with_send_rate_multiplier(2.0)
+            .with_min_bitrate(10_000.0)
+            .build();
+
+        // The budget covers the packet: it leaves in the write, with no timeout.
+        pacer.handle_write(rtp(start, 1, 0)).unwrap();
+        assert_eq!(vec![0], drain(&mut pacer));
+        assert_eq!(0, pacer.queued());
+
+        // Twice what went out over the window.
+        pacer
+            .handle_timeout(start + Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(
+            2.0 * PACKET_BITS,
+            pacer.pacer().target_bitrate(),
+            "the packet that left at once is part of the rate"
+        );
     }
 }

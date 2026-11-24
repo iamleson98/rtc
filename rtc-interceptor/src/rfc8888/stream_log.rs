@@ -4,7 +4,7 @@ use crate::jitterbuffer::sequence::SequenceExtender;
 use rtcp::transport_feedbacks::cc_feedback_report::{
     CcFeedbackMetricBlock, CcFeedbackReportBlock, Ecn,
 };
-use std::collections::HashMap;
+use shared::hash::FastMap;
 use std::time::Instant;
 
 /// The most packets one report block can describe, from the 16-bit `num_reports` field.
@@ -39,7 +39,7 @@ pub(crate) struct StreamLog {
     /// The highest sequence number seen.
     highest_received: u64,
     initialised: bool,
-    log: HashMap<u64, PacketReport>,
+    log: FastMap<u64, PacketReport>,
 }
 
 impl StreamLog {
@@ -50,7 +50,7 @@ impl StreamLog {
             next_to_report: 0,
             highest_received: 0,
             initialised: false,
-            log: HashMap::new(),
+            log: FastMap::default(),
         }
     }
 

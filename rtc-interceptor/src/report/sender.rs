@@ -8,7 +8,8 @@ use rtcp::header::PacketType;
 use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
-use std::collections::{HashMap, VecDeque};
+use shared::hash::FastMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Builder for the SenderReportInterceptor.
@@ -146,7 +147,7 @@ pub struct SenderReportInterceptor {
     /// Whether to always use the latest packet, even if out-of-order.
     use_latest_packet: bool,
 
-    streams: HashMap<u32, SenderStream>,
+    streams: FastMap<u32, SenderStream>,
 
     read_queue: VecDeque<TaggedPacket>,
     write_queue: VecDeque<TaggedPacket>,
@@ -161,7 +162,7 @@ impl SenderReportInterceptor {
 
             use_latest_packet,
 
-            streams: HashMap::new(),
+            streams: FastMap::default(),
 
             read_queue: VecDeque::new(),
             write_queue: VecDeque::new(),

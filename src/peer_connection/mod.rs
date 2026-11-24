@@ -1454,8 +1454,7 @@ impl RTCPeerConnection {
 
         self.pipeline_context
             .interceptor_handler_context
-            .ssrc_owners
-            .clear();
+            .reset_for_remote_description();
         self.pipeline_context
             .endpoint_handler_context
             .ssrc_owners
@@ -2676,6 +2675,11 @@ impl RTCPeerConnection {
     /// See [getStats](https://www.w3.org/TR/webrtc/#widl-RTCPeerConnection-getStats-Promise-RTCStatsReport--MediaStreamTrack-selector) and
     /// [The stats selection algorithm](https://www.w3.org/TR/webrtc/#the-stats-selection-algorithm)
     pub fn get_stats(&mut self, now: Instant, selector: StatsSelector) -> RTCStatsReport {
+        // The data path counts packets on the selected pair as plain fields; hand them to the
+        // accumulator before taking the snapshot.
+        self.pipeline_context
+            .ice_handler_context
+            .flush_traffic(&mut self.pipeline_context.stats);
         // Update ICE agent stats before taking snapshot
         self.update_ice_agent_stats(now);
         // Update codec stats from transceivers before taking snapshot
