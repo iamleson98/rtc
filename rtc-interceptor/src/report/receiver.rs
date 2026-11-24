@@ -129,28 +129,6 @@ impl ReceiverReportInterceptor {
         }
     }
 
-    /// Process an incoming RTP packet for statistics.
-    fn process_rtp(&mut self, now: Instant, ssrc: u32, seq: u16, timestamp: u32) {
-        // Create stream if it doesn't exist
-        let stream = self.streams.entry(ssrc).or_insert_with(|| {
-            // Default clock rate, should be configured per stream in real usage
-            ReceiverStream::new(ssrc, 90000)
-        });
-
-        // Create a minimal RTP packet for processing
-        let pkt = rtp::packet::Packet {
-            header: rtp::header::Header {
-                ssrc,
-                sequence_number: seq,
-                timestamp,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        stream.process_rtp(now, &pkt);
-    }
-
     /// Process an incoming RTCP Sender Report.
     fn process_sender_report(&mut self, now: Instant, sr: &rtcp::sender_report::SenderReport) {
         if let Some(stream) = self.streams.get_mut(&sr.ssrc) {
@@ -164,13 +142,6 @@ impl ReceiverReportInterceptor {
             .values_mut()
             .map(|stream| stream.generate_report(now))
             .collect()
-    }
-
-    /// Register a new stream with its clock rate.
-    fn register_stream(&mut self, ssrc: u32, clock_rate: u32) {
-        self.streams
-            .entry(ssrc)
-            .or_insert_with(|| ReceiverStream::new(ssrc, clock_rate));
     }
 }
 
