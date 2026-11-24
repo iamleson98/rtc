@@ -9,7 +9,7 @@ mod certificate;
 mod codec;
 mod data_channel;
 mod ice_candidate;
-mod ice_candidate_pair;
+pub(crate) mod ice_candidate_pair;
 mod media;
 mod peer_connection;
 mod rtp_stream;

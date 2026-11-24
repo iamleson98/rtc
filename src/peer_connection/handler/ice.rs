@@ -5,6 +5,7 @@ use crate::peer_connection::message::internal::{
 };
 use crate::peer_connection::transport::ice::IceTransport;
 use crate::statistics::accumulator::RTCStatsAccumulator;
+use crate::statistics::accumulator::ice_candidate_pair::PairTraffic;
 use crate::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState;
 use log::{debug, trace};
 use shared::error::{Error, Result};
@@ -19,12 +20,20 @@ pub(crate) struct IceHandlerContext {
     pub(crate) write_outs: VecDeque<TaggedRTCMessageInternal>,
     pub(crate) event_outs: VecDeque<TaggedRTCEventInternal>,
 
-    /// Cached stats key of the currently selected ICE candidate pair
-    /// (`RTCIceCandidatePair_<local>_<remote>`), refreshed only when the selected
-    /// pair changes. The per-packet read/write path looks the pair's stats
-    /// accumulator up with this key instead of re-`format!`ing it on every packet
-    /// — that formatting was a heap allocation on the hot path in both directions.
-    pub(crate) selected_pair_key: Option<String>,
+    /// The selected candidate pair as the data path sees it: its stats key
+    /// (`RTCIceCandidatePair_<local>_<remote>`, refreshed only when the selected pair
+    /// changes) and the packets counted on it since the last [`Self::flush_traffic`].
+    pub(crate) selected_pair: Option<SelectedPair>,
+
+    /// The route the selected pair resolves to, with the agent's
+    /// `selected_pair_generation` it was derived at. Packets reuse it until that moves.
+    route: Option<(u64, Option<Route>)>,
+}
+
+/// The stats key and unflushed packet counts of the selected candidate pair.
+pub(crate) struct SelectedPair {
+    key: String,
+    traffic: PairTraffic,
 }
 
 impl IceHandlerContext {
@@ -36,7 +45,17 @@ impl IceHandlerContext {
             write_outs: VecDeque::new(),
             event_outs: VecDeque::new(),
 
-            selected_pair_key: None,
+            selected_pair: None,
+            route: None,
+        }
+    }
+
+    /// Moves the packets counted on the selected pair into its stats accumulator.
+    pub(crate) fn flush_traffic(&mut self, stats: &mut RTCStatsAccumulator) {
+        if let Some(selected) = &mut self.selected_pair
+            && let Some(pair) = stats.ice_candidate_pairs.get_mut(&selected.key)
+        {
+            pair.absorb(&mut selected.traffic);
         }
     }
 }
@@ -91,16 +110,29 @@ impl super::WriteBypass for IceHandler<'_> {
 }
 
 impl IceHandler<'_> {
-    fn selected_route(&self) -> Option<Route> {
-        let (local, remote) = self.ctx.ice_transport.agent.get_selected_candidate_pair()?;
-        // Use the local candidate's base address: for (server/peer-)
-        // reflexive candidates the candidate address is the NAT mapping,
-        // not a bound local socket (RFC 8445 §5.1.1).
-        Some(Route {
-            local_addr: local.base_addr(),
-            peer_addr: remote.addr(),
-            transport_protocol: local.network_type().to_protocol(),
-        })
+    /// The route of the selected pair, derived once per change of the pair rather than per packet.
+    fn selected_route(&mut self) -> Option<Route> {
+        let generation = self.ctx.ice_transport.agent.selected_pair_generation();
+        if let Some((cached, route)) = self.ctx.route
+            && cached == generation
+        {
+            return route;
+        }
+        let route = self
+            .ctx
+            .ice_transport
+            .agent
+            .get_selected_candidate_pair()
+            .map(|(local, remote)| Route {
+                // Use the local candidate's base address: for (server/peer-)
+                // reflexive candidates the candidate address is the NAT mapping,
+                // not a bound local socket (RFC 8445 §5.1.1).
+                local_addr: local.base_addr(),
+                peer_addr: remote.addr(),
+                transport_protocol: local.network_type().to_protocol(),
+            });
+        self.ctx.route = Some((generation, route));
+        route
     }
 
     /// Addresses `msg` with the selected candidate pair and counts it.
@@ -115,13 +147,9 @@ impl IceHandler<'_> {
         msg.transport.transport_protocol = route.transport_protocol;
         debug!("Bypass ice write {:?}", msg.transport.peer_addr);
 
-        // Track packets/bytes sent on the selected candidate pair. Look the
-        // accumulator up via the cached key to avoid allocating it per packet.
-        let bytes = msg.message.len();
-        if let Some(key) = &self.ctx.selected_pair_key
-            && let Some(pair) = self.stats.ice_candidate_pairs.get_mut(key)
-        {
-            pair.on_packet_sent(bytes, msg.now);
+        // Count on the selected pair; the stats accumulator takes the counts when read.
+        if let Some(selected) = &mut self.ctx.selected_pair {
+            selected.traffic.on_sent(msg.message.len(), msg.now);
         }
     }
 
@@ -178,14 +206,9 @@ impl<'a>
             // only ICE connection is ready and bypass it
             debug!("bypass ice read {:?}", msg.transport.peer_addr);
 
-            // Track packets/bytes received on the selected candidate pair. Look
-            // the accumulator up via the cached key (set on the last
-            // SelectedCandidatePairChange) to avoid allocating the key per packet.
-            let bytes = msg.message.len();
-            if let Some(key) = &self.ctx.selected_pair_key
-                && let Some(pair) = self.stats.ice_candidate_pairs.get_mut(key)
-            {
-                pair.on_packet_received(bytes, msg.now);
+            // Count on the selected pair; the stats accumulator takes the counts when read.
+            if let Some(selected) = &mut self.ctx.selected_pair {
+                selected.traffic.on_received(msg.message.len(), msg.now);
             }
 
             // When ICE restarts and the selected candidate pair changes,
@@ -271,11 +294,13 @@ impl<'a>
                     pair.nominated = true;
                     pair.state = RTCStatsIceCandidatePairState::Succeeded;
 
-                    // Cache the pair's stats key so the per-packet path can look
-                    // the accumulator up by borrow instead of re-formatting (and
-                    // allocating) the key on every read/write.
+                    // Packets counted so far belong to the pair being left.
+                    self.ctx.flush_traffic(self.stats);
                     let key = format!("RTCIceCandidatePair_{}_{}", local.id(), remote.id());
-                    self.ctx.selected_pair_key = Some(key.clone());
+                    self.ctx.selected_pair = Some(SelectedPair {
+                        key: key.clone(),
+                        traffic: PairTraffic::default(),
+                    });
                     // Update transport stats for selected candidate pair change
                     self.stats.transport.on_selected_candidate_pair_changed(key);
 
@@ -304,5 +329,114 @@ impl<'a>
 
     fn close(&mut self) -> Result<()> {
         self.ctx.ice_transport.agent.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer_connection::transport::{RTCTransportId, TransportKind};
+    use crate::statistics::accumulator::ice_candidate_pair::IceCandidatePairAccumulator;
+    use ::ice::AgentConfig;
+    use std::time::Duration;
+
+    fn context() -> IceHandlerContext {
+        let crypto_provider =
+            crypto::default_provider().expect("a built-in crypto provider is enabled for tests");
+        let transport = IceTransport::new(
+            Instant::now(),
+            AgentConfig::default(),
+            crypto_provider,
+            RTCTransportId::new(0xabcd_ef01_2345_6789, TransportKind::Ice),
+        )
+        .expect("ice transport");
+        IceHandlerContext::new(transport)
+    }
+
+    fn select(ctx: &mut IceHandlerContext, stats: &mut RTCStatsAccumulator, key: &str) {
+        ctx.flush_traffic(stats);
+        stats
+            .ice_candidate_pairs
+            .entry(key.to_string())
+            .or_insert_with(IceCandidatePairAccumulator::default);
+        ctx.selected_pair = Some(SelectedPair {
+            key: key.to_string(),
+            traffic: PairTraffic::default(),
+        });
+    }
+
+    fn count(ctx: &mut IceHandlerContext, sent: &[usize], received: &[usize], at: Instant) {
+        let selected = ctx.selected_pair.as_mut().expect("a selected pair");
+        for bytes in sent {
+            selected.traffic.on_sent(*bytes, at);
+        }
+        for bytes in received {
+            selected.traffic.on_received(*bytes, at);
+        }
+    }
+
+    #[test]
+    fn counts_reach_the_accumulator_when_flushed() {
+        let mut ctx = context();
+        let mut stats = RTCStatsAccumulator::new();
+        let at = Instant::now();
+        select(&mut ctx, &mut stats, "pair-a");
+
+        count(&mut ctx, &[100; 7], &[40; 3], at);
+        assert_eq!(stats.ice_candidate_pairs["pair-a"].packets_sent, 0);
+
+        ctx.flush_traffic(&mut stats);
+        let pair = &stats.ice_candidate_pairs["pair-a"];
+        assert_eq!((pair.packets_sent, pair.bytes_sent), (7, 700));
+        assert_eq!((pair.packets_received, pair.bytes_received), (3, 120));
+        assert_eq!(pair.last_packet_sent_timestamp, Some(at));
+
+        // Flushing is idempotent, and later counts add on.
+        ctx.flush_traffic(&mut stats);
+        count(&mut ctx, &[10], &[], at + Duration::from_millis(1));
+        ctx.flush_traffic(&mut stats);
+        let pair = &stats.ice_candidate_pairs["pair-a"];
+        assert_eq!((pair.packets_sent, pair.bytes_sent), (8, 710));
+        assert_eq!(pair.packets_received, 3);
+    }
+
+    #[test]
+    fn a_route_change_keeps_each_pairs_own_counts() {
+        let mut ctx = context();
+        let mut stats = RTCStatsAccumulator::new();
+        let at = Instant::now();
+        select(&mut ctx, &mut stats, "pair-a");
+        count(&mut ctx, &[100; 5], &[50; 2], at);
+
+        // Renomination: what was counted so far belongs to the pair being left.
+        select(&mut ctx, &mut stats, "pair-b");
+        count(&mut ctx, &[200; 4], &[], at);
+        ctx.flush_traffic(&mut stats);
+
+        let a = &stats.ice_candidate_pairs["pair-a"];
+        assert_eq!((a.packets_sent, a.bytes_sent), (5, 500));
+        assert_eq!((a.packets_received, a.bytes_received), (2, 100));
+        let b = &stats.ice_candidate_pairs["pair-b"];
+        assert_eq!((b.packets_sent, b.bytes_sent), (4, 800));
+        assert_eq!(b.packets_received, 0);
+
+        // Back to the first pair: its counts continue rather than restart.
+        select(&mut ctx, &mut stats, "pair-a");
+        count(&mut ctx, &[1], &[], at);
+        ctx.flush_traffic(&mut stats);
+        assert_eq!(stats.ice_candidate_pairs["pair-a"].packets_sent, 6);
+    }
+
+    #[test]
+    fn the_route_is_none_until_a_pair_is_selected_and_is_cached_per_generation() {
+        let mut ctx = context();
+        let mut stats = RTCStatsAccumulator::new();
+        let mut handler = IceHandler {
+            ctx: &mut ctx,
+            stats: &mut stats,
+        };
+        assert!(handler.selected_route().is_none());
+        let generation = handler.ctx.ice_transport.agent.selected_pair_generation();
+        assert!(matches!(handler.ctx.route, Some((g, None)) if g == generation));
     }
 }

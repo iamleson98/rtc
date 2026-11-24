@@ -72,7 +72,51 @@ pub struct IceCandidatePairAccumulator {
     pub nominated: bool,
 }
 
+/// Packet counts the data path keeps for the selected pair as plain fields.
+///
+/// The pair's accumulator lives in a string-keyed map, so the data path adds here and
+/// [`IceCandidatePairAccumulator::absorb`] moves the counts across when stats are read or
+/// the selected pair changes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PairTraffic {
+    packets_sent: u64,
+    bytes_sent: u64,
+    last_sent: Option<Instant>,
+    packets_received: u64,
+    bytes_received: u64,
+    last_received: Option<Instant>,
+}
+
+impl PairTraffic {
+    pub(crate) fn on_sent(&mut self, bytes: usize, now: Instant) {
+        self.packets_sent += 1;
+        self.bytes_sent += bytes as u64;
+        self.last_sent = Some(now);
+    }
+
+    pub(crate) fn on_received(&mut self, bytes: usize, now: Instant) {
+        self.packets_received += 1;
+        self.bytes_received += bytes as u64;
+        self.last_received = Some(now);
+    }
+}
+
 impl IceCandidatePairAccumulator {
+    /// Adds what the data path counted in `traffic` and resets it.
+    pub(crate) fn absorb(&mut self, traffic: &mut PairTraffic) {
+        let traffic = std::mem::take(traffic);
+        self.packets_sent += traffic.packets_sent;
+        self.bytes_sent += traffic.bytes_sent;
+        self.packets_received += traffic.packets_received;
+        self.bytes_received += traffic.bytes_received;
+        if traffic.last_sent.is_some() {
+            self.last_packet_sent_timestamp = traffic.last_sent;
+        }
+        if traffic.last_received.is_some() {
+            self.last_packet_received_timestamp = traffic.last_received;
+        }
+    }
+
     /// Called when a packet is sent through this candidate pair.
     pub fn on_packet_sent(&mut self, bytes: usize, now: Instant) {
         self.packets_sent += 1;
@@ -298,6 +342,33 @@ mod tests {
         assert_eq!(acc.state, RTCStatsIceCandidatePairState::Succeeded);
         assert_eq!(acc.packets_sent, 1);
         assert_eq!(acc.bytes_sent, 1200);
+    }
+
+    #[test]
+    fn absorbing_the_counters_equals_counting_on_the_accumulator() {
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let mut direct = IceCandidatePairAccumulator::default();
+        let mut counted = IceCandidatePairAccumulator::default();
+        let mut traffic = PairTraffic::default();
+        for (bytes, now) in [(100, t0), (250, t1), (1200, t1)] {
+            direct.on_packet_sent(bytes, now);
+            traffic.on_sent(bytes, now);
+        }
+        for (bytes, now) in [(80, t0), (90, t1)] {
+            direct.on_packet_received(bytes, now);
+            traffic.on_received(bytes, now);
+        }
+        counted.absorb(&mut traffic);
+        assert_eq!(traffic, PairTraffic::default());
+        counted.absorb(&mut traffic);
+
+        assert_eq!(counted.packets_sent, direct.packets_sent);
+        assert_eq!(counted.bytes_sent, direct.bytes_sent);
+        assert_eq!(counted.packets_received, direct.packets_received);
+        assert_eq!(counted.bytes_received, direct.bytes_received);
+        assert_eq!(counted.last_packet_sent_timestamp, Some(t1));
+        assert_eq!(counted.last_packet_received_timestamp, Some(t1));
     }
 
     #[test]
