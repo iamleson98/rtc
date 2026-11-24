@@ -1,8 +1,9 @@
 //! A fast hasher for the integer keys on the packet path: SSRCs, sequence numbers and the like.
 //!
 //! The standard hasher (SipHash) costs more than the map lookup it feeds, and these keys are a
-//! single `u32`, `u16` or `u64`. [`FastBuildHasher`] mixes each written word with a multiply
-//! (Fibonacci hashing) and finishes with a second multiply and a shift, because the hash table
+//! single `u32`, `u16` or `u64`. [`FastBuildHasher`](crate::hash::FastBuildHasher) mixes each
+//! written word with a multiply (Fibonacci hashing) and finishes with a second multiply and a
+//! shift, because the hash table
 //! picks its bucket from the low bits and its control byte from the high ones: a plain multiply
 //! leaves the low bits as poor as the key's own, and a single fold of the high half onto the low
 //! one still clumps strided keys (stride 16 put a fifth of the keys of a 4096-slot table in too few
