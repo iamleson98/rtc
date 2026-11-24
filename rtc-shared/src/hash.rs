@@ -36,8 +36,12 @@ pub struct FastBuildHasher {
 
 impl FastBuildHasher {
     /// A builder with a chosen multiplier, made odd so the multiply is a bijection on `u64`.
-    /// Tests use it to get the same hashes every run; everything else wants [`Default`].
-    pub fn with_multiplier(multiplier: u64) -> Self {
+    ///
+    /// For tests only, to get the same hashes every run or to try many multipliers: a chosen
+    /// multiplier can be a weak one (a sparse one puts strided keys in one bucket), and the
+    /// process-wide random one of [`Default`] is what keeps a peer from aiming keys at a bucket.
+    #[cfg(test)]
+    pub(crate) fn with_multiplier(multiplier: u64) -> Self {
         Self {
             multiplier: multiplier | 1,
         }
@@ -126,11 +130,15 @@ impl Hasher for FastHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::hash::BuildHasher;
+    use std::hash::{BuildHasher, Hash};
 
     /// How many of `keys` land in each of `buckets` buckets, picking the bucket the way the hash
     /// table does: from the low bits.
-    fn loads(build: &FastBuildHasher, keys: impl Iterator<Item = u64>, buckets: usize) -> Vec<u32> {
+    fn loads<K: Hash>(
+        build: &FastBuildHasher,
+        keys: impl Iterator<Item = K>,
+        buckets: usize,
+    ) -> Vec<u32> {
         let mut loads = vec![0u32; buckets];
         for key in keys {
             loads[(build.hash_one(key) as usize) & (buckets - 1)] += 1;
@@ -190,6 +198,50 @@ mod tests {
         let build = FastBuildHasher::with_multiplier(FIBONACCI);
         assert_ne!(build.hash_one((1u32, 2u16)), build.hash_one((2u32, 1u16)));
         assert_ne!(build.hash_one((1u32, 2u16)), build.hash_one((1u32, 3u16)));
+    }
+
+    /// The `(ssrc, sequence number)` keys the interceptors use spread like random whichever
+    /// multiplier the process drew, not only for the fixed one the other tests use: the fullest
+    /// bucket stays near what chance gives (about 6 for 4096 keys in 4096 buckets).
+    #[test]
+    fn tuple_keys_spread_under_any_random_multiplier() {
+        type Keys = Box<dyn Fn() -> Box<dyn Iterator<Item = (u32, u16)>>>;
+        let patterns: [(&str, Keys); 5] = [
+            (
+                "one stream, counting sequence",
+                Box::new(|| Box::new((0..4096u32).map(|i| (0x1234_5678, i as u16)))),
+            ),
+            (
+                "one sequence number, many SSRCs",
+                Box::new(|| Box::new((0..4096u32).map(|i| (0x1000_0000 + i, 7u16)))),
+            ),
+            (
+                "three layers, counting sequence",
+                Box::new(|| {
+                    Box::new((0..4096u32).map(|i| (0x1000_0000 + (i % 3) * 0x100, (i / 3) as u16)))
+                }),
+            ),
+            (
+                "strided SSRCs and sequence numbers",
+                Box::new(|| Box::new((0..4096u32).map(|i| (i << 12, (i * 16) as u16)))),
+            ),
+            (
+                "SSRCs in step with the sequence",
+                Box::new(|| Box::new((0..4096u32).map(|i| (i, i as u16)))),
+            ),
+        ];
+        for _ in 0..256 {
+            let multiplier: u64 = rand::random();
+            let build = FastBuildHasher::with_multiplier(multiplier);
+            for (what, keys) in &patterns {
+                let loads = loads(&build, keys(), 4096);
+                let fullest = *loads.iter().max().unwrap();
+                assert!(
+                    fullest <= 14,
+                    "{what}: fullest bucket holds {fullest} under multiplier {multiplier:#x}"
+                );
+            }
+        }
     }
 
     #[test]
