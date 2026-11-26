@@ -5,8 +5,10 @@
 #
 # Environment: CYCLE_MIN (netem cycle length, default 20), IFACE (default lo), RULES (default
 # rules.json next to this script; rules-abuse.json for PROFILE=abuse), SOAK_RTC_BIN / SOAK_PION_BIN
-# (prebuilt peers; skips the build). RTC_PEER_ENV (space separated VAR=value, default empty) is set in
-# the environment of the rtc peers only, never the pion ones, and is written into the run row.
+# (prebuilt peers; skips the build). RTC_PEER_FEATURES (cargo features, default empty) builds the rtc
+# peer with them: heap-profile writes dhat-heap-<id>.json next to the jsonl. RTC_PEER_ENV (space
+# separated VAR=value, default empty) is set in the environment of the rtc peers only, never the pion
+# ones, and is written into the run row.
 # PROFILE=call (default) is the call under the netem phases. PROFILE=abuse runs the same call under
 # abuse: the peers add hostile connections and traffic (see README.md, "The abuse profile of the
 # peers") while netem.sh runs its abuse profile on the interface. Everything is replayable from SEED
@@ -88,7 +90,10 @@ sudo=""
 rtc_bin=${SOAK_RTC_BIN:-}
 pion_bin=${SOAK_PION_BIN:-}
 if [[ "$pair" == *rtc* ]] && [ -z "$rtc_bin" ]; then
-  cargo build --release --manifest-path "$here/Cargo.toml"
+  features=${RTC_PEER_FEATURES:-}
+  # dhat names allocation sites from debug info, so a profiled build keeps it.
+  [ -n "$features" ] && export CARGO_PROFILE_RELEASE_DEBUG=1
+  cargo build --release --manifest-path "$here/Cargo.toml" ${features:+--features "$features"}
   rtc_bin=$(cargo metadata --no-deps --format-version 1 --manifest-path "$here/Cargo.toml" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/soak-rtc
 fi

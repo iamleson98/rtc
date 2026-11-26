@@ -44,6 +44,12 @@ the rtc peers only, never the pion ones, and is recorded in the `run` row (`peer
 inputs. In CI, a manual run takes it as the `rtc_peer_env` input, and `pairs`, `archs` and `profiles`
 (JSON arrays, default all) pick the combinations, e.g. `["rtc-rtc"]`, `["x64"]`, `["trace"]` for one job.
 
+`RTC_PEER_FEATURES=heap-profile` (the `rtc_peer_features` input in CI) builds the rtc peer with debug info
+and dhat as its allocator. Each peer then writes `dhat-heap-<id>.json` next to its jsonl when the run ends
+(open it in the dhat viewer; `eb` is the bytes still live at the end, per allocation site), and the
+`heap` samples read dhat's totals, whose peak is since the start. Profiled runs are slower: never compare
+their timings with a normal run.
+
 On a Mac, use a privileged Linux container (Colima's VM is aarch64, so this is also an arm64 run).
 Build the two peers for Linux first (`cargo build --release` in a `rust` container, `go build` in a
 `golang` one), then run in an image that has `iproute2` and `python3`:

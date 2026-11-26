@@ -48,8 +48,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
 static ALLOC: heap::CountingAlloc = heap::CountingAlloc;
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const START_SEQ: u16 = (65536u32 - 300) as u16;
@@ -274,6 +278,14 @@ fn out_params(
 
 fn main() {
     let a = parse_args();
+    // Dropped at the end of main, on the normal end of the run, which writes the profile.
+    #[cfg(feature = "heap-profile")]
+    let _profiler = {
+        let out = std::path::Path::new(&a.out);
+        dhat::Profiler::builder()
+            .file_name(out.with_file_name(format!("dhat-heap-{}.json", a.id)))
+            .build()
+    };
     let mut log = match Logger::open(&a.out, &a.id) {
         Ok(l) => l,
         Err(e) => {

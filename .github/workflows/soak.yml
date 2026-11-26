@@ -30,6 +30,9 @@ on:
       rtc_peer_env:
         description: 'VAR=value words (space separated) set in the environment of the rtc peers only; empty for none'
         default: ""
+      rtc_peer_features:
+        description: 'cargo features of the rtc peer build (heap-profile writes dhat-heap-*.json); empty for none'
+        default: ""
   pull_request:
     paths:
       - 'benchmarks/soak/**'
@@ -102,6 +105,7 @@ jobs:
         env:
           PROFILE: ${{ matrix.profile }}
           RTC_PEER_ENV: ${{ inputs.rtc_peer_env }}
+          RTC_PEER_FEATURES: ${{ inputs.rtc_peer_features }}
           SEED: ${{ github.run_id }} # the same for every job of the run: one schedule of abuse, one trace replay for all
         run: scripts/ci-run.sh benchmarks/soak/run.sh "${{ matrix.pair }}" "$MINUTES" soak-out
       - uses: actions/upload-artifact@v4
@@ -112,6 +116,7 @@ jobs:
             soak-out/*.jsonl
             soak-out/*.log
             soak-out/machine.txt
+            soak-out/dhat-heap-*.json
 
   report:
     name: report
