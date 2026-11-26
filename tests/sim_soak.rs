@@ -12,9 +12,16 @@
 //! What a seed draws is the network weather and the sizes and timings of what is sent. The
 //! library draws its own randomness (certificates, ICE credentials, DTLS and SCTP initial values)
 //! from the operating system, which a seed does not control.
+//!
+//! A counting allocator (per thread, so seeds on worker threads do not mix) lets
+//! `live_memory_is_flat_under_generated_weather` sample the bytes the library holds once per
+//! virtual minute, to tell a leak from the allocator keeping pages. Knobs: `SIM_SOAK_MEM_SEED`
+//! (default 1), `SIM_SOAK_MEM_MINUTES` (default 120; 10 in a debug build).
 
 mod common;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -42,6 +49,53 @@ use rtc::rtp_transceiver::rtp_sender::{
 };
 use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtc::statistics::StatsSelector;
+
+/// How many bytes the live-memory test lets the live heap grow between its warm-up window
+/// (samples 10..30) and its last 20 samples. Seed 1 grows by about 0.41 MB on both architectures (one
+/// step of about 0.3 MB after a long outage; the heap is about 3 MB); a collection that keeps
+/// growing for the 2 h passes 0.8 MB long before the end.
+const LIVE_GROWTH_BOUND: isize = 800_000;
+
+thread_local! {
+    /// Bytes this thread has asked for and not freed (a free on another thread makes it dip).
+    /// Const-initialised and without a destructor, so the allocator can touch it safely.
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+}
+
+/// A size as a signed number; a layout never exceeds `isize::MAX`.
+fn signed(size: usize) -> isize {
+    isize::try_from(size).unwrap_or(isize::MAX)
+}
+
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        LIVE.with(|c| c.set(c.get().wrapping_add(signed(layout.size()))));
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.with(|c| c.set(c.get().wrapping_sub(signed(layout.size()))));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        LIVE.with(|c| {
+            c.set(
+                c.get()
+                    .wrapping_add(signed(new_size))
+                    .wrapping_sub(signed(layout.size())),
+            )
+        });
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn live() -> isize {
+    LIVE.with(Cell::get)
+}
 
 const AUDIO_INTERVAL: Duration = Duration::from_millis(20);
 /// 30 frames per second.
@@ -277,6 +331,8 @@ struct Soak {
     stats_baseline: Option<usize>,
     /// The phase in force, for failure messages.
     phase: String,
+    /// Live heap bytes of this thread, one sample per virtual minute.
+    live_bytes: Vec<isize>,
 }
 
 impl Soak {
@@ -356,6 +412,7 @@ impl Soak {
             deadlines: vec![],
             stats_baseline: None,
             phase: String::new(),
+            live_bytes: vec![],
         };
         if !connected {
             return soak.fail("the call did not connect within 10 s");
@@ -771,6 +828,7 @@ impl Soak {
         let (mut audio, mut video, mut data) = (origin, origin, origin);
         let mut tick = origin;
         let mut stats = origin + Duration::from_secs(30);
+        let mut sample = origin + Duration::from_secs(60);
         let mut outages = 0;
         while self.elapsed() < end {
             let at = self.elapsed();
@@ -807,8 +865,12 @@ impl Soak {
                 stats += Duration::from_secs(10);
                 self.check_growth()?;
             }
+            if at >= sample {
+                sample += Duration::from_secs(60);
+                self.live_bytes.push(live());
+            }
             let upcoming = starts.get(next_phase).copied().unwrap_or(end);
-            let next = [audio, video, data, tick, upcoming]
+            let next = [audio, video, data, tick, sample, upcoming]
                 .into_iter()
                 .min()
                 .unwrap();
@@ -871,6 +933,7 @@ impl Soak {
             virtual_time: at,
             outages,
             keyframes: self.nodes[0].recv.keyframes_decoded + self.nodes[1].recv.keyframes_decoded,
+            live_bytes: std::mem::take(&mut self.live_bytes),
         })
     }
 }
@@ -879,6 +942,7 @@ struct Report {
     virtual_time: Duration,
     outages: usize,
     keyframes: u64,
+    live_bytes: Vec<isize>,
 }
 
 fn run_seed(seed: u64, minutes: u64) -> Check<Report> {
@@ -953,5 +1017,41 @@ fn calls_survive_generated_network_weather() {
         failures.len(),
         seeds.len(),
         failures.join("\n")
+    );
+}
+
+fn mean(samples: &[isize]) -> isize {
+    samples.iter().sum::<isize>() / signed(samples.len().max(1))
+}
+
+#[test]
+fn live_memory_is_flat_under_generated_weather() {
+    let seed = knob("SIM_SOAK_MEM_SEED", 1);
+    let minutes = knob(
+        "SIM_SOAK_MEM_MINUTES",
+        if cfg!(debug_assertions) { 10 } else { 120 },
+    );
+    // Its own thread, so the counter holds this soak and nothing else.
+    let report = std::thread::spawn(move || run_seed(seed, minutes))
+        .join()
+        .expect("the soak thread panicked")
+        .unwrap_or_else(|e| panic!("{e}"));
+    let series = report.live_bytes;
+    let line = series
+        .iter()
+        .map(isize::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("seed={seed} live bytes per virtual minute: {line}");
+    // A short run (the debug default) has no window after warm-up to compare.
+    if series.len() < 30 {
+        return;
+    }
+    let early = mean(&series[10..30]);
+    let late = mean(&series[series.len() - 20..]);
+    let growth = late - early;
+    assert!(
+        growth <= LIVE_GROWTH_BOUND,
+        "seed={seed}: live bytes grew by {growth} (mean of minutes 10..30 {early}, of the last 20 {late}), bound {LIVE_GROWTH_BOUND}; per virtual minute: {line}"
     );
 }
