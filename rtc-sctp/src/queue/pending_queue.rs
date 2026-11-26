@@ -204,6 +204,18 @@ impl QueuedMessage {
     }
 }
 
+/// Entries a drained queue keeps room for; below this the capacity is left alone.
+const MIN_KEEP_CAPACITY: usize = 64;
+
+/// Gives a queue's capacity back once a backlog has drained: a `VecDeque` never shrinks by
+/// itself, so a stall that piled messages up would hold its high-water mark for the connection's
+/// life. Shrinking only at a quarter full keeps the cost amortised and avoids thrashing.
+fn shrink_drained<T>(queue: &mut VecDeque<T>) {
+    if queue.capacity() > MIN_KEEP_CAPACITY && queue.len() * 4 <= queue.capacity() {
+        queue.shrink_to((queue.len() * 2).max(MIN_KEEP_CAPACITY));
+    }
+}
+
 /// Takes the next fragment of the message at the front of `queue` after checking it against the
 /// message, and removes the message once its last fragment leaves.
 fn pop_front_fragment<T>(
@@ -212,7 +224,11 @@ fn pop_front_fragment<T>(
     whole: fn(T) -> Option<ChunkPayloadData>,
 ) -> Option<ChunkPayloadData> {
     match message(queue.front_mut()?)? {
-        QueuedMessage::Whole(_) => whole(queue.pop_front()?),
+        QueuedMessage::Whole(_) => {
+            let entry = queue.pop_front()?;
+            shrink_drained(queue);
+            whole(entry)
+        }
         QueuedMessage::Fragmented {
             snapshot,
             fragments,
@@ -233,6 +249,7 @@ fn pop_front_fragment<T>(
             *bytes = remaining_bytes;
             if c.ending_fragment {
                 queue.pop_front();
+                shrink_drained(queue);
             }
             Some(c)
         }
@@ -504,7 +521,10 @@ impl PendingQueue {
             let queue_len = self.queue_len.checked_sub(1)?;
             let reset = wfq.update(stream, |s, _| match s.entries.front()? {
                 (_, PendingEntry::Reset(_)) => match s.entries.pop_front()? {
-                    (_, PendingEntry::Reset(reset)) => Some(reset),
+                    (_, PendingEntry::Reset(reset)) => {
+                        shrink_drained(&mut s.entries);
+                        Some(reset)
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -522,6 +542,7 @@ impl PendingQueue {
         let PendingEntry::Reset(reset) = self.ordered_queue.pop_front()? else {
             return None;
         };
+        shrink_drained(&mut self.ordered_queue);
         self.queue_len = queue_len;
         Some(reset)
     }
@@ -565,10 +586,22 @@ impl PendingQueue {
         }
         let entry = match self.wfq.as_mut() {
             Some(wfq) => wfq
-                .update(snapshot.stream_identifier, |s, _| s.entries.pop_front())
+                .update(snapshot.stream_identifier, |s, _| {
+                    let entry = s.entries.pop_front();
+                    shrink_drained(&mut s.entries);
+                    entry
+                })
                 .map(|(_, entry)| entry),
-            None if snapshot.unordered => self.unordered_queue.pop_front(),
-            None => self.ordered_queue.pop_front(),
+            None => {
+                let queue = if snapshot.unordered {
+                    &mut self.unordered_queue
+                } else {
+                    &mut self.ordered_queue
+                };
+                let entry = queue.pop_front();
+                shrink_drained(queue);
+                entry
+            }
         };
         let Some(PendingEntry::Message(message)) = entry else {
             return Err(Error::OtherSctpErr("missing pending message".into()));
@@ -677,6 +710,50 @@ mod tests {
             user_data: Bytes::from_static(b"data"),
             ..Default::default()
         }
+    }
+
+    fn single(id: u64) -> Vec<ChunkPayloadData> {
+        let mut chunk = fragment(true, true, false);
+        chunk.message_id = MessageId::new(id);
+        vec![chunk]
+    }
+
+    #[test]
+    fn capacity_comes_back_once_a_backlog_drains_and_order_holds() {
+        let mut queue = PendingQueue::new();
+        for id in 0..50_000 {
+            queue.push_message(single(id));
+        }
+        assert!(queue.ordered_queue.capacity() >= 50_000);
+        for id in 0..50_000 {
+            assert_eq!(
+                MessageId::new(id),
+                queue.pop(true, false).unwrap().message_id
+            );
+        }
+        assert!(queue.is_empty());
+        assert!(queue.ordered_queue.capacity() <= 2 * MIN_KEEP_CAPACITY);
+
+        // Mixed pushes and pops around the shrink threshold keep arrival order.
+        let (mut next_push, mut next_pop) = (0, 0);
+        for round in 0..2_000u64 {
+            for _ in 0..(round % 7 + 1) {
+                queue.push_message(single(next_push));
+                next_push += 1;
+            }
+            for _ in 0..(round % 5 + 1) {
+                if let Some(c) = queue.pop(true, false) {
+                    assert_eq!(MessageId::new(next_pop), c.message_id);
+                    next_pop += 1;
+                }
+            }
+        }
+        while let Some(c) = queue.pop(true, false) {
+            assert_eq!(MessageId::new(next_pop), c.message_id);
+            next_pop += 1;
+        }
+        assert_eq!(next_push, next_pop);
+        assert!(queue.ordered_queue.capacity() <= 2 * MIN_KEEP_CAPACITY);
     }
 
     #[test]
