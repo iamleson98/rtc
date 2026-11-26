@@ -7,7 +7,7 @@ mod heap;
 mod stats;
 
 use bytes::{Bytes, BytesMut};
-use rtc::interceptor::Registry;
+use rtc::interceptor::{NackResponderBuilder, Registry, Slot};
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -347,7 +347,14 @@ fn build_peer(alt_video_ssrc: bool, patient: bool) -> Result<Peer, Box<dyn std::
         RtpCodecKind::Audio,
         None,
     )?;
-    let registry = register_default_interceptors(Registry::new(), &mut me)?;
+    let mut registry = register_default_interceptors(Registry::new(), &mut me)?;
+    // RTC_RETX_BUDGET=off: the NACK responder without its retransmit budget (an A/B knob; default on).
+    if std::env::var("RTC_RETX_BUDGET").is_ok_and(|v| v == "off") {
+        registry = registry.with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_retransmit_budget(false).build(),
+        );
+    }
     let mut builder = RTCPeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(me)

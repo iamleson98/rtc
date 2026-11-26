@@ -44,6 +44,8 @@ the rtc peers only, never the pion ones, and is recorded in the `run` row (`peer
 inputs. In CI, a manual run takes it as the `rtc_peer_env` input, and `pairs`, `archs` and `profiles`
 (JSON arrays, default all) pick the combinations, e.g. `["rtc-rtc"]`, `["x64"]`, `["trace"]` for one job.
 
+`RTC_RETX_BUDGET=off` (via `RTC_PEER_ENV`) builds the rtc peers' NACK responder without its retransmit budget, for an A/B on the same `SEED`; the default is on.
+
 `RTC_PEER_FEATURES=heap-profile` (the `rtc_peer_features` input in CI) builds the rtc peer with debug info
 and dhat as its allocator. Each peer then writes `dhat-heap-<id>.json` next to its jsonl when the run ends
 (open it in the dhat viewer; `eb` is the bytes still live at the end, per allocation site), and the

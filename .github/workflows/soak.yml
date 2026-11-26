@@ -30,6 +30,9 @@ on:
       rtc_peer_env:
         description: 'VAR=value words (space separated) set in the environment of the rtc peers only; empty for none'
         default: ""
+      seed:
+        description: 'seed of the abuse schedule and trace replay; empty = the run id. Reuse one to replay the same weather'
+        default: ""
       rtc_peer_features:
         description: 'cargo features of the rtc peer build (heap-profile writes dhat-heap-*.json); empty for none'
         default: ""
@@ -106,7 +109,7 @@ jobs:
           PROFILE: ${{ matrix.profile }}
           RTC_PEER_ENV: ${{ inputs.rtc_peer_env }}
           RTC_PEER_FEATURES: ${{ inputs.rtc_peer_features }}
-          SEED: ${{ github.run_id }} # the same for every job of the run: one schedule of abuse, one trace replay for all
+          SEED: ${{ inputs.seed || github.run_id }} # the same for every job of the run: one schedule of abuse, one trace replay for all
         run: scripts/ci-run.sh benchmarks/soak/run.sh "${{ matrix.pair }}" "$MINUTES" soak-out
       - uses: actions/upload-artifact@v4
         if: always()
