@@ -318,6 +318,29 @@ class CleanGroup(Fixture):
         self.assertIn("SFU process errors", md)
 
 
+class HeapCounters(Fixture):
+    def heap_rows(self):
+        return [dict(r, heap_live_mb=40.0, heap_peak_mb=55.0, rss_anon_mb=70.0, rss_file_mb=12.0)
+                for r in proc("rtcd-rs", END)]
+
+    def test_heap_row_shown_when_the_field_exists(self):
+        _, md, _, _ = run_report(side("rtcd-rs", extra=self.heap_rows()), side("rtcd-go"))
+        self.assertIn("Heap live MB (mean, last 20 samples)", md)
+        self.assertIn("| rtcd-rs | x86_64 | sfu | 40.0 | 55.0 | 100.0 | 70.0 | 12.0 |", md)
+
+    def test_heap_row_skipped_without_the_field(self):
+        _, md, _, _ = run_report(side("rtcd-rs", extra=proc("rtcd-rs", END)), side("rtcd-go"))
+        self.assertNotIn("Heap live MB", md)
+
+    def test_peer_env_in_inputs_only_when_set(self):
+        run = {"ts": ts(0), "impl": "run", "arch": "x86_64", "kind": "event", "id": "run", "what": "run",
+               "seed": "1", "profile": "trace", "minutes": 4, "peer_env": "MALLOC_ARENA_MAX=2"}
+        _, md, _, _ = run_report(side("rtcd-rs", extra=[run]), side("rtcd-go"))
+        self.assertIn("MALLOC_ARENA_MAX=2", md)
+        _, md, _, _ = run_report(side("rtcd-rs"), side("rtcd-go"))
+        self.assertNotIn("Peer env", md)
+
+
 class LessonEnd(Fixture):
     def test_receivers_stop_measuring_when_the_first_participant_stops(self):
         # The teacher stops at 200 s; the student's receiver sees nothing after that until its own

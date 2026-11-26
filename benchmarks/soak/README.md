@@ -39,7 +39,10 @@ CYCLE_MIN=2 benchmarks/soak/run.sh rtc-rtc 3 out   # short smoke run
 `rtc-pion` is bidirectional (each peer sends to the other), so it covers both directions. Output:
 `out/<pair>.jsonl`, `out/<pair>.{offerer,answerer}.log`, `out/summary.md`, `out/report.html`.
 `SOAK_RTC_BIN` / `SOAK_PION_BIN` use prebuilt peers; `IFACE` and `RULES` override the interface and
-the rules file.
+the rules file. `RTC_PEER_ENV` (space separated `VAR=value`, default empty) is set in the environment of
+the rtc peers only, never the pion ones, and is recorded in the `run` row (`peer_env`) and the report's
+inputs. In CI, a manual run takes it as the `rtc_peer_env` input, and `pairs`, `archs` and `profiles`
+(JSON arrays, default all) pick the combinations, e.g. `["rtc-rtc"]`, `["x64"]`, `["trace"]` for one job.
 
 On a Mac, use a privileged Linux container (Colima's VM is aarch64, so this is also an arm64 run).
 Build the two peers for Linux first (`cargo build --release` in a `rust` container, `go build` in a
@@ -331,7 +334,12 @@ One JSON object per line. Every line has:
 | `stalled` | bool: no media packet for more than 2 s at some point since the previous report |
 
 `proc`, one per process every 5 s: `rss_mb`, `cpu_pct`, `threads`, `fds`, `udp_rcvbuf_err`,
-`udp_sndbuf_err` (the host's UDP `RcvbufErrors` / `SndbufErrors`).
+`udp_sndbuf_err` (the host's UDP `RcvbufErrors` / `SndbufErrors`). To tell a leak from the allocator
+keeping freed memory, it also carries `rss_anon_mb` / `rss_file_mb` (`RssAnon:` / `RssFile:` of
+`/proc/self/status`) and `heap_live_mb`, the live heap (rtc peer: a counting global allocator over the
+system one; pion peer: `/memory/classes/heap/objects:bytes`). The rtc peer adds `heap_peak_mb`, the
+high-water mark of the live heap since the previous sample. The report shows them in an informational
+"Process heap" table (never gated; older files without the fields are skipped).
 
 `tx`, every 5 s, cumulative: what this peer sent through its media socket, `<class>_pkts` and
 `<class>_bytes` for the classes `rtp`, `rtcp`, `dtls` (with the data channel's SCTP), `stun` and `other`,

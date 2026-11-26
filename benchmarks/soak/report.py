@@ -1321,6 +1321,30 @@ def window_table(ents, rules):
              "Recover s"], [b[1] for b in body])
 
 
+HEAP_LAST = 20  # samples (about 100 s) the heap table averages at the end of the run
+
+
+def heap_table(ents):
+    """Informational, never gated: per process, the live heap next to the RSS, to tell a leak from the
+    allocator keeping freed memory. Processes whose samples carry no heap counters are left out."""
+    body = []
+    for e in sorted(ents, key=lambda x: (x.arch, x.impl, x.run.stem)):
+        for s in e.proc():
+            rows = [r for r in s.s if r.get("heap_live_mb") is not None][-HEAP_LAST:]
+            if not rows:
+                continue
+            peaks = [r["heap_peak_mb"] for r in rows if r.get("heap_peak_mb") is not None]
+            body.append([e.impl, e.arch, s.id, fmt(mean([r["heap_live_mb"] for r in rows]), 1),
+                         fmt(max(peaks), 1) if peaks else "-", fmt(mean([r.get("rss_mb") for r in rows]), 1),
+                         fmt(mean([r.get("rss_anon_mb") for r in rows]), 1),
+                         fmt(mean([r.get("rss_file_mb") for r in rows]), 1)])
+    if not body:
+        return None
+    return ("Process heap (informational)",
+            ["Impl", "Arch", "Process", "Heap live MB (mean, last %d samples)" % HEAP_LAST, "Heap peak MB (max)",
+             "RSS MB (mean)", "RSS anon MB (mean)", "RSS file MB (mean)"], body)
+
+
 def tables(rows, extra, runs, ents=None, rules=None, val=None):
     """List of (title, header, rows) shared by the markdown and html renderers."""
     out = []
@@ -1329,8 +1353,12 @@ def tables(rows, extra, runs, ents=None, rules=None, val=None):
         archs = sorted({str(o.get("arch", "?")) for o in r.rows if o["kind"] in ("recv", "proc")})
         impls = sorted({str(o.get("impl")) for o in r.rows if o["kind"] in ("recv", "proc")})
         n = sum(1 for o in r.rows if o["kind"] == "recv")
-        infos.append([r.stem, ", ".join(impls), ", ".join(archs), "%.1f" % ((r.t1 - r.t0) / 60.0), str(n)])
-    out.append(("Inputs", ["File", "Implementations", "Architectures", "Minutes", "Receiver samples"], infos))
+        env = next((str(o.get("peer_env")) for o in r.rows if o.get("what") == "run" and o.get("peer_env")), "")
+        infos.append([r.stem, ", ".join(impls), ", ".join(archs), "%.1f" % ((r.t1 - r.t0) / 60.0), str(n), env])
+    head = ["File", "Implementations", "Architectures", "Minutes", "Receiver samples", "Peer env"]
+    if not any(i[-1] for i in infos):
+        head, infos = head[:-1], [i[:-1] for i in infos]
+    out.append(("Inputs", head, infos))
     if val:
         out.append(("Run validity", ["Scope", "Check", "Value", "Result"],
                     [[sc, rule, value, "ok" if ok else ("baseline INVALID" if baseline else "INVALID")]
@@ -1341,6 +1369,9 @@ def tables(rows, extra, runs, ents=None, rules=None, val=None):
     rt = restart_table(ents, rules) if ents and rules else None
     if rt:
         out.append(rt)
+    ht = heap_table(ents) if ents else None
+    if ht:
+        out.append(ht)
     groups = defaultdict(list)
     for r in rows:
         groups[(r["arch"], r["pair"])].append(r)

@@ -336,7 +336,8 @@ pub struct ProcSampler {
 
 impl ProcSampler {
     pub fn sample(&mut self) -> Value {
-        let (mut rss, mut threads, mut fds, mut cpu_pct) = (0.0, 0u64, 0u64, 0.0);
+        let (mut rss, mut rss_anon, mut rss_file) = (0.0, 0.0, 0.0);
+        let (mut threads, mut fds, mut cpu_pct) = (0u64, 0u64, 0.0);
         let (mut rcv, mut snd) = (0u64, 0u64);
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
             for line in s.lines() {
@@ -344,6 +345,12 @@ impl ProcSampler {
                 match (f.next(), f.next()) {
                     (Some("VmRSS:"), Some(kb)) => {
                         rss = round1(kb.parse::<f64>().unwrap_or(0.0) / 1024.0)
+                    }
+                    (Some("RssAnon:"), Some(kb)) => {
+                        rss_anon = round1(kb.parse::<f64>().unwrap_or(0.0) / 1024.0)
+                    }
+                    (Some("RssFile:"), Some(kb)) => {
+                        rss_file = round1(kb.parse::<f64>().unwrap_or(0.0) / 1024.0)
                     }
                     (Some("Threads:"), Some(n)) => threads = n.parse().unwrap_or(0),
                     _ => {}
@@ -390,7 +397,10 @@ impl ProcSampler {
             .ok()
             .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
         let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
-        json!({"rss_mb": rss, "cpu_pct": cpu_pct, "threads": threads, "fds": fds,
+        let (live, peak) = crate::heap::take();
+        let mb = |b: usize| round1(b as f64 / 1048576.0);
+        json!({"rss_mb": rss, "rss_anon_mb": rss_anon, "rss_file_mb": rss_file,
+               "heap_live_mb": mb(live), "heap_peak_mb": mb(peak), "cpu_pct": cpu_pct, "threads": threads, "fds": fds,
                "udp_rcvbuf_err": rcv, "udp_sndbuf_err": snd, "load1": load1, "cpus": cpus})
     }
 }

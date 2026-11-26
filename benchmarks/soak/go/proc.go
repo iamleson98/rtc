@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,10 @@ type procSampler struct {
 func (p *procSampler) sample() map[string]any {
 	out := map[string]any{"rss_mb": 0.0, "cpu_pct": 0.0, "threads": 0, "fds": 0, "udp_rcvbuf_err": 0, "udp_sndbuf_err": 0,
 		"cpus": runtime.NumCPU()}
+	heap := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	if metrics.Read(heap); heap[0].Value.Kind() == metrics.KindUint64 {
+		out["heap_live_mb"] = round1(float64(heap[0].Value.Uint64()) / (1 << 20))
+	}
 	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
 		if f := strings.Fields(string(b)); len(f) > 0 {
 			if v, err := strconv.ParseFloat(f[0], 64); err == nil {
@@ -34,6 +39,12 @@ func (p *procSampler) sample() map[string]any {
 			case "VmRSS:":
 				kb, _ := strconv.ParseFloat(f[1], 64)
 				out["rss_mb"] = round1(kb / 1024)
+			case "RssAnon:":
+				kb, _ := strconv.ParseFloat(f[1], 64)
+				out["rss_anon_mb"] = round1(kb / 1024)
+			case "RssFile:":
+				kb, _ := strconv.ParseFloat(f[1], 64)
+				out["rss_file_mb"] = round1(kb / 1024)
 			case "Threads:":
 				out["threads"], _ = strconv.Atoi(f[1])
 			}

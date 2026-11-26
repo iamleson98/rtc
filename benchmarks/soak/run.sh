@@ -5,7 +5,8 @@
 #
 # Environment: CYCLE_MIN (netem cycle length, default 20), IFACE (default lo), RULES (default
 # rules.json next to this script; rules-abuse.json for PROFILE=abuse), SOAK_RTC_BIN / SOAK_PION_BIN
-# (prebuilt peers; skips the build).
+# (prebuilt peers; skips the build). RTC_PEER_ENV (space separated VAR=value, default empty) is set in
+# the environment of the rtc peers only, never the pion ones, and is written into the run row.
 # PROFILE=call (default) is the call under the netem phases. PROFILE=abuse runs the same call under
 # abuse: the peers add hostile connections and traffic (see README.md, "The abuse profile of the
 # peers") while netem.sh runs its abuse profile on the interface. Everything is replayable from SEED
@@ -58,6 +59,12 @@ if [ "$profile" = abuse ]; then
 fi
 # A recorded link stalls for up to 78 s: the peers keep ICE patient as in the abuse profile.
 [ "$profile" = trace ] && peer_args=(--profile trace)
+peer_env=${RTC_PEER_ENV:-}
+case "$peer_env" in *[\"\\]*)
+  echo "RTC_PEER_ENV holds only VAR=value words, no quotes or backslashes" >&2
+  exit 2
+  ;;
+esac
 mkdir -p "$outdir"
 outdir=$(cd "$outdir" && pwd)
 if [ "$profile" = trace ]; then
@@ -67,8 +74,8 @@ fi
 jsonl=$outdir/$pair.jsonl
 : >"$jsonl"
 # The run record: report.py refuses input files that do not share one seed, profile and length.
-printf '{"ts":%s,"impl":"run","arch":"%s","kind":"event","id":"run","what":"run","detail":"%s","seed":"%s","profile":"%s","minutes":%s}\n' \
-  "$(date +%s%3N)" "$(uname -m)" "$pair seed $seed" "$seed" "$profile" "$minutes" >>"$jsonl"
+printf '{"ts":%s,"impl":"run","arch":"%s","kind":"event","id":"run","what":"run","detail":"%s","seed":"%s","profile":"%s","minutes":%s,"peer_env":"%s"}\n' \
+  "$(date +%s%3N)" "$(uname -m)" "$pair seed $seed" "$seed" "$profile" "$minutes" "$peer_env" >>"$jsonl"
 {
   echo "arch: $(uname -m)"
   echo "kernel: $(uname -sr)"
@@ -106,10 +113,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
-"$(bin "$offerer")" --role offerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
+# The environment of each peer: RTC_PEER_ENV for an rtc peer, nothing for a pion one.
+offerer_env=() answerer_env=()
+[ "$offerer" = rtc ] && read -ra offerer_env <<<"$peer_env"
+[ "$answerer" = rtc ] && read -ra answerer_env <<<"$peer_env"
+
+env ${offerer_env[@]+"${offerer_env[@]}"} "$(bin "$offerer")" --role offerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
   --id "$offerer-offerer" --udp-port "$udp_base" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.offerer.log" &
 pids+=($!)
-"$(bin "$answerer")" --role answerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
+env ${answerer_env[@]+"${answerer_env[@]}"} "$(bin "$answerer")" --role answerer --signal "127.0.0.1:$port" --minutes "$minutes" --out "$jsonl" \
   --id "$answerer-answerer" --udp-port "$((udp_base + 4))" ${peer_args[@]+"${peer_args[@]}"} 2>"$outdir/$pair.answerer.log" &
 pids+=($!)
 
