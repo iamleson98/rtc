@@ -3,6 +3,7 @@
 //! over loopback. Mirrors ../go/ in behaviour and flags.
 
 mod abuse;
+mod heap;
 mod stats;
 
 use bytes::{Bytes, BytesMut};
@@ -46,6 +47,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[global_allocator]
+static ALLOC: heap::CountingAlloc = heap::CountingAlloc;
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const START_SEQ: u16 = (65536u32 - 300) as u16;

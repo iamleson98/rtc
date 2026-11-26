@@ -18,6 +18,18 @@ on:
       minutes:
         description: run length per pair, minutes
         default: "120"
+      pairs:
+        description: 'pairs to run, a JSON array'
+        default: '["rtc-rtc","pion-pion","rtc-pion"]'
+      archs:
+        description: 'architectures to run, a JSON array'
+        default: '["x64","arm64"]'
+      profiles:
+        description: 'profiles to run, a JSON array'
+        default: '["call","abuse","trace"]'
+      rtc_peer_env:
+        description: 'VAR=value words (space separated) set in the environment of the rtc peers only; empty for none'
+        default: ""
   pull_request:
     paths:
       - 'benchmarks/soak/**'
@@ -34,6 +46,10 @@ env:
   CARGO_TERM_COLOR: always
   MINUTES: ${{ github.event_name == 'pull_request' && '10' || inputs.minutes || '120' }}
   CYCLE_MIN: ${{ github.event_name == 'pull_request' && '5' || '20' }}
+  # The combinations of the run: all of them unless a manual run chose some (the matrix and the report job read these).
+  PAIRS: ${{ inputs.pairs || '["rtc-rtc","pion-pion","rtc-pion"]' }}
+  ARCHS: ${{ inputs.archs || '["x64","arm64"]' }}
+  PROFILES: ${{ inputs.profiles || '["call","abuse","trace"]' }}
 
 jobs:
   soak:
@@ -45,9 +61,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pair: [ rtc-rtc, pion-pion, rtc-pion ]
-        arch: [ x64, arm64 ]
-        profile: [ call, abuse, trace ]
+        pair: ${{ fromJSON(inputs.pairs || '["rtc-rtc","pion-pion","rtc-pion"]') }}
+        arch: ${{ fromJSON(inputs.archs || '["x64","arm64"]') }}
+        profile: ${{ fromJSON(inputs.profiles || '["call","abuse","trace"]') }}
         exclude:
           - pair: rtc-pion # the mixed pair is a call comparison only
             profile: abuse
@@ -85,6 +101,7 @@ jobs:
       - name: Soak
         env:
           PROFILE: ${{ matrix.profile }}
+          RTC_PEER_ENV: ${{ inputs.rtc_peer_env }}
           SEED: ${{ github.run_id }} # the same for every job of the run: one schedule of abuse, one trace replay for all
         run: scripts/ci-run.sh benchmarks/soak/run.sh "${{ matrix.pair }}" "$MINUTES" soak-out
       - uses: actions/upload-artifact@v4
@@ -112,11 +129,10 @@ jobs:
         id: inputs
         run: |
           missing=0
-          for profile in call abuse trace; do
-            pairs="rtc-rtc pion-pion rtc-pion"
-            [ "$profile" = abuse ] && pairs="rtc-rtc pion-pion"
-            for pair in $pairs; do
-              for arch in x64 arm64; do
+          for profile in $(jq -r '.[]' <<<"$PROFILES"); do
+            for pair in $(jq -r '.[]' <<<"$PAIRS"); do
+              [ "$profile" = abuse ] && [ "$pair" = rtc-pion ] && continue
+              for arch in $(jq -r '.[]' <<<"$ARCHS"); do
                 if [ -z "$(find "soak-in/soak-$pair-$arch-$profile" -name '*.jsonl' -size +0 2>/dev/null)" ]; then
                   echo "::error::no measurements from $pair on $arch ($profile)"
                   missing=1
@@ -131,10 +147,10 @@ jobs:
           set +e
           # One report per architecture and profile: the pairs of one are compared with each other.
           status=0
-          for profile in call abuse trace; do
+          for profile in $(jq -r '.[]' <<<"$PROFILES"); do
             rules=rules.json
             [ "$profile" = abuse ] && rules='rules-abuse.json'
-            for arch in x64 arm64; do
+            for arch in $(jq -r '.[]' <<<"$ARCHS"); do
               mapfile -t files < <(find "soak-in" -path "*-$arch-$profile/*" -name '*.jsonl' | sort)
               python3 benchmarks/soak/report.py --rules "benchmarks/soak/$rules" --out "soak-report/$arch-$profile" \
                 "${files[@]}" || status=1
@@ -145,8 +161,8 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          for profile in call abuse trace; do
-            for arch in x64 arm64; do
+          for profile in $(jq -r '.[]' <<<"$PROFILES"); do
+            for arch in $(jq -r '.[]' <<<"$ARCHS"); do
               [ -f "soak-report/$arch-$profile/summary.md" ] && { echo "## $arch, $profile"; cat "soak-report/$arch-$profile/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
             done
           done
