@@ -1050,9 +1050,11 @@ def cycle_s(ents):
 
 def freezes_only_if_frozen(key, verdict, s_m, b_m, rules):
     """More freezes of no more frozen time is a stream that plays, not one that breaks: freezes per
-    minute breach only when the freeze ms per minute breaches its own limit too (both streams frozen
-    nearly all the time differ by noise, and the one that still shows frames counts more freezes)."""
-    if key == "freeze_rate" and verdict == "BREACH" and judge("freeze_ms", s_m["freeze_ms"] or 0, b_m["freeze_ms"] or 0, rules)[0] != "BREACH":
+    minute, and the raw freeze count of an attack class, breach only when the freeze ms per minute
+    breaches its own limit too (both streams frozen nearly all the time differ by noise, and the one
+    that still shows frames counts more freezes; the count has no ratio, so one pion run against
+    another differs by more than the gap)."""
+    if key in ("freeze_rate", "freezes") and verdict == "BREACH" and judge("freeze_ms", s_m["freeze_ms"] or 0, b_m["freeze_ms"] or 0, rules)[0] != "BREACH":
         return "ok"
     return verdict
 

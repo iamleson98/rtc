@@ -193,8 +193,6 @@ class FrozenStream(Fixture):
 
 
 class AttackFrozenTime(Fixture):
-    RULES = dict(RULES, slack={"freezes": 1000})
-
     def side(self, impl, freezes, ms):
         """An innocent impaired receiver that freezes `freezes` times, `ms` ms in all, in a window (100 to 110 s)."""
         rows = list(TIMELINE) + proc(impl, END) + window(100, 110, "a1", "reorder", ["s17"])
@@ -205,12 +203,12 @@ class AttackFrozenTime(Fixture):
                             freeze_ms=lambda t: int(lerp(t, 100, 110, ms)))
 
     def test_many_short_freezes_are_not_a_breach_when_the_frozen_time_is_less(self):
-        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 400), self.side("rtcd-go", 1, 4000), self.RULES)
+        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 400), self.side("rtcd-go", 1, 4000), RULES)
         self.assertEqual(code, 0, md)
         self.assertIn("| reorder | Freeze ms / min (video) |", md)
 
     def test_more_frozen_time_breaches(self):
-        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 4000), self.side("rtcd-go", 1, 400), self.RULES)
+        code, md, _, _ = run_report(self.side("rtcd-rs", 4, 4000), self.side("rtcd-go", 1, 400), RULES)
         self.assertEqual(code, 1, md)
         self.assertIn("attack / reorder / Freeze ms / min (video)", md)
 
@@ -611,6 +609,13 @@ class FreezeCountNeedsFreezeTime(unittest.TestCase):
         # Both frozen nearly all minute; the subject 0.6 % more frozen, but it shows frames, so it freezes more often.
         s, b = {"freeze_ms": 48857}, {"freeze_ms": 48561}
         self.assertEqual(report.freezes_only_if_frozen("freeze_rate", "BREACH", s, b, rules), "ok")
+
+    def test_the_raw_count_follows_the_same_rule(self):
+        rules = dict(report.DEFAULTS)
+        s, b = {"freeze_ms": 25859}, {"freeze_ms": 27375}
+        self.assertEqual(report.freezes_only_if_frozen("freezes", "BREACH", s, b, rules), "ok")
+        s, b = {"freeze_ms": 9000}, {"freeze_ms": 3000}
+        self.assertEqual(report.freezes_only_if_frozen("freezes", "BREACH", s, b, rules), "BREACH")
 
     def test_more_freezes_and_breaching_freeze_time_stays_a_breach(self):
         rules = dict(report.DEFAULTS)

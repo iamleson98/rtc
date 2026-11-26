@@ -442,8 +442,8 @@ without failing on it. For each architecture the subject is held to the baseline
 * frames per second (higher is better): subject >= baseline / `ratio` - slack (1). Freezes per minute
   breach only when the subject's freeze ms per minute is also above the baseline's: a stream that stays
   frozen has few freezes, one that plays and stutters has many.
-  The attack classes follow the same rule: their freezes per minute breach only with their freeze ms per
-  minute, which is gated like the scope's.
+  The attack classes follow the same rule: their freezes per minute and their raw freeze count breach only
+  with their freeze ms per minute, which is gated like the scope's.
 
 Data that is missing fails loudly: no baseline (or no subject) data for an architecture, a group the
 subject must have (`require_groups`) without receivers, a side with SFU process samples where the other
