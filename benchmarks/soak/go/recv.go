@@ -12,6 +12,7 @@ const (
 	audioGapMs       = 60.0
 	stalledAfterMs   = 2000.0
 	freezeMinExtraMs = 150.0
+	freezeMinSamples = 5
 )
 
 // recvStats keeps the cumulative counters of one received track (README.md, kind recv).
@@ -45,16 +46,26 @@ func newRecvStats(l *logger, media string, clockRate uint32) *recvStats {
 	return &recvStats{log: l, media: media, clock: float64(clockRate) / 1000}
 }
 
-func (r *recvStats) threshold() float64 {
-	if len(r.intervals) == 0 {
-		return math.Inf(1)
+// isFreeze is the freeze test of webrtc-stats freezeCount as Chrome applies it
+// (video/video_quality_observer2.cc, OnRenderedFrame): the gap joins the window of the last 30 frame
+// intervals first, freeze gaps included, and counts once that window holds five intervals and the
+// gap is at least max(3 x average, average + 150 ms), the average rounded down to a whole
+// millisecond. src/stats.rs does the same.
+func (r *recvStats) isFreeze(gap float64) bool {
+	earlier := r.intervals
+	if len(earlier) > freezeWindow-1 {
+		earlier = earlier[len(earlier)-(freezeWindow-1):]
 	}
-	sum := 0.0
-	for _, v := range r.intervals {
+	n := len(earlier) + 1
+	if n < freezeMinSamples {
+		return false
+	}
+	sum := gap
+	for _, v := range earlier {
 		sum += v
 	}
-	avg := sum / float64(len(r.intervals))
-	return math.Max(3*avg, avg+freezeMinExtraMs)
+	avg := math.Floor(sum / float64(n))
+	return gap >= math.Max(3*avg, avg+freezeMinExtraMs)
 }
 
 // onPacket counts one received packet. It returns true when the track just came out of a freeze
@@ -111,7 +122,7 @@ func (r *recvStats) onPacket(now time.Time, seq uint16, ts uint32, marker bool) 
 func (r *recvStats) frameDone(now time.Time) (froze bool) {
 	if !r.lastFrame.IsZero() {
 		iv := now.Sub(r.lastFrame).Seconds() * 1000
-		if iv > r.threshold() {
+		if r.isFreeze(iv) {
 			froze = true
 			if !r.openFreeze {
 				r.freezes++
@@ -139,7 +150,7 @@ func (r *recvStats) snapshot(now time.Time, nack, pli uint32, rtt any) map[strin
 		}
 	}
 	if r.media == "video" && !r.lastFrame.IsZero() {
-		if o := now.Sub(r.lastFrame).Seconds() * 1000; o > r.threshold() {
+		if o := now.Sub(r.lastFrame).Seconds() * 1000; r.isFreeze(o) {
 			if !r.openFreeze {
 				r.freezes++
 				r.openFreeze = true
