@@ -47,7 +47,8 @@ pub struct NackResponderBuilder {
     /// buffer overwrites it.
     max_packet_age: Option<Duration>,
     /// Age past which a packet sent before the stream's latest keyframe is no longer
-    /// retransmitted; `None` leaves such packets to `max_packet_age` alone.
+    /// retransmitted; `None` leaves such packets to `max_packet_age` alone (see
+    /// [`DEFAULT_SUPERSEDED_PACKET_AGE`]).
     superseded_packet_age: Option<Duration>,
     /// Whether a PLI or FIR supersedes everything sent before it.
     supersede_on_keyframe_request: bool,
@@ -62,6 +63,13 @@ const MEDIA_RATE_WINDOW: Duration = Duration::from_secs(1);
 /// libwebrtc's `kDefaultRtt`: assumed until the application supplies a measured round trip.
 const DEFAULT_RTT: Duration = Duration::from_millis(100);
 
+/// Default age past which a packet from before the stream's latest keyframe is not
+/// retransmitted. A soak A/B (x64 trace, 60 min, with a 3 s `max_packet_age`) showed 1 s
+/// lowers freezes (883 to 819), freeze time, stalls and residual loss against no limit: those
+/// packets' bytes only spend the retransmission budget ahead of live frames. Packets of the
+/// current keyframe keep `max_packet_age`, so a large keyframe on a slow link is still repaired.
+const DEFAULT_SUPERSEDED_PACKET_AGE: Duration = Duration::from_secs(1);
+
 impl Default for NackResponderBuilder {
     fn default() -> Self {
         Self {
@@ -71,7 +79,7 @@ impl Default for NackResponderBuilder {
             budget: true,
             budget_window: DEFAULT_BUDGET_WINDOW,
             max_packet_age: None,
-            superseded_packet_age: None,
+            superseded_packet_age: Some(DEFAULT_SUPERSEDED_PACKET_AGE),
             supersede_on_keyframe_request: false,
         }
     }
@@ -169,9 +177,18 @@ impl NackResponderBuilder {
     /// [`Self::with_max_packet_age`], so a large keyframe on a slow link is still repaired. Only
     /// streams whose codec is understood (see `rtp::codec::keyframe_start`; VP8 so far) take
     /// part. A skipped request is counted in [`NackResponderStats::stale_skipped_packets`].
-    /// Off by default.
+    /// On by default with an age of 1 s; this changes it and
+    /// [`Self::without_superseded_packet_age`] turns the rule off.
     pub fn with_superseded_packet_age(mut self, age: Duration) -> Self {
         self.superseded_packet_age = Some(age);
+        self
+    }
+
+    /// Retransmit packets from before the stream's latest keyframe for as long as
+    /// [`Self::with_max_packet_age`] allows, turning off the rule that is on by default (see
+    /// [`Self::with_superseded_packet_age`]).
+    pub fn without_superseded_packet_age(mut self) -> Self {
+        self.superseded_packet_age = None;
         self
     }
 
@@ -1148,9 +1165,51 @@ mod superseded_tests {
     }
 
     #[test]
-    fn old_packets_are_resent_by_default() {
+    fn default_skips_packets_before_the_latest_keyframe_after_one_second() {
         let t0 = Instant::now();
-        let mut r = responder(NackResponderBuilder::new(), "video/VP8");
+        let mut r = responder(
+            NackResponderBuilder::new().with_max_packet_age(Duration::from_secs(3)),
+            "video/VP8",
+        );
+        send_stream(&mut r, t0);
+        // Packets 0..=9 are 3.1 s old and precede the keyframe: skipped (older than 1 s). The
+        // keyframe (10..=12) is only 0.1 s old.
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(3100)),
+            vec![10, 11, 12, 13]
+        );
+        assert_eq!(r.stats().stale_skipped_packets, 10);
+    }
+
+    #[test]
+    fn default_still_resends_the_current_keyframe_up_to_max_packet_age() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_max_packet_age(Duration::from_secs(3)),
+            "video/VP8",
+        );
+        send_stream(&mut r, t0);
+        // The keyframe is 2 s old: past the 1 s superseded age, within the 3 s maximum.
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(5000)),
+            vec![10, 11, 12, 13]
+        );
+        // Past 3 s it goes as well.
+        let mut r = responder(
+            NackResponderBuilder::new().with_max_packet_age(Duration::from_secs(3)),
+            "video/VP8",
+        );
+        send_stream(&mut r, t0);
+        assert!(nack_all(&mut r, t0 + Duration::from_millis(6100)).is_empty());
+    }
+
+    #[test]
+    fn without_superseded_packet_age_resends_old_packets() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().without_superseded_packet_age(),
+            "video/VP8",
+        );
         send_stream(&mut r, t0);
         // Oldest first: the four budgeted packets all go to frames from before the keyframe.
         assert_eq!(
