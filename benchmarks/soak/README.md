@@ -48,6 +48,8 @@ the rtc peers only, never the pion ones, and is recorded in the `run` row (`peer
 inputs. In CI, a manual run takes it as the `rtc_peer_env` input, and `pairs`, `archs` and `profiles`
 (JSON arrays, default all) pick the combinations, e.g. `["rtc-rtc"]`, `["x64"]`, `["trace"]` for one job.
 
+`RTC_RETX_MAX_AGE_MS=<ms>` and `RTC_RETX_WINDOW_MS=<ms>` (via `RTC_PEER_ENV`, space separated) build the rtc peers' NACK responder with that packet age limit and retransmit budget window, for an A/B on the same `SEED` (the `seed` input in CI); `RTC_RETX_SUPERSEDED_AGE_MS=<ms>` stops re-sending packets sent before the latest VP8 keyframe once they are that old, and `RTC_RETX_SUPERSEDE_ON_PLI=1` stops re-sending anything sent before a PLI or FIR; unset keeps the defaults.
+
 `RTC_PEER_FEATURES=heap-profile` (the `rtc_peer_features` input in CI) builds the rtc peer with debug info
 and dhat as its allocator. Each peer then writes `dhat-heap-<id>.json` next to its jsonl when the run ends
 (open it in the dhat viewer; `eb` is the bytes still live at the end, per allocation site), and the

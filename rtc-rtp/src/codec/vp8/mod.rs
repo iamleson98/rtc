@@ -9,6 +9,40 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Bytes of mandatory VP8 payload descriptor prefixed to each payload.
 pub const VP8_HEADER_SIZE: usize = 1;
 
+/// Whether `payload` (descriptor included) is the first packet of a VP8 keyframe: the first
+/// partition begins in it and the frame tag that follows the descriptor has the "not a keyframe"
+/// bit (RFC 6386 section 9.1) clear.
+pub(crate) fn starts_keyframe(payload: &[u8]) -> bool {
+    let Some(&first) = payload.first() else {
+        return false;
+    };
+    // S (start of partition) set and PID (partition index) zero.
+    if first & 0x17 != 0x10 {
+        return false;
+    }
+    let mut len = 1;
+    if first & 0x80 != 0 {
+        let Some(&ext) = payload.get(1) else {
+            return false;
+        };
+        len = 2;
+        if ext & 0x80 != 0 {
+            // Picture id: 15 bits when its first byte has the M bit.
+            let Some(&id) = payload.get(len) else {
+                return false;
+            };
+            len += if id & 0x80 != 0 { 2 } else { 1 };
+        }
+        if ext & 0x40 != 0 {
+            len += 1;
+        }
+        if ext & 0x30 != 0 {
+            len += 1;
+        }
+    }
+    payload.get(len).is_some_and(|tag| tag & 0x01 == 0)
+}
+
 /// Vp8Payloader payloads VP8 packets
 #[derive(Default, Debug, Copy, Clone)]
 pub struct Vp8Payloader {

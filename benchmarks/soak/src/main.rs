@@ -7,7 +7,7 @@ mod heap;
 mod stats;
 
 use bytes::{Bytes, BytesMut};
-use rtc::interceptor::Registry;
+use rtc::interceptor::{NackResponderBuilder, Registry, Slot};
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -347,7 +347,40 @@ fn build_peer(alt_video_ssrc: bool, patient: bool) -> Result<Peer, Box<dyn std::
         RtpCodecKind::Audio,
         None,
     )?;
-    let registry = register_default_interceptors(Registry::new(), &mut me)?;
+    let mut registry = register_default_interceptors(Registry::new(), &mut me)?;
+    // RTC_RETX_MAX_AGE_MS / RTC_RETX_WINDOW_MS / RTC_RETX_SUPERSEDED_AGE_MS / RTC_RETX_SUPERSEDE_ON_PLI:
+    // the NACK responder with a packet age limit, a retransmit budget window, a shorter age for
+    // packets sent before the latest keyframe, and/or PLI/FIR superseding earlier packets (A/B
+    // knobs; all unset keeps the default responder).
+    let knob = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+    };
+    let (max_age, window, superseded) = (
+        knob("RTC_RETX_MAX_AGE_MS"),
+        knob("RTC_RETX_WINDOW_MS"),
+        knob("RTC_RETX_SUPERSEDED_AGE_MS"),
+    );
+    let on_pli = std::env::var("RTC_RETX_SUPERSEDE_ON_PLI").is_ok_and(|v| v == "1");
+    if max_age.is_some() || window.is_some() || superseded.is_some() || on_pli {
+        let mut responder = NackResponderBuilder::new();
+        if let Some(age) = max_age {
+            responder = responder.with_max_packet_age(age);
+        }
+        if let Some(window) = window {
+            responder = responder.with_retransmit_window(window);
+        }
+        if let Some(age) = superseded {
+            responder = responder.with_superseded_packet_age(age);
+        }
+        if on_pli {
+            responder = responder.with_supersede_on_keyframe_request(true);
+        }
+        registry = registry.with(Slot::NackResponder, responder.build());
+    }
     let mut builder = RTCPeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(me)

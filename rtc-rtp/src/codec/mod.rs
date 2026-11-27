@@ -16,3 +16,17 @@ pub mod smpte336m;
 pub mod vp8;
 /// VP9 payload format (draft-ietf-payload-vp9).
 pub mod vp9;
+
+/// Whether an RTP `payload` of the codec `mime` (such as `video/VP8`, compared case-insensitively)
+/// is the first packet of a keyframe.
+///
+/// `Some(true)` for the start of a keyframe, `Some(false)` for anything else of a known codec (a
+/// delta frame, a continuation packet, a truncated payload) and `None` when the codec is not
+/// understood, which callers should treat as "cannot tell". Only VP8 is understood so far.
+pub fn keyframe_start(mime: &str, payload: &[u8]) -> Option<bool> {
+    if mime.eq_ignore_ascii_case("video/vp8") {
+        Some(vp8::starts_keyframe(payload))
+    } else {
+        None
+    }
+}
