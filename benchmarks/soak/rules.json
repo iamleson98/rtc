@@ -1,7 +1,12 @@
 {
   "compare": [
     {"subject": "rtc", "baseline": "pion", "subject_run": "rtc-rtc", "baseline_run": "pion-pion"},
-    {"subject": "rtc", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "rtc-pion", "gate": false}
+    {"subject": "rtc", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "pion-pion", "gate": false,
+     "subject_peer": "offerer", "baseline_peer": "offerer",
+     "subject_label": "rtc receiving pion", "baseline_label": "pion receiving pion"},
+    {"subject": "pion", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "pion-pion", "gate": false,
+     "subject_peer": "answerer", "baseline_peer": "answerer",
+     "subject_label": "pion receiving rtc", "baseline_label": "pion receiving pion"}
   ],
   "require_groups": ["impaired"],
   "ratio": 1.25,

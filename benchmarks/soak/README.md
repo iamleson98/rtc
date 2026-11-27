@@ -36,7 +36,11 @@ benchmarks/soak/run.sh rtc-pion 120 out        # pair: rtc-rtc | pion-pion | rtc
 CYCLE_MIN=2 benchmarks/soak/run.sh rtc-rtc 3 out   # short smoke run
 ```
 
-`rtc-pion` is bidirectional (each peer sends to the other), so it covers both directions. Output:
+`rtc-pion` is bidirectional (each peer sends to the other), so it covers both directions. Its two
+receivers are each compared with `pion-pion` on the same sender, never with each other (quality follows the
+sender, and a pion sender loads the impaired link harder than an rtc one): `rtc receiving pion` against
+`pion receiving pion` swaps only the receiver, `pion receiving rtc` against `pion receiving pion` swaps only
+the sender. Both are reported, never gated (`subject_label` / `baseline_label` in `rules.json` name the sides). Output:
 `out/<pair>.jsonl`, `out/<pair>.{offerer,answerer}.log`, `out/summary.md`, `out/report.html`.
 `SOAK_RTC_BIN` / `SOAK_PION_BIN` use prebuilt peers; `IFACE` and `RULES` override the interface and
 the rules file. `RTC_PEER_ENV` (space separated `VAR=value`, default empty) is set in the environment of
