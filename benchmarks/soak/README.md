@@ -335,7 +335,7 @@ One JSON object per line. Every line has:
 | `media` | `video` or `audio` |
 | `group` | `clean` (a path that is never impaired, e.g. a control participant) or `impaired` (on the netem path). Samples of a `clean` group count as clean in every phase |
 | `frames` | video: frames completed (marker packet received); audio: audio packets received |
-| `freezes`, `freeze_ms` | WebRTC stats freeze: an inter-frame interval longer than max(3 x average, average + 150 ms), average over the last 30 frames; `freeze_ms` is the summed interval. A freeze still open at a report counts at once |
+| `freezes`, `freeze_ms` | WebRTC stats freeze as Chrome counts it (`video_quality_observer2.cc`): an inter-frame interval at least max(3 x average, average + 150 ms), the average (rounded down to a millisecond) taken over the last 30 intervals with the interval itself and freeze intervals in it, and only once five are in; `freeze_ms` is the summed interval. A freeze still open at a report counts at once |
 | `packets` | RTP packets received (retransmissions included) |
 | `lost` | expected minus received, from extended sequence numbers; falls when a retransmission fills a gap |
 | `nack`, `pli` | NACKs and PLIs this receiver sent (library statistics; pion's NACK generator bypasses its own stats, so `pion` reads 0 NACKs) |

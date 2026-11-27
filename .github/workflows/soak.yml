@@ -104,6 +104,10 @@ jobs:
           echo "TRACE_DIR=$dir" >> "$GITHUB_ENV"
       - name: Report tests
         run: python3 -m unittest discover -s benchmarks/soak -p 'test_*.py'
+      - name: Peer tests
+        run: |
+          cargo test --manifest-path benchmarks/soak/Cargo.toml
+          (cd benchmarks/soak/go && go test ./...)
       - name: Soak
         env:
           PROFILE: ${{ matrix.profile }}

@@ -10,6 +10,7 @@ const FREEZE_WINDOW: usize = 30;
 const AUDIO_GAP_MS: f64 = 60.0;
 const STALLED_AFTER_MS: f64 = 2000.0;
 const FREEZE_MIN_EXTRA_MS: f64 = 150.0;
+const FREEZE_MIN_SAMPLES: usize = 5;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -173,12 +174,19 @@ impl RecvStats {
         }
     }
 
-    fn threshold(&self) -> f64 {
-        if self.intervals.is_empty() {
-            return f64::INFINITY;
+    /// The freeze test of webrtc-stats `freezeCount` as Chrome applies it
+    /// (video/video_quality_observer2.cc, `OnRenderedFrame`): the gap joins the window of the last
+    /// 30 frame intervals first, freeze gaps included, and counts once that window holds five
+    /// intervals and the gap is at least max(3 x average, average + 150 ms), the average rounded
+    /// down to a whole millisecond. `go/recv.go` does the same.
+    fn is_freeze(&self, gap: f64) -> bool {
+        let earlier = &self.intervals[self.intervals.len().saturating_sub(FREEZE_WINDOW - 1)..];
+        let n = earlier.len() + 1;
+        if n < FREEZE_MIN_SAMPLES {
+            return false;
         }
-        let avg = self.intervals.iter().sum::<f64>() / self.intervals.len() as f64;
-        (3.0 * avg).max(avg + FREEZE_MIN_EXTRA_MS)
+        let avg = ((earlier.iter().sum::<f64>() + gap) / n as f64).floor();
+        gap >= (3.0 * avg).max(avg + FREEZE_MIN_EXTRA_MS)
     }
 
     /// Counts one received packet. Returns true when the track just came out of a freeze and a
@@ -265,7 +273,7 @@ impl RecvStats {
         let mut froze = false;
         if let Some(prev) = self.last_frame {
             let iv = now.duration_since(prev).as_secs_f64() * 1000.0;
-            if iv > self.threshold() {
+            if self.is_freeze(iv) {
                 froze = true;
                 if !self.open_freeze {
                     self.freezes += 1;
@@ -298,7 +306,7 @@ impl RecvStats {
             && let Some(prev) = self.last_frame
         {
             let o = now.duration_since(prev).as_secs_f64() * 1000.0;
-            if o > self.threshold() {
+            if self.is_freeze(o) {
                 if !self.open_freeze {
                     self.freezes += 1;
                     self.open_freeze = true;
@@ -446,5 +454,53 @@ mod thread_count_tests {
         .collect();
         assert_eq!(peer_threads(&names), 2);
         assert_eq!(peer_threads(&[]), 0);
+    }
+}
+
+#[cfg(test)]
+mod freeze_tests {
+    use super::*;
+
+    /// Feeds one frame per gap (ms) and returns the freezes counted.
+    fn freezes_of(gaps: &[u64]) -> u64 {
+        let mut r = RecvStats::new("video", 90_000);
+        let mut now = Instant::now();
+        r.frame_done(now);
+        for g in gaps {
+            now += Duration::from_millis(*g);
+            r.frame_done(now);
+        }
+        r.freezes
+    }
+
+    #[test]
+    fn a_gap_needs_five_intervals_before_it_can_freeze() {
+        assert_eq!(freezes_of(&[33, 33, 33, 33, 500]), 1); // four earlier and the gap: five
+        assert_eq!(freezes_of(&[33, 33, 33, 500]), 0); // three earlier and the gap: too few
+    }
+
+    #[test]
+    fn the_gap_counts_in_its_own_average() {
+        let mut steady = vec![40u64; 29];
+        steady.push(194); // average 45 with the gap in it: 194 < 45 + 150
+        assert_eq!(freezes_of(&steady), 0);
+        steady[29] = 196; // 196 >= 195
+        assert_eq!(freezes_of(&steady), 1);
+    }
+
+    #[test]
+    fn freeze_gaps_stay_in_the_average() {
+        let mut series = vec![33u64; 29];
+        series.push(600); // a freeze
+        series.push(190); // 57 is the average with the freeze in the window: 190 < 207
+        assert_eq!(freezes_of(&series), 1);
+    }
+
+    #[test]
+    fn the_window_keeps_thirty_intervals() {
+        let mut series = vec![200u64; 30]; // a slow stream: 200 ms is its normal
+        series.extend([33; 30]); // the slow intervals have left the window
+        series.push(190); // 29 intervals of 33 and the gap: 190 >= 38 + 150; a longer window would not freeze
+        assert_eq!(freezes_of(&series), 1);
     }
 }
