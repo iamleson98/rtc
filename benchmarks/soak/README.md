@@ -346,7 +346,7 @@ One JSON object per line. Every line has:
 | `audio_gap_ms` | time the sender was sending but no audio packet arrived for more than 60 ms, summed |
 | `stalled` | bool: no media packet for more than 2 s at some point since the previous report |
 
-`proc`, one per process every 5 s: `rss_mb`, `cpu_pct`, `threads`, `fds`, `udp_rcvbuf_err`,
+`proc`, one per process every 5 s: `rss_mb`, `cpu_pct`, `threads` (the Rust peer leaves out its abuse generators' threads, named `abuse-`, as Go's are goroutines and never counted), `fds`, `udp_rcvbuf_err`,
 `udp_sndbuf_err` (the host's UDP `RcvbufErrors` / `SndbufErrors`). To tell a leak from the allocator
 keeping freed memory, it also carries `rss_anon_mb` / `rss_file_mb` (`RssAnon:` / `RssFile:` of
 `/proc/self/status`) and `heap_live_mb`, the live heap (rtc peer: a counting global allocator over the

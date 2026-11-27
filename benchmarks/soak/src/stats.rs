@@ -334,10 +334,33 @@ pub struct ProcSampler {
     last: Option<(f64, Instant)>,
 }
 
+/// Prefix of the threads the abuse generators run on. Go's abusers are goroutines, which
+/// `Threads:` never counts, so these are left out of the peer's thread count to keep it fair.
+pub const ABUSE_THREAD_PREFIX: &str = "abuse-";
+
+fn thread_names() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(d) = std::fs::read_dir("/proc/self/task") {
+        for e in d.flatten() {
+            let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+            names.push(comm.trim_end().to_string());
+        }
+    }
+    names
+}
+
+/// Threads of the peer itself: every thread whose name does not start with the abuse prefix.
+fn peer_threads(names: &[String]) -> u64 {
+    names
+        .iter()
+        .filter(|n| !n.starts_with(ABUSE_THREAD_PREFIX))
+        .count() as u64
+}
+
 impl ProcSampler {
     pub fn sample(&mut self) -> Value {
         let (mut rss, mut rss_anon, mut rss_file) = (0.0, 0.0, 0.0);
-        let (mut threads, mut fds, mut cpu_pct) = (0u64, 0u64, 0.0);
+        let (mut fds, mut cpu_pct) = (0u64, 0.0);
         let (mut rcv, mut snd) = (0u64, 0u64);
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
             for line in s.lines() {
@@ -352,11 +375,11 @@ impl ProcSampler {
                     (Some("RssFile:"), Some(kb)) => {
                         rss_file = round1(kb.parse::<f64>().unwrap_or(0.0) / 1024.0)
                     }
-                    (Some("Threads:"), Some(n)) => threads = n.parse().unwrap_or(0),
                     _ => {}
                 }
             }
         }
+        let threads = peer_threads(&thread_names());
         if let Ok(d) = std::fs::read_dir("/proc/self/fd") {
             fds = d.count() as u64;
         }
@@ -402,5 +425,26 @@ impl ProcSampler {
         json!({"rss_mb": rss, "rss_anon_mb": rss_anon, "rss_file_mb": rss_file,
                "heap_live_mb": mb(live), "heap_peak_mb": mb(peak), "cpu_pct": cpu_pct, "threads": threads, "fds": fds,
                "udp_rcvbuf_err": rcv, "udp_sndbuf_err": snd, "load1": load1, "cpus": cpus})
+    }
+}
+
+#[cfg(test)]
+mod thread_count_tests {
+    use super::*;
+
+    #[test]
+    fn abuse_threads_are_not_counted() {
+        let names: Vec<String> = [
+            "soak-rtc",
+            "tokio-runtime-w",
+            "abuse-victim",
+            "abuse-reader",
+            "abuse-sess",
+        ]
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+        assert_eq!(peer_threads(&names), 2);
+        assert_eq!(peer_threads(&[]), 0);
     }
 }

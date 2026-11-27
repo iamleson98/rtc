@@ -167,6 +167,13 @@ impl Abuse {
     }
 }
 
+/// Spawns a thread the abuse generators own, named so the peer's thread count leaves it out.
+fn spawn_abuse(name: &str, f: impl FnOnce() + Send + 'static) {
+    let _ = thread::Builder::new()
+        .name(format!("{}{name}", crate::stats::ABUSE_THREAD_PREFIX))
+        .spawn(f);
+}
+
 pub fn start(cfg: Cfg) -> Abuse {
     let cfg = Arc::new(cfg);
     let mut hs = Vec::new();
@@ -177,7 +184,10 @@ pub fn start(cfg: Cfg) -> Abuse {
         ("junk", junk_worker),
     ] {
         let c = cfg.clone();
-        if let Ok(h) = thread::Builder::new().name(name.into()).spawn(move || f(c)) {
+        if let Ok(h) = thread::Builder::new()
+            .name(format!("{}{name}", crate::stats::ABUSE_THREAD_PREFIX))
+            .spawn(move || f(c))
+        {
             hs.push(h);
         }
     }
@@ -334,7 +344,7 @@ impl Sess {
         } = build_peer(true, false)?;
         let mut rd = tcp.try_clone()?;
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
+        spawn_abuse("reader", move || {
             while let Ok(m) = read_frame::<Msg>(&mut rd) {
                 if tx.send(m).is_err() {
                     break;
@@ -1048,7 +1058,7 @@ fn victim_service(cfg: Arc<Cfg>) {
             Ok((tcp, _)) => {
                 let _ = tcp.set_nonblocking(false);
                 let seed = rng.next();
-                thread::spawn(move || {
+                spawn_abuse("sess", move || {
                     if let Ok(mut s) = Sess::new(tcp, true, seed) {
                         s.run(
                             Instant::now() + Duration::from_secs(24 * 3600),
