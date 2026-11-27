@@ -46,6 +46,11 @@ pub struct NackResponderBuilder {
     /// Age past which a buffered packet is no longer retransmitted; `None` keeps it until the
     /// buffer overwrites it.
     max_packet_age: Option<Duration>,
+    /// Age past which a packet sent before the stream's latest keyframe is no longer
+    /// retransmitted; `None` leaves such packets to `max_packet_age` alone.
+    superseded_packet_age: Option<Duration>,
+    /// Whether a PLI or FIR supersedes everything sent before it.
+    supersede_on_keyframe_request: bool,
 }
 
 /// libwebrtc's `kRetransmitWindowSizeMs` and pion's retransmission window.
@@ -66,6 +71,8 @@ impl Default for NackResponderBuilder {
             budget: true,
             budget_window: DEFAULT_BUDGET_WINDOW,
             max_packet_age: None,
+            superseded_packet_age: None,
+            supersede_on_keyframe_request: false,
         }
     }
 }
@@ -152,6 +159,32 @@ impl NackResponderBuilder {
         self
     }
 
+    /// Stop retransmitting packets sent before the stream's latest keyframe once they are older
+    /// than `age`, or three round trips if that is longer.
+    ///
+    /// A frame older than the latest keyframe is superseded: the receiver has, or will have,
+    /// restarted from the keyframe, so those packets are of no use to it, yet a NACK burst lists
+    /// them first and their bytes spend the retransmission budget ahead of the live frames. This
+    /// is a shorter age for them alone; packets from the latest keyframe on keep
+    /// [`Self::with_max_packet_age`], so a large keyframe on a slow link is still repaired. Only
+    /// streams whose codec is understood (see `rtp::codec::keyframe_start`; VP8 so far) take
+    /// part. A skipped request is counted in [`NackResponderStats::stale_skipped_packets`].
+    /// Off by default.
+    pub fn with_superseded_packet_age(mut self, age: Duration) -> Self {
+        self.superseded_packet_age = Some(age);
+        self
+    }
+
+    /// Treat everything sent before a PLI or FIR for a stream as superseded.
+    ///
+    /// The receiver asking for a keyframe has given up on the frames it has; a NACK arriving
+    /// after the request for any packet sent before it is skipped without spending budget. Works
+    /// for every codec. Off by default.
+    pub fn with_supersede_on_keyframe_request(mut self, enabled: bool) -> Self {
+        self.supersede_on_keyframe_request = enabled;
+        self
+    }
+
     /// Build the interceptor, rejecting a buffer size that could never retransmit anything.
     ///
     /// pion fails construction with `ErrInvalidSize`; the infallible [`Self::build`] keeps its
@@ -176,6 +209,8 @@ impl NackResponderBuilder {
             self.streams_filter,
             self.budget.then_some(self.budget_window),
             self.max_packet_age,
+            self.superseded_packet_age,
+            self.supersede_on_keyframe_request,
         )
     }
 }
@@ -188,6 +223,12 @@ struct LocalStream {
     ssrc_rtx: Option<u32>,
     /// RTX payload type for RFC4588 retransmission (if configured).
     payload_type_rtx: Option<u8>,
+    /// The stream's codec, to recognise its keyframes.
+    mime_type: String,
+    /// When the first packet of the latest keyframe was sent.
+    keyframe_sent: Option<Instant>,
+    /// When the latest PLI or FIR for this stream arrived.
+    keyframe_requested: Option<Instant>,
     /// Sequence number counter for RTX packets.
     rtx_sequence_number: u16,
     /// When each buffered packet was last retransmitted, so a repeat request within one round
@@ -213,7 +254,9 @@ pub struct NackResponderStats {
     pub retransmitted_bytes: u64,
     /// Requested packets left unanswered because the retransmission budget was spent.
     pub budget_dropped_packets: u64,
-    /// Requested packets not re-sent because they were older than the maximum packet age.
+    /// Requested packets not re-sent because they were older than the maximum packet age, or
+    /// belonged to a superseded frame (see
+    /// [`NackResponderBuilder::with_superseded_packet_age`]).
     pub stale_skipped_packets: u64,
 }
 
@@ -237,6 +280,10 @@ pub struct NackResponderInterceptor {
     budget_window: Option<Duration>,
     /// See [`NackResponderBuilder::with_max_packet_age`].
     max_packet_age: Option<Duration>,
+    /// See [`NackResponderBuilder::with_superseded_packet_age`].
+    superseded_packet_age: Option<Duration>,
+    /// See [`NackResponderBuilder::with_supersede_on_keyframe_request`].
+    supersede_on_keyframe_request: bool,
     /// The congestion controller's latest target, in bits per second.
     target_bitrate: Option<f64>,
     /// Bytes re-sent across all streams over the budget window; the budget while a target
@@ -260,9 +307,13 @@ impl NackResponderInterceptor {
         streams_filter: Option<ResponderStreamsFilter>,
         budget_window: Option<Duration>,
         max_packet_age: Option<Duration>,
+        superseded_packet_age: Option<Duration>,
+        supersede_on_keyframe_request: bool,
     ) -> Self {
         Self {
             max_packet_age,
+            superseded_packet_age,
+            supersede_on_keyframe_request,
             budget_window,
             target_bitrate: None,
             resent: RateWindow::new(budget_window.unwrap_or(DEFAULT_BUDGET_WINDOW)),
@@ -316,6 +367,25 @@ impl NackResponderInterceptor {
                     .sent_reports
                     .push_back(((sr.ntp_time >> 16) as u32, now));
             }
+        }
+    }
+
+    /// Remember that the receiver of `packet`'s stream asked for a keyframe, if it did.
+    fn record_keyframe_request(&mut self, now: Instant, packet: &dyn rtcp::packet::Packet) {
+        let any = packet.as_any();
+        let ssrc = if let Some(pli) = any
+            .downcast_ref::<rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
+        {
+            pli.media_ssrc
+        } else if let Some(fir) =
+            any.downcast_ref::<rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>()
+        {
+            fir.media_ssrc
+        } else {
+            return;
+        };
+        if let Some(stream) = self.streams.get_mut(&ssrc) {
+            stream.keyframe_requested = Some(now);
         }
     }
 
@@ -410,6 +480,22 @@ impl NackResponderInterceptor {
             let Some(original_packet) = stream.send_buffer.get(seq) else {
                 continue;
             };
+
+            // Sent before the receiver's latest keyframe, or before it asked for one: the frame it
+            // belongs to is gone. A packet this old only spends the budget ahead of a live one.
+            if let Some(stored) = stream.send_buffer.stored_at(seq)
+                && (stream.keyframe_requested.is_some_and(|at| stored < at)
+                    || self
+                        .superseded_packet_age
+                        .zip(stream.keyframe_sent)
+                        .is_some_and(|(age, keyframe)| {
+                            stored < keyframe
+                                && now.saturating_duration_since(stored) > age.max(rtt * 3)
+                        }))
+            {
+                self.stats.stale_skipped_packets += 1;
+                continue;
+            }
 
             // Too old for any receiver to still want, and past what the round trip could explain.
             if let Some(max_age) = self.max_packet_age
@@ -552,6 +638,9 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
         // Process NACK packets
         if let Packet::Rtcp(ref rtcp_packets) = msg.message.packet {
             for rtcp_packet in rtcp_packets {
+                if self.supersede_on_keyframe_request {
+                    self.record_keyframe_request(msg.now, rtcp_packet.as_ref());
+                }
                 if let Some(nack) = rtcp_packet
                     .as_any()
                     .downcast_ref::<rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>()
@@ -600,6 +689,12 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
                     .remove(&rtp_packet.header.sequence_number);
                 stream.media.add(msg.now, rtp_packet.marshal_size());
                 stream.send_buffer.add(rtp_packet.clone(), msg.now);
+                if self.superseded_packet_age.is_some()
+                    && rtp::codec::keyframe_start(&stream.mime_type, &rtp_packet.payload)
+                        == Some(true)
+                {
+                    stream.keyframe_sent = Some(msg.now);
+                }
             }
         }
 
@@ -638,6 +733,9 @@ impl Interceptor for NackResponderInterceptor {
                     send_buffer,
                     ssrc_rtx: info.ssrc_rtx,
                     payload_type_rtx: info.payload_type_rtx,
+                    mime_type: info.mime_type.clone(),
+                    keyframe_sent: None,
+                    keyframe_requested: None,
                     rtx_sequence_number: 0,
                     last_retransmit: FastMap::default(),
                     sent_reports: VecDeque::new(),
@@ -873,5 +971,279 @@ mod budget_tests {
         send_media(&mut r, t0);
         assert_eq!(nack(&mut r, t0 + Duration::from_millis(1000), 0..85), 85);
         assert_eq!(r.stats().budget_dropped_packets, 0);
+    }
+}
+
+#[cfg(test)]
+mod superseded_tests {
+    use super::*;
+    use rtcp::payload_feedbacks::full_intra_request::{FirEntry, FullIntraRequest};
+    use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+    use rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack};
+
+    const SSRC: u32 = 0x1234;
+
+    /// Start of a VP8 keyframe, and of a delta frame.
+    const KEY: [u8; 4] = [0x10, 0x50, 0x42, 0x00];
+    const DELTA: [u8; 4] = [0x10, 0x51, 0x42, 0x00];
+
+    fn responder(builder: NackResponderBuilder, mime_type: &str) -> NackResponderInterceptor {
+        let mut r = builder.with_rtt(Duration::ZERO).build();
+        r.bind_local_stream(&StreamInfo {
+            ssrc: SSRC,
+            mime_type: mime_type.to_string(),
+            rtcp_feedback: vec![crate::stream_info::RTCPFeedback {
+                typ: "nack".to_string(),
+                parameter: String::new(),
+            }],
+            ..Default::default()
+        });
+        // 80 kbit/s: a budget of 5,000 bytes, four of the packets below.
+        r.target_bitrate = Some(80_000.0);
+        r
+    }
+
+    fn send(r: &mut NackResponderInterceptor, now: Instant, seq: u16, head: [u8; 4]) {
+        let mut payload = head.to_vec();
+        payload.resize(1000, 0);
+        r.handle_write(TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
+                header: rtp::header::Header {
+                    version: 2,
+                    ssrc: SSRC,
+                    sequence_number: seq,
+                    ..Default::default()
+                },
+                payload: payload.into(),
+            })),
+        })
+        .unwrap();
+        while r.poll_write().is_some() {}
+    }
+
+    /// Packets 0..=9 are delta frames sent from `t0` every 10 ms; packet 10 starts a keyframe at
+    /// t0 + 3 s, 11 and 12 continue it and 13 is the next delta frame.
+    fn send_stream(r: &mut NackResponderInterceptor, t0: Instant) {
+        for seq in 0..10 {
+            send(
+                r,
+                t0 + Duration::from_millis(u64::from(seq) * 10),
+                seq,
+                DELTA,
+            );
+        }
+        let key_at = t0 + Duration::from_secs(3);
+        send(r, key_at, 10, KEY);
+        send(r, key_at + Duration::from_millis(10), 11, [0, 0, 0, 0]);
+        send(r, key_at + Duration::from_millis(20), 12, [0, 0, 0, 0]);
+        send(r, key_at + Duration::from_millis(30), 13, DELTA);
+    }
+
+    fn read(
+        r: &mut NackResponderInterceptor,
+        now: Instant,
+        packet: Vec<Box<dyn rtcp::packet::Packet>>,
+    ) {
+        r.handle_read(TaggedPacket {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(packet)),
+        })
+        .unwrap();
+        while r.poll_read().is_some() {}
+    }
+
+    /// Ask for packets 0..=13 at `now`; returns the sequence numbers that were re-sent.
+    fn nack_all(r: &mut NackResponderInterceptor, now: Instant) -> Vec<u16> {
+        read(
+            r,
+            now,
+            vec![Box::new(TransportLayerNack {
+                sender_ssrc: 1,
+                media_ssrc: SSRC,
+                nacks: vec![NackPair {
+                    packet_id: 0,
+                    lost_packets: 0x1FFF,
+                }],
+            })],
+        );
+        let mut seqs = Vec::new();
+        while let Some(TaggedPacket {
+            message:
+                AttributedPacket {
+                    packet: Packet::Rtp(p),
+                    ..
+                },
+            ..
+        }) = r.poll_write()
+        {
+            seqs.push(p.header.sequence_number);
+        }
+        seqs
+    }
+
+    #[test]
+    fn superseded_packets_cost_no_budget() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_superseded_packet_age(Duration::from_secs(1)),
+            "video/VP8",
+        );
+        send_stream(&mut r, t0);
+        // Packets 0..=9 are 3 s old and precede the keyframe: skipped, so all four budgeted
+        // packets go to the keyframe and the fresh loss behind it.
+        let sent = nack_all(&mut r, t0 + Duration::from_millis(3100));
+        assert_eq!(sent, vec![10, 11, 12, 13]);
+        assert_eq!(r.stats().stale_skipped_packets, 10);
+        assert_eq!(r.stats().budget_dropped_packets, 0);
+    }
+
+    #[test]
+    fn current_keyframe_keeps_the_max_packet_age() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new()
+                .with_max_packet_age(Duration::from_secs(3))
+                .with_superseded_packet_age(Duration::from_millis(500)),
+            "video/VP8",
+        );
+        send_stream(&mut r, t0);
+        // The keyframe (packets 10..=12) is 1.2 s old: past the superseded age, within 3 s.
+        let sent = nack_all(&mut r, t0 + Duration::from_millis(4200));
+        assert_eq!(sent, vec![10, 11, 12, 13]);
+        // Packets before it are older than 3 s as well, and are skipped by either rule.
+        assert_eq!(r.stats().stale_skipped_packets, 10);
+    }
+
+    #[test]
+    fn superseded_age_is_floored_at_three_round_trips() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_superseded_packet_age(Duration::from_secs(1)),
+            "video/VP8",
+        );
+        r.streams.get_mut(&SSRC).unwrap().rtt = Some(Duration::from_secs(2));
+        send_stream(&mut r, t0);
+        // Packets 0..=9 are 3.1 s old, within 3 x 2 s.
+        let sent = nack_all(&mut r, t0 + Duration::from_millis(3100));
+        assert_eq!(sent, vec![0, 1, 2, 3]);
+        assert_eq!(r.stats().stale_skipped_packets, 0);
+    }
+
+    #[test]
+    fn superseded_age_is_inactive_for_an_unknown_codec() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_superseded_packet_age(Duration::from_secs(1)),
+            "video/H264",
+        );
+        send_stream(&mut r, t0);
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(3100)),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(r.stats().stale_skipped_packets, 0);
+    }
+
+    #[test]
+    fn old_packets_are_resent_by_default() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new(), "video/VP8");
+        send_stream(&mut r, t0);
+        // Oldest first: the four budgeted packets all go to frames from before the keyframe.
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(3100)),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(r.stats().stale_skipped_packets, 0);
+    }
+
+    #[test]
+    fn keyframe_request_supersedes_what_was_sent_before_it() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_supersede_on_keyframe_request(true),
+            "video/H264",
+        );
+        send_stream(&mut r, t0);
+        // The PLI comes after packet 12 and before 13, so 13 is the only live one.
+        let pli_at = t0 + Duration::from_millis(3025);
+        read(
+            &mut r,
+            pli_at,
+            vec![Box::new(PictureLossIndication {
+                sender_ssrc: 1,
+                media_ssrc: SSRC,
+            })],
+        );
+        assert_eq!(nack_all(&mut r, t0 + Duration::from_millis(3100)), vec![13]);
+        assert_eq!(r.stats().stale_skipped_packets, 13);
+    }
+
+    #[test]
+    fn full_intra_request_supersedes_too() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_supersede_on_keyframe_request(true),
+            "video/H264",
+        );
+        send_stream(&mut r, t0);
+        read(
+            &mut r,
+            t0 + Duration::from_millis(3025),
+            vec![Box::new(FullIntraRequest {
+                sender_ssrc: 1,
+                media_ssrc: SSRC,
+                fir: vec![FirEntry {
+                    ssrc: SSRC,
+                    sequence_number: 1,
+                }],
+            })],
+        );
+        assert_eq!(nack_all(&mut r, t0 + Duration::from_millis(3100)), vec![13]);
+    }
+
+    #[test]
+    fn keyframe_request_is_ignored_unless_enabled() {
+        let t0 = Instant::now();
+        let mut r = responder(NackResponderBuilder::new(), "video/H264");
+        send_stream(&mut r, t0);
+        read(
+            &mut r,
+            t0 + Duration::from_millis(3025),
+            vec![Box::new(PictureLossIndication {
+                sender_ssrc: 1,
+                media_ssrc: SSRC,
+            })],
+        );
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(3100)),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn packets_sent_after_a_keyframe_request_are_still_served() {
+        let t0 = Instant::now();
+        let mut r = responder(
+            NackResponderBuilder::new().with_supersede_on_keyframe_request(true),
+            "video/H264",
+        );
+        send_stream(&mut r, t0);
+        read(
+            &mut r,
+            t0 + Duration::from_millis(100),
+            vec![Box::new(PictureLossIndication {
+                sender_ssrc: 1,
+                media_ssrc: SSRC,
+            })],
+        );
+        // Packets 0..=9 predate the request; the rest (10..=13) came after it.
+        assert_eq!(
+            nack_all(&mut r, t0 + Duration::from_millis(3100)),
+            vec![10, 11, 12, 13]
+        );
     }
 }

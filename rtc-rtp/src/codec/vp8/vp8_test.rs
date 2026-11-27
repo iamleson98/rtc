@@ -228,3 +228,50 @@ fn test_vp8_partition_head_checker_is_partition_head() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_vp8_starts_keyframe() {
+    // Keyframe: S set, no extension, frame tag 0x50 (P bit clear), then the 0x9d012a start code.
+    let key = [0x10, 0x50, 0x42, 0x00, 0x9d, 0x01, 0x2a, 0xb0, 0x02];
+    assert!(starts_keyframe(&key));
+
+    // The same keyframe with X, I (15-bit picture id), L and T set, as a browser sends it.
+    let key_ext = [
+        0x90, 0xe0, 0x81, 0x23, 0x07, 0x20, 0x50, 0x42, 0x00, 0x9d, 0x01, 0x2a,
+    ];
+    assert!(starts_keyframe(&key_ext));
+
+    // One-byte picture id.
+    let key_short_id = [0x90, 0x80, 0x23, 0x50, 0x42, 0x00];
+    assert!(starts_keyframe(&key_short_id));
+
+    // Delta frame: P bit of the frame tag set.
+    let delta = [0x10, 0x51, 0x42, 0x00, 0x1a, 0x2b];
+    assert!(!starts_keyframe(&delta));
+    let delta_ext = [0x90, 0xe0, 0x81, 0x24, 0x07, 0x20, 0x31, 0x01, 0x00];
+    assert!(!starts_keyframe(&delta_ext));
+
+    // A continuation packet (S clear) of a keyframe, and a later partition (PID 1).
+    assert!(!starts_keyframe(&[0x00, 0x50, 0x42, 0x00]));
+    assert!(!starts_keyframe(&[0x11, 0x50, 0x42, 0x00]));
+
+    // Truncated payloads.
+    assert!(!starts_keyframe(&[]));
+    assert!(!starts_keyframe(&[0x10]));
+    assert!(!starts_keyframe(&[0x90, 0xe0, 0x81]));
+}
+
+#[test]
+fn test_keyframe_start_by_codec() {
+    let key = [0x10, 0x50, 0x42, 0x00];
+    let delta = [0x10, 0x51, 0x42, 0x00];
+    assert_eq!(super::super::keyframe_start("video/VP8", &key), Some(true));
+    assert_eq!(super::super::keyframe_start("video/vp8", &key), Some(true));
+    assert_eq!(
+        super::super::keyframe_start("video/VP8", &delta),
+        Some(false)
+    );
+    assert_eq!(super::super::keyframe_start("video/H264", &key), None);
+    assert_eq!(super::super::keyframe_start("audio/opus", &key), None);
+    assert_eq!(super::super::keyframe_start("", &key), None);
+}
