@@ -702,10 +702,6 @@ class FreezeCountNeedsFreezeTime(unittest.TestCase):
                                                        dict(report.DEFAULTS)), "BREACH")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def peer_pair(impl, off_every=5, ans_every=5, timeline=None, nack=(3, 3), retx=(2, 2), cpu=40.0, load=(1.0, 4), seed="7",
               start=0, stalled=()):
     """A call of two peers (offerer, answerer), one file: `*_every` is how often (s) each one's receiver
@@ -753,10 +749,35 @@ class RunValidity(unittest.TestCase):
         self.assertEqual(failed_checks(val), [], val)
 
     def test_a_direction_starved_beyond_three_to_one_is_invalid(self):
-        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=20)))  # 4:1
+        clean, short = [phase(0, "clean")], {"valid_direction_min_clean_s": 60}
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=20, timeline=clean)), rules=short)  # 4:1
         self.assertEqual(failed_checks(val), ["video delivered, offerer vs answerer"])
-        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=10)))  # 2:1
+        val, _, _ = validate(("rtc-rtc", peer_pair("rtc", ans_every=10, timeline=clean)), rules=short)  # 2:1
         self.assertEqual(failed_checks(val), [])
+
+    def test_a_shortfall_inside_impairment_windows_of_a_short_run_is_not_judged(self):
+        # PR #77 run 1 (arm64 trace, rtc-rtc): 82967 vs 27215 video packets (3.0:1) in a 4-minute run whose
+        # trace impaired one direction; the clean minute is too short to judge a ratio on.
+        rows = peer_pair("rtc", ans_every=20)  # 4:1 over the run, TIMELINE is clean only for its first 60 s
+        val, _, _ = validate(("rtc-rtc", rows))
+        self.assertEqual(failed_checks(val), [])
+        self.assertIn("no clean window", [v[2] for v in val if v[1] == "video delivered, offerer vs answerer"][0])
+
+    def test_a_long_run_judges_its_clean_time_whatever_the_impaired_part_did(self):
+        # 60 minutes of clean time, then a window: the answerer's video is 3:1 behind in the clean part.
+        end = 3600
+        tl = [phase(0, "clean"), phase(end - 60, "bw")]
+
+        def long_pair(ans_every):
+            rows = list(tl)
+            for role, every in (("offerer", 5), ("answerer", ans_every)):
+                rows += track("rtc", "rtc-%s-video" % role, "impaired", end, flowing=lambda t, e=every: t % e == 0)
+            return rows
+
+        val, _, _ = validate(("rtc-rtc", long_pair(10)))  # 2:1
+        self.assertNotIn("video delivered, offerer vs answerer", failed_checks(val))
+        val, _, _ = validate(("rtc-rtc", long_pair(20)))  # 4:1
+        self.assertIn("video delivered, offerer vs answerer", failed_checks(val))
 
     def test_files_that_deliver_more_than_two_to_one_apart_are_invalid(self):
         val, _, _ = validate(("rtc-rtc", peer_pair("rtc")), ("pion-pion", peer_pair("pion", 15, 15)))
@@ -798,13 +819,14 @@ class RunValidity(unittest.TestCase):
     def test_an_invalid_run_gets_no_verdict_and_fails_the_gate(self):
         d = tempfile.mkdtemp()
         paths = []
-        for name, rows in (("rtc-rtc", peer_pair("rtc", ans_every=20)), ("pion-pion", peer_pair("pion"))):
+        for name, rows in (("rtc-rtc", peer_pair("rtc", ans_every=20, timeline=[phase(0, "clean")])),
+                           ("pion-pion", peer_pair("pion", timeline=[phase(0, "clean")]))):
             paths.append(os.path.join(d, name + ".jsonl"))
             with open(paths[-1], "w") as f:
                 f.writelines(json.dumps(r) + "\n" for r in rows)
         rules = os.path.join(d, "rules.json")
         with open(rules, "w") as f:
-            json.dump({"compare": [{"subject": "rtc", "baseline": "pion"}]}, f)
+            json.dump({"compare": [{"subject": "rtc", "baseline": "pion"}], "valid_direction_min_clean_s": 60}, f)
         self.assertEqual(report.main(["--rules", rules, "--out", os.path.join(d, "out")] + paths), 1)
         with open(os.path.join(d, "out", "summary.md")) as f:
             md = f.read()
@@ -1130,3 +1152,7 @@ class TargetRules(unittest.TestCase):
         self.assertIn("concealed | 0.00 | <= 1.00 | PASS (not gated) |", md)
         _, md2 = self.run_targets([{"name": "fec", "metric": "fec_packets", "min": 1, "scope": "nobody"}])
         self.assertIn("fec | - | >= 1 | n/a |", md2)
+
+
+if __name__ == "__main__":
+    unittest.main()

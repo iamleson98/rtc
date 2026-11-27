@@ -52,6 +52,7 @@ DEFAULTS = {
     # runs' total delivered packets may differ, and the share of samples (%) that may be CPU
     # saturated (a peer) or have a load average above the CPU count (the host) before the run is void.
     "valid_direction_ratio": 3.0,
+    "valid_direction_min_clean_s": 600,
     "valid_total_ratio": 2.0,
     "valid_cpu_sat_pct_max": 5.0,
     "valid_load_pct_max": 10.0,
@@ -1628,16 +1629,23 @@ def validity(runs, ents, rules):
         sers = [s for e in es for s in e.series.values()]
         recv = [s for s in sers if s.kind == "recv"]
         video = defaultdict(int)
+        clean_s = 0.0
         for s in recv:
             if s.media == "video" and role_of(s.who):
-                video[role_of(s.who)] += sum(i["packets"] for i in s.ivs)
+                clean = [i for i in s.ivs if i["clean"]]
+                video[role_of(s.who)] += sum(i["packets"] for i in clean)
+                clean_s += sum(i["dt"] for i in clean)
         if len(video) == 2:
             totals[run.stem] = sum(i["packets"] for s in recv for i in s.ivs)
             hi, lo = max(video.values()), min(video.values())
             ratio = hi / lo if lo else math.inf
-            add(run.stem, "video delivered, offerer vs answerer", "%d vs %d (%s:1)" % (
-                video["offerer"], video["answerer"], "inf" if math.isinf(ratio) else "%.1f" % ratio),
-                ratio <= rules["valid_direction_ratio"])
+            if clean_s / 2 < rules["valid_direction_min_clean_s"]:
+                add(run.stem, "video delivered, offerer vs answerer", "no clean window (%.0f s of %d needed)" % (
+                    clean_s / 2, rules["valid_direction_min_clean_s"]), True)
+            else:
+                add(run.stem, "video delivered, offerer vs answerer", "%d vs %d (%s:1), clean time only" % (
+                    video["offerer"], video["answerer"], "inf" if math.isinf(ratio) else "%.1f" % ratio),
+                    ratio <= rules["valid_direction_ratio"])
         if has_loss(run):
             vals = defaultdict(lambda: defaultdict(int))
             seen_tx = False
