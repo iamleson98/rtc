@@ -14,10 +14,10 @@
 
 use crate::stats::Logger;
 use crate::{
-    AUDIO_LEVEL_URI, Args, Filler, Inbox, Peer, STOP, build_peer, host_candidate, read_frame,
-    write_frame,
+    AUDIO_LEVEL_URI, Args, Filler, Inbox, Peer, SESSION_INBOX_DEPTH, STOP, build_peer,
+    host_candidate, read_frame, write_frame,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::RTCPeerConnection;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
@@ -334,7 +334,7 @@ impl Sess {
         tcp.set_nodelay(true)?;
         let sock = UdpSocket::bind("127.0.0.1:0")?;
         let local = sock.local_addr()?;
-        let inbox = Inbox::new(&sock)?;
+        let inbox = Inbox::new(&sock, SESSION_INBOX_DEPTH)?;
         let host = host_candidate(local)?;
         let Peer {
             pc,
@@ -689,11 +689,11 @@ impl Sess {
     }
 
     fn dc_send(&mut self, now: Instant, len: usize) {
-        let b = self.fill.bytes(len);
+        let b = self.fill.bytes_mut(len);
         if self.dc_open
             && let Some(mut dc) = self.pc.data_channel(self.dc_id)
         {
-            let ok = dc.send(now, BytesMut::from(&b[..])).is_ok();
+            let ok = dc.send(now, b).is_ok();
             self.count(2, ok);
         }
     }

@@ -72,8 +72,13 @@ const DC_STREAM_ID: u16 = 1; // the id both peers agree on out-of-band
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// Datagrams the reader thread has taken off the socket and the loop has not handled yet.
+/// Datagrams the reader thread of the measured call's socket has taken off it and the loop has not
+/// handled yet.
 const INBOX_DEPTH: usize = 8192;
+/// The same for an abuse session's socket. A bounded queue is allocated whole, so 8192 slots
+/// (704 KiB) per session made the session churn, not the rtc stack, dominate the peer's memory;
+/// a session's traffic is light and a full queue only drops what the kernel would have.
+pub(crate) const SESSION_INBOX_DEPTH: usize = 256;
 /// How many queued datagrams one turn of a loop handles before it looks at its timers again.
 const INBOX_BATCH: usize = 256;
 
@@ -93,12 +98,12 @@ pub(crate) struct Inbox {
 }
 
 impl Inbox {
-    pub(crate) fn new(socket: &UdpSocket) -> std::io::Result<Inbox> {
+    pub(crate) fn new(socket: &UdpSocket, depth: usize) -> std::io::Result<Inbox> {
         let sock = socket.try_clone()?;
         // the thread looks at `open` this often when nothing arrives
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
         let open = Arc::new(AtomicBool::new(true));
-        let (tx, rx) = sync_channel(INBOX_DEPTH);
+        let (tx, rx) = sync_channel(depth);
         let alive = open.clone();
         thread::spawn(move || read_socket(&sock, &tx, &alive));
         Ok(Inbox { rx, open })
@@ -244,6 +249,13 @@ impl Filler {
 
     fn bytes(&mut self, n: usize) -> Vec<u8> {
         (0..n).map(|_| self.next() as u8).collect()
+    }
+
+    /// The same bytes, built once in the buffer a data channel takes.
+    fn bytes_mut(&mut self, n: usize) -> BytesMut {
+        let mut b = BytesMut::with_capacity(n);
+        b.extend((0..n).map(|_| self.next() as u8));
+        b
     }
 }
 
@@ -543,7 +555,7 @@ fn run(log: &mut Logger, a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut fill = Filler(0x9e37_79b9_7f4a_7c15);
     let mut vp8 = Vp8Payloader::default();
     vp8.enable_picture_id = true;
-    let inbox = Inbox::new(&socket)?;
+    let inbox = Inbox::new(&socket, INBOX_DEPTH)?;
     let mut t_audio = Instant::now();
     let (mut t_video, mut t_data) = (t_audio, t_audio);
     let mut t_report = t_audio + REPORT_EVERY;
