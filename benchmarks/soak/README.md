@@ -83,7 +83,8 @@ ports). `tc -s qdisc show dev lo` shows the drops of each direction in its own l
 `report.py` first asks whether the input may be compared at all, and prints the answers in the "Run
 validity" section. A failing check makes the report INVALID: the first line of `summary.md` says why,
 the gate fails and no comparison is given. The checks: the two directions of a call delivered video
-within 3:1 of each other, and the files within 2:1 of each other in total packets; `nack`, the
+within 3:1 of each other in the clean part of the run (a run with less than `valid_direction_min_clean_s`, 600 s, of
+clean time is not judged: a short trace or abuse run impairs one direction on purpose), and the files within 2:1 of each other in total packets; `nack`, the
 retransmissions and the per-class send counters (`tx`) are non-zero on both peers wherever the profile
 impairs the path; no peer CPU-saturated and the host load average within its CPU count (more than 5 %
 and 10 % of the samples); and the files are one run (one `run` record each, the same seed, profile and
