@@ -1008,6 +1008,32 @@ def pick(ents, spec, side):
     return [e for e in ents if e.impl == impl and (run is None or e.run.stem == run)]
 
 
+def only_peer(ents, peer):
+    """The same entities with only what one peer of a pair did: its series (their ids start with
+    `<impl>-<peer>`, peer `offerer` or `answerer`) and its events. A mixed pair is then held to the
+    pure pair's peer in the same role."""
+    other = {"offerer", "answerer"} - {peer}
+
+    def theirs(sid):
+        return any(re.search(r"-%s(-|$)" % o, sid) for o in other)
+    out = []
+    for e in ents:
+        c = Ent(e.impl, e.arch, e.run)
+        c.t1 = e.t1
+        c.events = [ev for ev in e.events if not theirs(str(ev.get("id", "")))]
+        c.series = {k: v for k, v in e.series.items() if not theirs(v.id)}
+        out.append(c)
+    return out
+
+
+def compared(ents, spec, side):
+    """What one side of a `compare` pair is: its implementation in its run (`<side>_run`), and with
+    `<side>_peer` only that peer's receivers, so that one pair's sender is held to the other's."""
+    es = pick(ents, spec, side)
+    peer = spec.get(side + "_peer")
+    return only_peer(es, peer) if peer else es
+
+
 def fmt(v, nd=2):
     if v is None:
         return "-"
@@ -1070,7 +1096,7 @@ def compare(ents, rules, bad_baselines=None):
 
     for spec in rules["compare"]:
         gated = spec.get("gate", True)
-        subj, base = pick(ents, spec, "subject"), pick(ents, spec, "baseline")
+        subj, base = compared(ents, spec, "subject"), compared(ents, spec, "baseline")
         name = "%s vs %s" % (label(spec, "subject"), label(spec, "baseline"))
         archs = sorted({e.arch for e in subj} | {e.arch for e in base})
         if not archs:
@@ -1220,8 +1246,10 @@ def compare(ents, rules, bad_baselines=None):
 
 
 def label(spec, side):
+    """How a side is named in the report: an optional `<side>_label` says what it is (for example
+    "rtc sending"), then the run in brackets."""
     run = spec.get(side + "_run")
-    return spec[side] + (" [%s]" % run if run else "")
+    return spec.get(side + "_label", spec[side]) + (" [%s]" % run if run else "")
 
 
 def drift_metrics(ents, a, b):
@@ -1516,7 +1544,7 @@ def html_report(rows, checks, runs, ents, rules, failed, val=None):
         legend["attack"] = ATTACK_FILL
     parts.append("<p>" + "".join('<span class=sw style="background:%s"></span>%s' % (c, n) for n, c in legend.items()) + "</p>")
     for spec in rules["compare"]:
-        subj, base = pick(ents, spec, "subject"), pick(ents, spec, "baseline")
+        subj, base = compared(ents, spec, "subject"), compared(ents, spec, "baseline")
         for arch in sorted({e.arch for e in subj} & {e.arch for e in base}):
             s_ents = [e for e in subj if e.arch == arch]
             b_ents = [e for e in base if e.arch == arch]

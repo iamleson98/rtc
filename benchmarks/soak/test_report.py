@@ -245,6 +245,58 @@ class Recovery(Fixture):
         self.assertAlmostEqual(m["downtime"], 4.0, delta=0.01)
 
 
+class MixedPair(Fixture):
+    """In the rtc-pion run each receiver gets the other peer's stream, and quality follows the sender."""
+    RULES = {"compare": [], "require_groups": ["impaired"], "min_clean_window_min": 1, "warmup_min": 0,
+             "window_min": 1}
+    OLD = {"subject": "rtc", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "rtc-pion",
+           "gate": False}
+    NEW = [{"subject": "rtc", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "pion-pion",
+            "gate": False, "subject_peer": "offerer", "baseline_peer": "offerer",
+            "subject_label": "rtc receiving pion", "baseline_label": "pion receiving pion"},
+           {"subject": "pion", "baseline": "pion", "subject_run": "rtc-pion", "baseline_run": "pion-pion",
+            "gate": False, "subject_peer": "answerer", "baseline_peer": "answerer",
+            "subject_label": "pion receiving rtc", "baseline_label": "pion receiving pion"}]
+
+    def stream(self, impl, peer, sender_freezes):
+        """One receiver's rows; `sender_freezes` is what the stream it receives suffers."""
+        rows = track(impl, "%s-%s-video" % (impl, peer), "impaired", END, bytes_per_s=300_000,
+                     freezes=lambda t: t // STEP * sender_freezes,
+                     freeze_ms=lambda t: t // STEP * sender_freezes * 1000)
+        for r in rows:
+            r["nack"] = 5  # a pair's run is only valid when both sides counted NACKs
+        return rows
+
+    def report(self, compare):
+        d = tempfile.mkdtemp()
+        runs = {  # pion's sending freezes the receiver 3 times per sample, rtc's sending never does
+            "rtc-pion": TIMELINE + self.stream("rtc", "offerer", 3) + self.stream("pion", "answerer", 0),
+            "pion-pion": TIMELINE + self.stream("pion", "offerer", 3) + self.stream("pion", "answerer", 0)}
+        paths = []
+        for name, rows in runs.items():
+            paths.append(os.path.join(d, name + ".jsonl"))
+            with open(paths[-1], "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows)
+        rules = os.path.join(d, "rules.json")
+        with open(rules, "w") as f:
+            json.dump(dict(self.RULES, compare=compare), f)
+        report.main(["--rules", rules, "--out", os.path.join(d, "out")] + paths)
+        with open(os.path.join(d, "out", "summary.md")) as f:
+            return f.read()
+
+    def breaches(self, md):
+        return md.split("## Breaches")[1].split("## ")[0]
+
+    def test_receiver_against_receiver_blames_the_sender_s_quality(self):
+        self.assertIn("breach:", self.breaches(self.report([self.OLD])))
+
+    def test_same_sender_comparisons_hold_when_only_the_sender_differs(self):
+        md = self.report(self.NEW)
+        self.assertIn("None.", self.breaches(md))
+        self.assertIn("rtc receiving pion [rtc-pion] vs pion receiving pion [pion-pion]", md)
+        self.assertIn("pion receiving rtc [rtc-pion] vs pion receiving pion [pion-pion]", md)
+
+
 class Compare(Fixture):
     def test_equal_runs_pass(self):
         s, b = self.rows()
